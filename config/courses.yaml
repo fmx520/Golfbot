@@ -1,0 +1,28 @@
+defaults:
+  poll_interval_seconds: 30
+  target_windows:
+    - start: "06:00"
+      end: "08:30"
+    - start: "16:00"
+      end: "18:30"
+  retry_profile:
+    max_attempts: 5
+    backoff_seconds: 2
+    max_backoff_seconds: 30
+  player_count: 4
+
+courses:
+  pebble_beach:
+    poll_interval_seconds: 20
+    target_windows:
+      - start: "07:00"
+        end: "09:00"
+    retry_profile:
+      max_attempts: 8
+      backoff_seconds: 1
+      max_backoff_seconds: 20
+    player_count: 2
+
+  torrey_pines:
+    # Inherits defaults for omitted values
+    player_count: 3
