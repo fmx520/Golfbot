@@ -1,0 +1,41 @@
+{
+  "run_id": "30aeb49c24f6",
+  "started_at": "2026-05-06T23:46:47.876446+00:00",
+  "ended_at": "2026-05-06T23:46:47.977308+00:00",
+  "success": true,
+  "confirmation_sent": true,
+  "decision_trace": [
+    {
+      "phase": "discovery",
+      "decision": "selected_inventory",
+      "reason": "Found 3 candidate tee times",
+      "elapsed_ms": 30
+    },
+    {
+      "phase": "booking_prep",
+      "decision": "chose_best_option",
+      "reason": "Lowest points + preferred window",
+      "elapsed_ms": 40
+    },
+    {
+      "phase": "confirmation_gate",
+      "decision": "sent_confirmation_request",
+      "reason": "Ready for irreversible confirmation",
+      "elapsed_ms": 30
+    }
+  ],
+  "race_loss_points": [
+    {
+      "phase": "discovery",
+      "elapsed_ms": 30
+    },
+    {
+      "phase": "booking_prep",
+      "elapsed_ms": 40
+    },
+    {
+      "phase": "confirmation_gate",
+      "elapsed_ms": 30
+    }
+  ]
+}
