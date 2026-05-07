@@ -25,6 +25,14 @@ function esc(s) {
   return d.innerHTML;
 }
 
+function fmt12(t) {
+  if (!t) return 'N/A';
+  const [h, m] = t.split(':').map(Number);
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const hr = h % 12 || 12;
+  return `${hr}:${String(m).padStart(2, '0')} ${ampm}`;
+}
+
 function showAlert(id, msg) {
   const el = $(id);
   if (!el) return;
@@ -313,7 +321,7 @@ function renderSlots() {
     tr.className = 'slot-select' + (S.selectedSlot === slot ? ' selected' : '');
     tr.onclick = () => { S.selectedSlot = slot; renderSlots(); };
     tr.innerHTML =
-      `<td>${esc(slot.time || 'N/A')}</td>` +
+      `<td>${esc(fmt12(slot.time))}</td>` +
       `<td>${slot.available_spots || '?'}</td>` +
       `<td>${slot.green_fee ? '$' + slot.green_fee : 'N/A'}</td>` +
       `<td>${S.selectedSlot === slot ? '<span class="badge badge-success">Selected</span>' : '<span class="badge badge-neutral">Select</span>'}</td>`;
@@ -344,7 +352,7 @@ function renderResults(jobData) {
     statusHtml = `
       <div class="alert alert-success show">${esc(alertMsg)}</div>
       <div class="summary-card">
-        <div class="summary-row"><span class="summary-key">Tee Time</span><span class="summary-value">${esc(S.selectedSlot.time || 'N/A')}</span></div>
+        <div class="summary-row"><span class="summary-key">Tee Time</span><span class="summary-value">${esc(fmt12(S.selectedSlot.time))}</span></div>
         <div class="summary-row"><span class="summary-key">Available Spots</span><span class="summary-value">${S.selectedSlot.available_spots || '?'}</span></div>
         <div class="summary-row"><span class="summary-key">Green Fee</span><span class="summary-value">${S.selectedSlot.green_fee ? '$' + S.selectedSlot.green_fee : 'N/A'}</span></div>
         <div class="summary-row"><span class="summary-key">Date</span><span class="summary-value">${esc($('playDate').value)}</span></div>
@@ -397,7 +405,7 @@ function fireNotification(data) {
   const slot = slotEv?.slot || S.selectedSlot;
   const title = S.sniperMode ? 'Sniper: Tee Time Found!' : 'Tee Time Found!';
   const body = slot
-    ? `${slot.time} — ${slot.available_spots} spots — $${slot.green_fee || '?'}`
+    ? `${fmt12(slot.time)} — ${slot.available_spots} spots — $${slot.green_fee || '?'}`
     : 'A matching tee time is available.';
 
   try {
