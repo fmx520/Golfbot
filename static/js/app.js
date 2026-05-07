@@ -418,7 +418,7 @@ function updateDateRange() {
 
   // Non-resident: 5 days advance; everyone else (resident classes): 7 days
   const isNonResident = /non.?resident/i.test(selectedText);
-  const advanceDays = isNonResident ? 5 : 7;
+  const advanceDays = isNonResident ? 6 : 8;
 
   // If past 7pm, the furthest day is released; otherwise subtract 1
   const maxDays = hour >= 19 ? advanceDays : advanceDays - 1;
