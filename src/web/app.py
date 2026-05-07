@@ -9,6 +9,7 @@ from multiprocessing import Process, Queue
 from queue import Empty
 from threading import Lock, Thread
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -28,6 +29,7 @@ class StartJobRequest(BaseModel):
     time_start: str
     time_end: str
     dry_run: bool = True
+    foreup_booking_url: str | None = None
 
 
 @dataclass
@@ -100,13 +102,37 @@ def _normalize_course(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+
+def _extract_foreup_target(booking_url: str | None, fallback_base_url: str, fallback_course_id: str) -> tuple[str, str]:
+    if not booking_url:
+        return fallback_base_url, fallback_course_id
+
+    parsed = urlparse(booking_url)
+    if not parsed.scheme or not parsed.netloc:
+        return fallback_base_url, fallback_course_id
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    course_id = fallback_course_id
+    if "booking" in path_parts:
+        booking_ix = path_parts.index("booking")
+        if booking_ix + 2 < len(path_parts):
+            course_id = path_parts[booking_ix + 2]
+    return base_url, course_id
+
 def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
     queue.put({"type": "status", "status": "running"})
 
     def _finalize_worker() -> None:
         queue.put({"type": "worker_done"})
 
-    base_url = os.getenv("FOREUP_BASE_URL", "http://localhost:8080")
+    default_base_url = os.getenv("FOREUP_BASE_URL", "http://localhost:8080")
+    base_url, resolved_course_id = _extract_foreup_target(
+        payload.get("foreup_booking_url"),
+        fallback_base_url=default_base_url,
+        fallback_course_id=payload["course_id"],
+    )
     username = os.getenv("FOREUP_USERNAME", "")
     password = os.getenv("FOREUP_PASSWORD", "")
 
@@ -137,7 +163,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
 
         fetch_started = time.perf_counter()
         availability = discovery.lookup_availability(
-            course_id=payload["course_id"], date=payload["play_date"], players=payload["players"], request_id=request_id
+            course_id=resolved_course_id, date=payload["play_date"], players=payload["players"], request_id=request_id
         )
         _emit_event(
             queue,
@@ -189,7 +215,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
 
         submit_started = time.perf_counter()
         booking_payload = {
-            "course_id": payload["course_id"],
+            "course_id": resolved_course_id,
             "date": payload["play_date"],
             "players": payload["players"],
             "tee_time_id": selected.get("tee_time_id"),
@@ -272,7 +298,7 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
 
 
 @app.get("/courses")
-def list_courses(q: str = "", live: bool = True) -> dict[str, Any]:
+def list_courses(q: str = "", live: bool = True, booking_url: str | None = None) -> dict[str, Any]:
     query = q.strip().lower()
     username = os.getenv("FOREUP_USERNAME", "")
     password = os.getenv("FOREUP_PASSWORD", "")
@@ -283,7 +309,12 @@ def list_courses(q: str = "", live: bool = True) -> dict[str, Any]:
                 status_code=503,
                 detail="Live course lookup requires FOREUP_USERNAME and FOREUP_PASSWORD.",
             )
-        base_url = os.getenv("FOREUP_BASE_URL", "http://localhost:8080")
+        env_base_url = os.getenv("FOREUP_BASE_URL", "http://localhost:8080")
+        base_url, _ = _extract_foreup_target(
+            booking_url,
+            fallback_base_url=env_base_url,
+            fallback_course_id="",
+        )
         courses_path = os.getenv("FOREUP_COURSES_PATH", "/api/courses")
         discovery = ForeUpDiscoveryClient(base_url=base_url)
         request_id = f"courses-{uuid.uuid4().hex[:8]}"
@@ -333,6 +364,7 @@ def index() -> str:
 <!doctype html><html><body>
 <h2>Golfbot Web UI</h2>
 <form id='f'>
+  ForeUp Booking URL <input name='foreup_booking_url' placeholder='https://foreupsoftware.com/index.php/booking/19765/2431#teetimes' size='90'><br/>
   Course ID <input name='course_id' list='course-options' value='pebble_beach'><br/>
   <datalist id='course-options'></datalist>
   Play Date <input name='play_date' value='2026-05-10'><br/>
@@ -348,7 +380,9 @@ const out = document.getElementById('out');
 const courseList = document.getElementById('course-options');
 
 async function loadCourses() {
-  const res = await fetch('/courses');
+  const bookingUrl = document.querySelector("input[name='foreup_booking_url']")?.value?.trim();
+  const endpoint = bookingUrl ? `/courses?booking_url=${encodeURIComponent(bookingUrl)}` : '/courses';
+  const res = await fetch(endpoint);
   const payload = await res.json();
   courseList.innerHTML = '';
   for (const course of payload.courses || []) {
@@ -360,6 +394,7 @@ async function loadCourses() {
 }
 
 loadCourses();
+document.querySelector("input[name='foreup_booking_url']")?.addEventListener('change', loadCourses);
 document.getElementById('f').onsubmit = async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
