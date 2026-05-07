@@ -255,9 +255,17 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
             _finalize_worker()
             return
 
-        raw_keys = list(selected.get("raw", {}).keys()) if selected.get("raw") else []
+        raw_slot = selected.get("raw", {}) or {}
+        constraint_fields = {
+            k: raw_slot.get(k) for k in (
+                "minimum_players", "maximum_players_per_booking", "allowed_group_sizes",
+                "available_spots", "available_spots_9", "available_spots_18",
+                "booking_class_id", "require_credit_card", "pay_online",
+                "booking_fee_required", "booking_fee_price",
+            )
+        }
         _emit_event(queue, phase="checkout", stage="debug",
-                    message=f"Slot raw keys: {raw_keys} | raw sample: {dict(list(selected.get('raw', {}).items())[:15])}")
+                    message=f"Slot constraints: {constraint_fields} | requested players={payload.get('players')} holes={holes}")
 
         submit_started = time.perf_counter()
 
@@ -756,7 +764,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.34"
+APP_VERSION = "0.35"
 
 @app.get("/health")
 def health() -> dict[str, str]:
