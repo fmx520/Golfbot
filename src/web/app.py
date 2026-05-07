@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -10,10 +12,21 @@ from threading import Lock, Thread
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from src.config import load_config
+
 app = FastAPI(title="Golfbot Web UI")
+_cors_origins = os.getenv("GOLFBOT_CORS_ORIGINS", "http://localhost:3000").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in _cors_origins if origin.strip()],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class StartJobRequest(BaseModel):
@@ -38,23 +51,26 @@ JOBS: dict[str, JobState] = {}
 JOB_LOCK = Lock()
 
 
-def _event(job: JobState, stage: str, message: str, **extra: Any) -> None:
+def _event(job: JobState, phase: str, message: str, **extra: Any) -> None:
     job.updated_at = datetime.now(timezone.utc).isoformat()
-    job.events.append({"ts": job.updated_at, "stage": stage, "message": message, **extra})
+    event = {
+        "ts": job.updated_at,
+        "phase": phase,
+        "message": message,
+        "status": job.status,
+        **extra,
+    }
+    job.events.append(event)
 
 
 def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
-    """Timing-sensitive worker process.
-
-    This process is intentionally isolated from web request handling so UI rendering
-    cannot block booking-loop timing.
-    """
     queue.put({"type": "status", "status": "running"})
+    start = time.monotonic()
 
-    # Placeholder fast loop (replace with BookingExecutor wiring).
+    queue.put({"type": "event", "phase": "auth", "message": "Session ready", "latency_ms": 0})
+
     poll_interval = 0.05
     timeout_seconds = 5.0
-    start = time.monotonic()
     found = None
 
     slots = [
@@ -63,6 +79,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
         {"starts_at": "08:20", "spots": 4, "price": 139.0, "tee_time_id": f"{payload['course_id']}-3"},
     ]
 
+    queue.put({"type": "event", "phase": "discovery", "message": "Polling tee times"})
     while time.monotonic() - start <= timeout_seconds:
         for slot in slots:
             if slot["spots"] >= payload["players"] and payload["time_start"] <= slot["starts_at"] <= payload["time_end"]:
@@ -72,19 +89,20 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
             break
         time.sleep(poll_interval)
 
+    elapsed_ms = int((time.monotonic() - start) * 1000)
     if not found:
-        queue.put({"type": "event", "stage": "discovery", "message": "No matching tee time before timeout"})
+        queue.put({"type": "event", "phase": "discovery", "message": "No matching tee time before timeout", "latency_ms": elapsed_ms})
         queue.put({"type": "status", "status": "failed"})
         return
 
-    queue.put({"type": "event", "stage": "discovery", "message": "Found matching tee time", "slot": found})
+    queue.put({"type": "event", "phase": "discovery", "message": "Found matching tee time", "slot": found, "latency_ms": elapsed_ms})
 
     if payload.get("dry_run", True):
-        queue.put({"type": "event", "stage": "confirmation_gate", "message": "Dry run enabled; not submitting"})
+        queue.put({"type": "event", "phase": "confirmation_gate", "message": "Dry run enabled; not submitting", "terminal": "dry_run_stopped"})
         queue.put({"type": "status", "status": "succeeded"})
         return
 
-    queue.put({"type": "event", "stage": "confirmation_gate", "message": "Submitted booking request (simulated)", "slot": found})
+    queue.put({"type": "event", "phase": "booking", "message": "Submitted booking request (simulated)", "slot": found})
     queue.put({"type": "status", "status": "succeeded"})
 
 
@@ -101,9 +119,20 @@ def _watch_worker(job_id: str, queue: Queue, process: Process) -> None:
                 job.status = msg["status"]
                 job.updated_at = datetime.now(timezone.utc).isoformat()
             elif msg["type"] == "event":
-                _event(job, msg["stage"], msg["message"], **{k: v for k, v in msg.items() if k not in {"type", "stage", "message"}})
+                _event(job, msg["phase"], msg["message"], **{k: v for k, v in msg.items() if k not in {"type", "phase", "message"}})
 
     process.join(timeout=1)
+
+
+@app.get("/courses")
+def list_courses() -> dict[str, Any]:
+    config = load_config()
+    return {
+        "courses": [
+            {"course_id": course_id, "player_count_default": settings.player_count}
+            for course_id, settings in sorted(config.courses.items())
+        ]
+    }
 
 
 @app.post("/jobs")
@@ -127,6 +156,34 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
     return {"job_id": job_id}
 
 
+@app.get("/jobs/{job_id}/stream")
+def stream_job(job_id: str) -> StreamingResponse:
+    def event_stream():
+        sent = 0
+        while True:
+            with JOB_LOCK:
+                job = JOBS.get(job_id)
+                if not job:
+                    yield "event: error\ndata: Job not found\n\n"
+                    return
+
+                while sent < len(job.events):
+                    event = job.events[sent]
+                    payload = {"index": sent, "status": job.status, "event": event}
+                    yield f"event: message\ndata: {json.dumps(payload)}\n\n"
+                    sent += 1
+
+                done = job.status in {"succeeded", "failed"}
+
+            if done:
+                yield "event: done\ndata: complete\n\n"
+                return
+
+            time.sleep(0.25)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str) -> dict[str, Any]:
     with JOB_LOCK:
@@ -147,35 +204,6 @@ def index() -> str:
     return """
 <!doctype html><html><body>
 <h2>Golfbot Web UI</h2>
-<form id='f'>
-  Course ID <input name='course_id' value='pebble_beach'><br/>
-  Play Date <input name='play_date' value='2026-05-10'><br/>
-  Players <input name='players' value='2' type='number' min='1' max='4'><br/>
-  Time Start <input name='time_start' value='07:00'><br/>
-  Time End <input name='time_end' value='09:00'><br/>
-  Dry Run <input name='dry_run' type='checkbox' checked><br/>
-  <button>Start Job</button>
-</form>
-<pre id='out'></pre>
-<script>
-const out = document.getElementById('out');
-document.getElementById('f').onsubmit = async (e) => {
-  e.preventDefault();
-  const fd = new FormData(e.target);
-  const payload = Object.fromEntries(fd.entries());
-  payload.players = Number(payload.players);
-  payload.dry_run = fd.get('dry_run') === 'on';
-  const res = await fetch('/jobs', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload)});
-  const {job_id} = await res.json();
-  out.textContent = 'job ' + job_id + '\n';
-
-  const timer = setInterval(async () => {
-    const jr = await fetch('/jobs/' + job_id);
-    const js = await jr.json();
-    out.textContent = JSON.stringify(js, null, 2);
-    if (['succeeded','failed'].includes(js.status)) clearInterval(timer);
-  }, 400);
-}
-</script>
+<p>Use the Next.js frontend at localhost:3000 for the main interface.</p>
 </body></html>
 """
