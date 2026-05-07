@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.20</span>
+        <span class="version-badge">v0.21</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -212,6 +212,11 @@
     <!-- FAQ -->
     <section class="faq-section">
       <h2 class="page-title">How It Works</h2>
+
+      <details class="faq-item">
+        <summary>How do I get the Booking URL?</summary>
+        <p>Go to your golf course's website and find their online tee time booking page (powered by ForeUp). The URL will look something like:<br><code>https://foreupsoftware.com/index.php/booking/19765/2431#teetimes</code><br>Copy the full URL from your browser's address bar and paste it into the Booking URL field. Golfbot will automatically extract the Schedule ID and Course ID from the link — you don't need to fill those in manually.</p>
+      </details>
 
       <details class="faq-item">
         <summary>What is Dry Run?</summary>
