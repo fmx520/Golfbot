@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.21</span>
+        <span class="version-badge">v0.22</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -89,7 +89,9 @@
         <div class="card-title">Search Criteria</div>
         <div class="form-group">
           <label for="playDate">Play Date</label>
-          <input type="date" id="playDate">
+          <select id="playDate">
+            <option value="" disabled selected>Select a date</option>
+          </select>
         </div>
         <div class="form-row">
           <div class="form-group">

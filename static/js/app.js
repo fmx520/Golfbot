@@ -185,22 +185,6 @@ async function searchTeeTimes() {
     return;
   }
 
-  const dateInput = $('playDate');
-  if (dateInput.min && dateInput.value < dateInput.min) {
-    showAlert('searchError', 'Selected date is too early. Earliest available: ' + dateInput.min);
-    btn.disabled = false;
-    btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
-    $('eventLogContainer')?.classList.remove('sniper-armed');
-    return;
-  }
-  if (dateInput.max && dateInput.value > dateInput.max) {
-    showAlert('searchError', 'Selected date is too far out for your booking class. Latest available: ' + dateInput.max);
-    btn.disabled = false;
-    btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
-    $('eventLogContainer')?.classList.remove('sniper-armed');
-    return;
-  }
-
   const payload = {
     username: $('username').value.trim(),
     password: $('password').value.trim(),
@@ -425,37 +409,38 @@ function fireNotification(data) {
 // Date picker restrictions based on booking class
 function updateDateRange() {
   const bcSelect = $('bookingClass');
-  const dateInput = $('playDate');
+  const dateSelect = $('playDate');
   const selectedText = bcSelect.options[bcSelect.selectedIndex]?.textContent || '';
+  const prevValue = dateSelect.value;
 
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const hour = now.getHours();
 
-  // Non-resident: 5 days advance; everyone else (resident classes): 7 days
   const isNonResident = /non.?resident/i.test(selectedText);
   const advanceDays = isNonResident ? 6 : 8;
-
-  // If past 7pm, the furthest day is released; otherwise subtract 1
   const maxDays = hour >= 19 ? advanceDays : advanceDays - 1;
 
-  const minDate = new Date(today);
-  const maxDate = new Date(today);
-  maxDate.setDate(maxDate.getDate() + maxDays);
-
   const fmt = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-  dateInput.min = fmt(minDate);
-  dateInput.max = fmt(maxDate);
+  const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
-  // Clamp current value into range
-  if (dateInput.value < dateInput.min) dateInput.value = dateInput.min;
-  if (dateInput.value > dateInput.max) dateInput.value = dateInput.max;
+  dateSelect.innerHTML = '';
+  for (let i = 0; i <= maxDays; i++) {
+    const d = new Date(today);
+    d.setDate(d.getDate() + i);
+    const opt = document.createElement('option');
+    opt.value = fmt(d);
+    const label = i === 0 ? 'Today' : i === 1 ? 'Tomorrow' : `${dayNames[d.getDay()]}, ${monthNames[d.getMonth()]} ${d.getDate()}`;
+    opt.textContent = label;
+    dateSelect.appendChild(opt);
+  }
 
-  // If no value set, default to tomorrow (or today if tomorrow exceeds max)
-  if (!dateInput.value) {
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    dateInput.value = fmt(tomorrow) <= dateInput.max ? fmt(tomorrow) : dateInput.min;
+  // Restore previous selection if still in range, otherwise default to tomorrow
+  if (prevValue && [...dateSelect.options].some(o => o.value === prevValue)) {
+    dateSelect.value = prevValue;
+  } else if (dateSelect.options.length > 1) {
+    dateSelect.value = dateSelect.options[1].value;
   }
 }
 
@@ -491,9 +476,4 @@ document.addEventListener('DOMContentLoaded', () => {
   $('sniperMode').addEventListener('change', toggleSniperMode);
   $('autoBook').addEventListener('change', toggleCaptchaKey);
   $('bookingClass').addEventListener('change', updateDateRange);
-
-  // Set initial date to tomorrow (will be clamped once booking class is selected)
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  $('playDate').value = tomorrow.toISOString().split('T')[0];
 });
