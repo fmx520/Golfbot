@@ -4,15 +4,32 @@ Golf bot testing CLI with dry-run support and structured run logs.
 
 ## Usage
 
+From the repo root (`/workspace/Golfbot`), run:
+
 ```bash
-python3 golfbot_cli.py --dry-run
-python3 golfbot_cli.py
+python3 golfbot_cli.py \
+  --course-id pebble_beach \
+  --play-date 2026-05-10 \
+  --players 2 \
+  --time-start 07:00 \
+  --time-end 09:00 \
+  --dry-run
+```
+
+Real run (will prompt for final confirmation):
+
+```bash
+python3 golfbot_cli.py \
+  --course-id pebble_beach \
+  --play-date 2026-05-10 \
+  --players 2 \
+  --time-start 07:00 \
+  --time-end 09:00
 ```
 
 ### `--dry-run`
 
-`--dry-run` runs full discovery and booking preparation, emits timing/decision trace,
-and stops before the irreversible confirmation request.
+`--dry-run` runs discovery and interactive slot selection, then stops before the irreversible confirmation request.
 
 ## Logs
 

@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Golfbot CLI with dry-run support and structured run logging."""
+"""Golfbot CLI with interactive selection, dry-run support, and structured run logging."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 
@@ -61,69 +60,117 @@ class RunLogger:
         return path
 
 
-def simulate_work(seconds: float) -> None:
-    time.sleep(seconds)
+def _hhmm(value: str) -> time:
+    return time.fromisoformat(value)
 
 
-def perform_flow(dry_run: bool) -> tuple[bool, bool, RunLogger]:
-    run_id = uuid.uuid4().hex[:12]
-    logger = RunLogger(run_id)
+def _sample_inventory(course_id: str, play_date: date) -> list[dict[str, Any]]:
+    return [
+        {"course_id": course_id, "tee_time_id": f"{course_id}-{play_date}-1", "starts_at": "07:10", "spots": 4, "price": 129.00},
+        {"course_id": course_id, "tee_time_id": f"{course_id}-{play_date}-2", "starts_at": "07:40", "spots": 2, "price": 149.00},
+        {"course_id": course_id, "tee_time_id": f"{course_id}-{play_date}-3", "starts_at": "08:20", "spots": 4, "price": 139.00},
+        {"course_id": course_id, "tee_time_id": f"{course_id}-{play_date}-4", "starts_at": "09:10", "spots": 4, "price": 119.00},
+    ]
 
-    start = time.perf_counter()
-    simulate_work(0.03)
-    end = time.perf_counter()
-    logger.add_step("discovery", "selected_inventory", "Found 3 candidate tee times", start, end)
 
-    start = time.perf_counter()
-    simulate_work(0.04)
-    end = time.perf_counter()
-    logger.add_step("booking_prep", "chose_best_option", "Lowest points + preferred window", start, end)
+def _filter_inventory(inventory: list[dict[str, Any]], players: int, start: time, end: time) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for slot in inventory:
+        slot_time = time.fromisoformat(slot["starts_at"])
+        if slot["spots"] >= players and start <= slot_time <= end:
+            matches.append(slot)
+    return matches
 
-    if dry_run:
-        start = time.perf_counter()
-        simulate_work(0.01)
-        end = time.perf_counter()
-        logger.add_step(
-            "confirmation_gate",
-            "skipped_confirmation",
-            "Dry-run enabled; stopping before irreversible action",
-            start,
-            end,
-        )
-        logger.mark_success()
-        return True, False, logger
 
-    start = time.perf_counter()
-    simulate_work(0.03)
-    end = time.perf_counter()
-    logger.add_step("confirmation_gate", "sent_confirmation_request", "Ready for irreversible confirmation", start, end)
-    logger.mark_confirmation_sent()
-    logger.mark_success()
-    return True, True, logger
+def _choose_slot(slots: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not slots:
+        return None
+
+    print("\nMatching tee times:")
+    for i, slot in enumerate(slots, start=1):
+        print(f"  [{i}] {slot['starts_at']} | spots={slot['spots']} | ${slot['price']:.2f} | id={slot['tee_time_id']}")
+
+    while True:
+        selected = input("Pick a tee time number (or 'q' to cancel): ").strip().lower()
+        if selected == "q":
+            return None
+        if selected.isdigit():
+            idx = int(selected)
+            if 1 <= idx <= len(slots):
+                return slots[idx - 1]
+        print("Invalid selection. Try again.")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Golfbot CLI")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Perform discovery and booking preparation, then stop before confirmation request.",
-    )
+    parser = argparse.ArgumentParser(description="Golfbot interactive CLI")
+    parser.add_argument("--dry-run", action="store_true", help="Stop before sending confirmation request.")
+    parser.add_argument("--course-id", required=True, help="Course identifier")
+    parser.add_argument("--play-date", required=True, help="YYYY-MM-DD")
+    parser.add_argument("--players", required=True, type=int, help="Player count")
+    parser.add_argument("--time-start", required=True, help="HH:MM")
+    parser.add_argument("--time-end", required=True, help="HH:MM")
+    parser.add_argument("--payment-profile-id", default="demo-profile", help="Payment profile id")
+    parser.add_argument("--contact-email", default="demo@example.com", help="Contact email")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    success, confirmation_sent, logger = perform_flow(args.dry_run)
-    log_path = logger.write()
+    run_id = uuid.uuid4().hex[:12]
+    logger = RunLogger(run_id)
 
-    print(f"Run complete: success={success} dry_run={args.dry_run} confirmation_sent={confirmation_sent}")
-    print(f"Structured log: {log_path}")
+    play_date = date.fromisoformat(args.play_date)
+    t_start = _hhmm(args.time_start)
+    t_end = _hhmm(args.time_end)
+
+    step_start = datetime.now().timestamp()
+    inventory = _sample_inventory(args.course_id, play_date)
+    matches = _filter_inventory(inventory, args.players, t_start, t_end)
+    step_end = datetime.now().timestamp()
+    logger.add_step("discovery", "found_candidates", f"Found {len(matches)} matching tee times", step_start, step_end)
+
+    if not matches:
+        print("No tee times matched your criteria.")
+        log_path = logger.write()
+        print(f"Structured log: {log_path}")
+        return 1
+
+    selected = _choose_slot(matches)
+    if not selected:
+        logger.add_step("selection", "cancelled", "User cancelled selection", step_end, datetime.now().timestamp())
+        log_path = logger.write()
+        print("Selection cancelled.")
+        print(f"Structured log: {log_path}")
+        return 1
+
+    logger.add_step("selection", "selected_slot", f"Selected {selected['tee_time_id']}", step_end, datetime.now().timestamp())
+
+    print("\nPreparing booking request:")
+    print({"tee_time": selected, "payment_profile_id": args.payment_profile_id, "contact_email": args.contact_email})
 
     if args.dry_run:
-        print("Stopped before irreversible confirmation request (--dry-run).")
+        logger.add_step("confirmation_gate", "skipped_confirmation", "Dry-run enabled", datetime.now().timestamp(), datetime.now().timestamp())
+        logger.mark_success()
+        log_path = logger.write()
+        print("Dry-run complete. No booking submitted.")
+        print(f"Structured log: {log_path}")
+        return 0
 
-    return 0 if success else 1
+    confirm = input("Send booking confirmation request now? (y/N): ").strip().lower()
+    if confirm != "y":
+        logger.add_step("confirmation_gate", "aborted", "User chose not to confirm", datetime.now().timestamp(), datetime.now().timestamp())
+        log_path = logger.write()
+        print("Booking aborted by user.")
+        print(f"Structured log: {log_path}")
+        return 1
+
+    logger.add_step("confirmation_gate", "sent_confirmation_request", "User confirmed submission", datetime.now().timestamp(), datetime.now().timestamp())
+    logger.mark_confirmation_sent()
+    logger.mark_success()
+    log_path = logger.write()
+    print("Booking request submitted (simulated).")
+    print(f"Structured log: {log_path}")
+    return 0
 
 
 if __name__ == "__main__":
