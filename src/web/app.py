@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from src.booking.foreup_client import ForeUpBookingClient
+from src.config import load_config
 from src.discovery.foreup_client import ForeUpDiscoveryClient, ForeUpError
 
 app = FastAPI(title="Golfbot Web UI")
@@ -40,6 +41,7 @@ class JobState:
 
 JOBS: dict[str, JobState] = {}
 JOB_LOCK = Lock()
+APP_CONFIG = load_config()
 
 
 def _event(job: JobState, stage: str, message: str, **extra: Any) -> None:
@@ -82,8 +84,27 @@ def _select_slot(slots: list[dict[str, Any]], payload: dict[str, Any]) -> dict[s
     return None
 
 
+def _normalize_course(record: dict[str, Any]) -> dict[str, Any]:
+    course_id = str(
+        record.get("course_id")
+        or record.get("id")
+        or record.get("courseId")
+        or record.get("slug")
+        or ""
+    ).strip()
+    display_name = str(record.get("name") or record.get("course_name") or record.get("title") or course_id).strip()
+    return {
+        "course_id": course_id,
+        "display_name": display_name,
+        "raw": record,
+    }
+
+
 def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
     queue.put({"type": "status", "status": "running"})
+
+    def _finalize_worker() -> None:
+        queue.put({"type": "worker_done"})
 
     base_url = os.getenv("FOREUP_BASE_URL", "http://localhost:8080")
     username = os.getenv("FOREUP_USERNAME", "")
@@ -150,6 +171,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
                 terminal="failed",
             )
             queue.put({"type": "status", "status": "failed"})
+            _finalize_worker()
             return
 
         if payload.get("dry_run", True):
@@ -162,6 +184,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
                 slot=selected,
             )
             queue.put({"type": "status", "status": "succeeded"})
+            _finalize_worker()
             return
 
         submit_started = time.perf_counter()
@@ -195,16 +218,20 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
             confirmation=booking_response,
         )
         queue.put({"type": "status", "status": "succeeded"})
+        _finalize_worker()
     except ForeUpError as exc:
         _emit_event(queue, phase="confirm", stage="terminal", message=f"ForeUp request failed: {exc}", terminal="failed")
         queue.put({"type": "status", "status": "failed"})
+        _finalize_worker()
     except Exception as exc:  # noqa: BLE001
         _emit_event(queue, phase="confirm", stage="terminal", message=f"Unexpected worker error: {exc}", terminal="failed")
         queue.put({"type": "status", "status": "failed"})
+        _finalize_worker()
 
 
 def _watch_worker(job_id: str, queue: Queue, process: Process) -> None:
-    while process.is_alive() or not queue.empty():
+    worker_done = False
+    while not worker_done or process.is_alive():
         try:
             msg = queue.get(timeout=0.25)
         except Empty:
@@ -217,6 +244,8 @@ def _watch_worker(job_id: str, queue: Queue, process: Process) -> None:
                 job.updated_at = datetime.now(timezone.utc).isoformat()
             elif msg["type"] == "event":
                 _event(job, msg["stage"], msg["message"], **{k: v for k, v in msg.items() if k not in {"type", "stage", "message"}})
+            elif msg["type"] == "worker_done":
+                worker_done = True
 
     process.join(timeout=1)
 
@@ -242,6 +271,47 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
     return {"job_id": job_id}
 
 
+@app.get("/courses")
+def list_courses(q: str = "", live: bool = True) -> dict[str, Any]:
+    query = q.strip().lower()
+    username = os.getenv("FOREUP_USERNAME", "")
+    password = os.getenv("FOREUP_PASSWORD", "")
+
+    if live:
+        if not username or not password:
+            raise HTTPException(
+                status_code=503,
+                detail="Live course lookup requires FOREUP_USERNAME and FOREUP_PASSWORD.",
+            )
+        base_url = os.getenv("FOREUP_BASE_URL", "http://localhost:8080")
+        courses_path = os.getenv("FOREUP_COURSES_PATH", "/api/courses")
+        discovery = ForeUpDiscoveryClient(base_url=base_url)
+        request_id = f"courses-{uuid.uuid4().hex[:8]}"
+        try:
+            discovery.bootstrap_session(username=username, password=password, request_id=request_id)
+            live_courses = discovery.lookup_courses(request_id=request_id, path=courses_path)
+            normalized = [_normalize_course(course) for course in live_courses]
+            filtered = [course for course in normalized if course["course_id"] and (not query or query in course["course_id"].lower() or query in course["display_name"].lower())]
+            return {"source": "foreup_live", "courses": filtered}
+        except ForeUpError as exc:
+            raise HTTPException(status_code=503, detail=f"Live course lookup failed: {exc}") from exc
+
+    matches = []
+    for course_id, settings in APP_CONFIG.courses.items():
+        if query and query not in course_id.lower():
+            continue
+        matches.append(
+            {
+                "course_id": course_id,
+                "display_name": course_id.replace("_", " ").title(),
+                "default_players": settings.player_count,
+                "poll_interval_seconds": settings.poll_interval_seconds,
+                "target_windows": [{"start": window.start, "end": window.end} for window in settings.target_windows],
+            }
+        )
+    return {"source": "config/courses.yaml", "courses": matches, "warning": "live lookup disabled (live=false)"}
+
+
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str) -> dict[str, Any]:
     with JOB_LOCK:
@@ -263,7 +333,8 @@ def index() -> str:
 <!doctype html><html><body>
 <h2>Golfbot Web UI</h2>
 <form id='f'>
-  Course ID <input name='course_id' value='pebble_beach'><br/>
+  Course ID <input name='course_id' list='course-options' value='pebble_beach'><br/>
+  <datalist id='course-options'></datalist>
   Play Date <input name='play_date' value='2026-05-10'><br/>
   Players <input name='players' value='2' type='number' min='1' max='4'><br/>
   Time Start <input name='time_start' value='07:00'><br/>
@@ -274,6 +345,21 @@ def index() -> str:
 <pre id='out'></pre>
 <script>
 const out = document.getElementById('out');
+const courseList = document.getElementById('course-options');
+
+async function loadCourses() {
+  const res = await fetch('/courses');
+  const payload = await res.json();
+  courseList.innerHTML = '';
+  for (const course of payload.courses || []) {
+    const option = document.createElement('option');
+    option.value = course.course_id;
+    option.label = `default players: ${course.default_players}`;
+    courseList.appendChild(option);
+  }
+}
+
+loadCourses();
 document.getElementById('f').onsubmit = async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
