@@ -364,6 +364,7 @@ def index() -> str:
 <!doctype html><html><body>
 <h2>Golfbot Web UI</h2>
 <form id='f'>
+  ForeUp Booking URL <input name='foreup_booking_url' placeholder='https://foreupsoftware.com/index.php/booking/19765/2431#teetimes' size='90'><br/>
   Course ID <input name='course_id' list='course-options' value='pebble_beach'><br/>
   <datalist id='course-options'></datalist>
   Play Date <input name='play_date' value='2026-05-10'><br/>
