@@ -103,9 +103,10 @@ def _fetch_inventory(
         client.bootstrap_session(username=username, password=password, schedule_id=schedule_id, course_id=course_id, request_id=request_id)
         print("  Login successful.")
 
-    print(f"  Fetching tee times for {play_date} (schedule {schedule_id})...")
+    teesheet_id = course_id or schedule_id
+    print(f"  Fetching tee times for {play_date} (teesheet {teesheet_id})...")
     slots = client.lookup_availability(
-        schedule_id=schedule_id,
+        schedule_id=teesheet_id,
         date=play_date.isoformat(),
         players=players,
         holes=holes,

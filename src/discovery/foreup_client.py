@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Optional
 
+import json as _json
+
 import httpx
 
 
@@ -110,25 +112,52 @@ class ForeUpDiscoveryClient:
                 )
         return cls._shared_client
 
-    def _init_session(self, schedule_id: str = "19765") -> None:
+    def _init_session(self, schedule_id: str = "19765", teesheet_id: str = "") -> None:
         """Load the booking page to establish a PHPSESSID cookie and extract booking classes."""
         response = self.client.get(f"{self.base_url}/index.php/booking/{schedule_id}")
-        self._booking_classes = re.findall(
-            r'"booking_class_id"\s*:\s*"(\d+)"', response.text
-        )
-        # deduplicate while preserving order
+        self._booking_classes = self._extract_booking_classes(response.text, teesheet_id)
+        logger.info("extracted_booking_classes", extra={
+            "teesheet_id": teesheet_id,
+            "booking_classes": self._booking_classes,
+        })
+
+    def _extract_booking_classes(self, html: str, teesheet_id: str) -> list[str]:
+        m = re.search(r"SCHEDULES\s*=\s*(\[.*?\])\s*;", html, re.DOTALL)
+        if not m:
+            return self._extract_booking_classes_fallback(html)
+        try:
+            schedules = _json.loads(m.group(1))
+        except (ValueError, _json.JSONDecodeError):
+            return self._extract_booking_classes_fallback(html)
+
+        for sched in schedules:
+            if teesheet_id and sched.get("teesheet_id") != teesheet_id:
+                continue
+            bcs = sched.get("booking_classes", [])
+            if not bcs:
+                continue
+            visible = [
+                bc["booking_class_id"] for bc in bcs
+                if bc.get("active") == "1" and bc.get("hidden") != "1"
+            ]
+            if visible:
+                unprotected = [
+                    bc["booking_class_id"] for bc in bcs
+                    if bc.get("active") == "1" and bc.get("hidden") != "1"
+                    and bc.get("online_booking_protected") != "1"
+                ]
+                return unprotected + [v for v in visible if v not in unprotected]
+        return self._extract_booking_classes_fallback(html)
+
+    def _extract_booking_classes_fallback(self, html: str) -> list[str]:
+        raw = re.findall(r'"booking_class_id"\s*:\s*"(\d+)"', html)
         seen: set[str] = set()
-        deduped: list[str] = []
-        for bc in self._booking_classes:
-            if bc not in seen:
-                seen.add(bc)
-                deduped.append(bc)
-        self._booking_classes = deduped
+        return [bc for bc in raw if bc not in seen and not seen.add(bc)]
 
     def bootstrap_session(self, username: str, password: str, schedule_id: str = "", course_id: str = "", request_id: Optional[str] = None) -> dict[str, Any]:
         req_id = request_id or str(uuid.uuid4())
         sid = schedule_id or "19765"
-        self._init_session(sid)
+        self._init_session(sid, teesheet_id=course_id)
         response = self._request(
             "POST",
             FOREUP_LOGIN_PATH,

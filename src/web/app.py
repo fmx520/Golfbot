@@ -186,8 +186,9 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
             )
 
         fetch_started = time.perf_counter()
+        teesheet_id = resolved_course_id or resolved_schedule_id
         slots = discovery.lookup_availability(
-            schedule_id=resolved_schedule_id,
+            schedule_id=teesheet_id,
             date=payload["play_date"],
             players=payload["players"],
             holes=holes,
@@ -241,7 +242,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
         booking_response, booking_latency = booking.book_slot(
             idempotency_key=f"job-{job_id}-{selected.get('tee_time_id', 'unknown')}",
             slot=selected,
-            schedule_id=resolved_schedule_id,
+            schedule_id=teesheet_id,
             date=payload["play_date"],
             players=payload["players"],
             holes=holes,
