@@ -95,6 +95,7 @@ class ForeUpDiscoveryClient:
         self.base_url = base_url.rstrip("/")
         self.config = config or RequestConfig()
         self.client = self._get_or_create_client(self.config.timeout_seconds)
+        self._jwt: Optional[str] = None
 
     @classmethod
     def _get_or_create_client(cls, timeout_seconds: float) -> httpx.Client:
@@ -131,9 +132,15 @@ class ForeUpDiscoveryClient:
             retry_safe=False,
         )
         try:
-            return response.json()
+            result = response.json()
         except Exception:
             return {"status": "logged_in", "raw": response.text[:500]}
+
+        if isinstance(result, dict) and result.get("jwt"):
+            self._jwt = result["jwt"]
+            self.client.headers["X-Authorization"] = f"Bearer {self._jwt}"
+
+        return result
 
     def lookup_availability(
         self,
@@ -147,9 +154,12 @@ class ForeUpDiscoveryClient:
     ) -> list[dict[str, Any]]:
         req_id = request_id or str(uuid.uuid4())
         params: dict[str, Any] = {
-            "schedule_id": schedule_id,
+            "time": "all",
             "date": iso_to_foreup_date(date),
             "holes": holes,
+            "players": players,
+            "schedule_id": schedule_id,
+            "specials_only": 0,
             "api_key": FOREUP_API_KEY,
         }
         if booking_class:
