@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.24</span>
+        <span class="version-badge">v0.25</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -153,9 +153,9 @@
           </div>
           <div id="captchaKeyGroup" class="hidden">
             <div class="form-group">
-              <label for="captchaApiKey">Anti-Captcha API Key</label>
-              <input type="password" id="captchaApiKey" placeholder="Your anti-captcha.com API key">
-              <div class="form-hint">Required for auto-booking on reCAPTCHA-protected courses</div>
+              <label for="captchaApiKey">Anti-Captcha API Key (optional)</label>
+              <input type="password" id="captchaApiKey" placeholder="Leave blank to use server .env key">
+              <div class="form-hint">Only needed if no ANTICAPTCHA_API_KEY is set in the server .env file</div>
             </div>
           </div>
         </div>
