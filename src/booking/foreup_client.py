@@ -95,7 +95,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                         stage="reservation_submit",
                         request_id=req_id,
                         retry_safe=False,
-                        json=reservation_payload,
+                        data=reservation_payload,
                     ).json()
                 ),
             )

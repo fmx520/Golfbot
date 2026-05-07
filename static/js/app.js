@@ -209,7 +209,7 @@ async function searchTeeTimes() {
     sniper_mode: isSniper,
     release_time: isSniper ? $('releaseTime').value : '',
     auto_book: isSniper ? $('autoBook').checked : false,
-    anticaptcha_api_key: (isSniper && $('autoBook').checked) ? $('captchaApiKey').value.trim() : '',
+    anticaptcha_api_key: '',
   };
 
   try {
@@ -467,12 +467,7 @@ function toggleSniperMode() {
   toggleCaptchaKey();
 }
 
-function toggleCaptchaKey() {
-  const show = $('sniperMode').checked && $('autoBook').checked;
-  const group = $('captchaKeyGroup');
-  if (show) group.classList.remove('hidden');
-  else group.classList.add('hidden');
-}
+function toggleCaptchaKey() {}
 
 // Init
 document.addEventListener('DOMContentLoaded', () => {
