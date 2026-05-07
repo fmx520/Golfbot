@@ -133,6 +133,7 @@ async function connect() {
       });
     }
 
+    updateDateRange();
     goToStep(2);
   } catch (e) {
     showAlert('connectError', e.message);
@@ -405,6 +406,43 @@ function fireNotification(data) {
   } catch {}
 }
 
+// Date picker restrictions based on booking class
+function updateDateRange() {
+  const bcSelect = $('bookingClass');
+  const dateInput = $('playDate');
+  const selectedText = bcSelect.options[bcSelect.selectedIndex]?.textContent || '';
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const hour = now.getHours();
+
+  // Non-resident: 5 days advance; everyone else (resident classes): 7 days
+  const isNonResident = /non.?resident/i.test(selectedText);
+  const advanceDays = isNonResident ? 5 : 7;
+
+  // If past 7pm, the furthest day is released; otherwise subtract 1
+  const maxDays = hour >= 19 ? advanceDays : advanceDays - 1;
+
+  const minDate = new Date(today);
+  const maxDate = new Date(today);
+  maxDate.setDate(maxDate.getDate() + maxDays);
+
+  const fmt = d => d.toISOString().split('T')[0];
+  dateInput.min = fmt(minDate);
+  dateInput.max = fmt(maxDate);
+
+  // Clamp current value into range
+  if (dateInput.value < dateInput.min) dateInput.value = dateInput.min;
+  if (dateInput.value > dateInput.max) dateInput.value = dateInput.max;
+
+  // If no value set, default to tomorrow (or today if tomorrow exceeds max)
+  if (!dateInput.value) {
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    dateInput.value = fmt(tomorrow) <= dateInput.max ? fmt(tomorrow) : dateInput.min;
+  }
+}
+
 // Sniper toggle
 function toggleSniperMode() {
   const checked = $('sniperMode').checked;
@@ -436,8 +474,9 @@ document.addEventListener('DOMContentLoaded', () => {
   $('searchBtn').addEventListener('click', searchTeeTimes);
   $('sniperMode').addEventListener('change', toggleSniperMode);
   $('autoBook').addEventListener('change', toggleCaptchaKey);
+  $('bookingClass').addEventListener('change', updateDateRange);
 
-  // Set default date to tomorrow
+  // Set initial date to tomorrow (will be clamped once booking class is selected)
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
   $('playDate').value = tomorrow.toISOString().split('T')[0];
