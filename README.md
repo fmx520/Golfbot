@@ -31,6 +31,19 @@ python3 golfbot_cli.py \
 
 `--dry-run` runs discovery and interactive slot selection, then stops before the irreversible confirmation request.
 
+## Web UI (Option A: separate worker process)
+
+Run the web app:
+
+```bash
+cd /workspace/Golfbot
+uvicorn src.web.app:app --host 0.0.0.0 --port 8000
+```
+
+Then open `http://localhost:8000` and submit a job.
+
+Design note: the web server starts a separate worker **process** per job, so UI rendering/request handling stays off the timing-sensitive booking loop path.
+
 ## Logs
 
 Every run writes structured JSON to `logs/run_<id>.json` including:
@@ -51,3 +64,4 @@ The analyzer reports:
 - attempt counts
 - success rate
 - average race loss points (where latency was spent)
+README.md
