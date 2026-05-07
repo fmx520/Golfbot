@@ -254,6 +254,10 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
             _finalize_worker()
             return
 
+        raw_keys = list(selected.get("raw", {}).keys()) if selected.get("raw") else []
+        _emit_event(queue, phase="checkout", stage="debug",
+                    message=f"Slot raw keys: {raw_keys} | raw sample: {dict(list(selected.get('raw', {}).items())[:15])}")
+
         submit_started = time.perf_counter()
         booking_response, booking_latency = booking.book_slot(
             idempotency_key=f"job-{job_id}-{selected.get('tee_time_id', 'unknown')}",
