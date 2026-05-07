@@ -86,6 +86,7 @@ def _parse_booking_url(url: str) -> tuple[str, str, str]:
 def _fetch_inventory(
     base_url: str,
     schedule_id: str,
+    course_id: str,
     play_date: date,
     players: int,
     holes: int,
@@ -99,7 +100,7 @@ def _fetch_inventory(
 
     if username and password:
         print(f"  Logging in as {username}...")
-        client.bootstrap_session(username=username, password=password, schedule_id=schedule_id, request_id=request_id)
+        client.bootstrap_session(username=username, password=password, schedule_id=schedule_id, course_id=course_id, request_id=request_id)
         print("  Login successful.")
 
     print(f"  Fetching tee times for {play_date} (schedule {schedule_id})...")
@@ -194,6 +195,7 @@ def main() -> int:
         inventory = _fetch_inventory(
             base_url=base_url,
             schedule_id=schedule_id,
+            course_id=course_id,
             play_date=play_date,
             players=args.players,
             holes=args.holes,
@@ -250,7 +252,7 @@ def main() -> int:
 
         booking_client = ForeUpBookingClient(base_url=base_url)
         if username and password:
-            booking_client.bootstrap_session(username=username, password=password)
+            booking_client.bootstrap_session(username=username, password=password, schedule_id=schedule_id, course_id=course_id)
 
         book_start = datetime.now().timestamp()
         response, latency = booking_client.book_slot(

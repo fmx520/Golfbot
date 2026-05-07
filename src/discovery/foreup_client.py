@@ -112,7 +112,7 @@ class ForeUpDiscoveryClient:
         """Load the booking page to establish a PHPSESSID cookie before login."""
         self.client.get(f"{self.base_url}/index.php/booking/{schedule_id}")
 
-    def bootstrap_session(self, username: str, password: str, schedule_id: str = "", request_id: Optional[str] = None) -> dict[str, Any]:
+    def bootstrap_session(self, username: str, password: str, schedule_id: str = "", course_id: str = "", request_id: Optional[str] = None) -> dict[str, Any]:
         req_id = request_id or str(uuid.uuid4())
         self._init_session(schedule_id or "19765")
         response = self._request(
@@ -120,7 +120,13 @@ class ForeUpDiscoveryClient:
             FOREUP_LOGIN_PATH,
             stage="bootstrap",
             request_id=req_id,
-            data={"username": username, "password": password, "api_key": FOREUP_API_KEY, "booking_class_id": ""},
+            data={
+                "username": username,
+                "password": password,
+                "api_key": FOREUP_API_KEY,
+                "booking_class_id": "",
+                "course_id": course_id,
+            },
             retry_safe=False,
         )
         try:
