@@ -1,14 +1,62 @@
 # Golfbot
 
-Golf bot testing CLI with dry-run support and structured run logs.
+Automated tee time booking for courses that use [ForeUp](https://foreupsoftware.com) software. Supports both direct API booking and Playwright browser-automation fallback for courses with anti-bot protections.
 
-## Usage
-
-From the repo root (`/workspace/Golfbot`), run:
+## Setup
 
 ```bash
+pip install -r requirements.txt
+
+# Only needed if using Playwright fallback for anti-bot courses
+playwright install chromium
+```
+
+Copy `.env.example` to `.env` and fill in your ForeUp credentials:
+
+```bash
+cp .env.example .env
+```
+
+## Finding your course's booking URL
+
+Go to the course's online booking page — it'll look like:
+```
+https://foreupsoftware.com/index.php/booking/19765/2431#teetimes
+```
+
+The two numbers are:
+- **Schedule ID**: `19765`
+- **Course ID**: `2431`
+
+You can pass the full URL directly — the bot will extract both IDs automatically.
+
+## CLI Usage
+
+```bash
+# Dry run — discover tee times without booking
 python3 golfbot_cli.py \
-  --course-id pebble_beach \
+  --foreup-url "https://foreupsoftware.com/index.php/booking/19765/2431#teetimes" \
+  --play-date 2026-05-10 \
+  --players 2 \
+  --time-start 07:00 \
+  --time-end 09:00 \
+  --username your@email.com \
+  --password yourpassword \
+  --dry-run
+
+# Real booking (will prompt for confirmation)
+python3 golfbot_cli.py \
+  --foreup-url "https://foreupsoftware.com/index.php/booking/19765/2431#teetimes" \
+  --play-date 2026-05-10 \
+  --players 2 \
+  --time-start 07:00 \
+  --time-end 09:00
+
+# Using env vars instead of CLI flags
+export FOREUP_USERNAME=your@email.com
+export FOREUP_PASSWORD=yourpassword
+python3 golfbot_cli.py \
+  --schedule-id 19765 \
   --play-date 2026-05-10 \
   --players 2 \
   --time-start 07:00 \
@@ -16,52 +64,62 @@ python3 golfbot_cli.py \
   --dry-run
 ```
 
-Real run (will prompt for final confirmation):
+### CLI Options
+
+| Flag | Description |
+|------|-------------|
+| `--foreup-url` | Full ForeUp booking URL (extracts base URL, schedule ID, course ID) |
+| `--schedule-id` | ForeUp schedule ID (alternative to URL) |
+| `--course-id` | ForeUp course ID |
+| `--play-date` | Target date (YYYY-MM-DD) |
+| `--players` | Number of players (1-4) |
+| `--time-start` | Earliest acceptable tee time (HH:MM, 24h) |
+| `--time-end` | Latest acceptable tee time (HH:MM, 24h) |
+| `--holes` | 9 or 18 (default: 18) |
+| `--username` | ForeUp login email (or `FOREUP_USERNAME` env var) |
+| `--password` | ForeUp password (or `FOREUP_PASSWORD` env var) |
+| `--dry-run` | Discover and select tee times without booking |
+
+## Web UI
 
 ```bash
-python3 golfbot_cli.py \
-  --course-id pebble_beach \
-  --play-date 2026-05-10 \
-  --players 2 \
-  --time-start 07:00 \
-  --time-end 09:00
-```
-
-### `--dry-run`
-
-`--dry-run` runs discovery and interactive slot selection, then stops before the irreversible confirmation request.
-
-## Web UI (Option A: separate worker process)
-
-Run the web app:
-
-```bash
-cd /workspace/Golfbot
 uvicorn src.web.app:app --host 0.0.0.0 --port 8000
 ```
 
-Then open `http://localhost:8000` and submit a job.
+Open `http://localhost:8000`. The web UI lets you:
+- Enter ForeUp credentials
+- Paste a booking URL (auto-populates schedule/course IDs)
+- Set date, time window, player count
+- Run dry-run or real booking jobs
+- Watch job progress in real-time
 
-Design note: the web server starts a separate worker **process** per job, so UI rendering/request handling stays off the timing-sensitive booking loop path.
+## How it works
+
+1. **Auth** — Logs into ForeUp with your credentials via their booking API
+2. **Discovery** — Fetches available tee times for the target date/schedule
+3. **Filtering** — Matches slots to your time window and player count
+4. **Booking** — Validates slot availability, then submits a reservation (with idempotency guard to prevent double-bookings)
+5. **Anti-bot fallback** — If a course has reCAPTCHA or other protections, automatically falls back to Playwright browser automation
 
 ## Logs
 
-Every run writes structured JSON to `logs/run_<id>.json` including:
-
-- run metadata
-- decision trace
-- race loss points (latency by phase)
-- success/confirmation state
-
-## Analyze runs
+Every CLI run writes structured JSON to `logs/run_<id>.json` including decision traces, latency breakdowns, and success/failure state.
 
 ```bash
 python3 scripts/analyze_runs.py
 ```
 
-The analyzer reports:
+## Architecture
 
-- attempt counts
-- success rate
-- average race loss points (where latency was spent)
-README.md
+```
+src/
+  auth/          — Session token/cookie management interfaces
+  booking/       — ForeUp booking client, executor, Playwright fallback
+  discovery/     — ForeUp tee time discovery client
+  scheduler/     — High-frequency polling scheduler
+  telemetry/     — Latency measurement and metrics
+  web/           — FastAPI web server with inline UI
+  config.py      — YAML config loading, secret redaction
+config/
+  courses.yaml   — Per-course settings (schedule IDs, time windows, retry profiles)
+```

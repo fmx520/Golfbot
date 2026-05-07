@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: golfbot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: FOREUP_USERNAME
+        sync: false
+      - key: FOREUP_PASSWORD
+        sync: false
+      - key: FOREUP_BASE_URL
+        value: https://foreupsoftware.com

@@ -6,30 +6,47 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from multiprocessing import Process, Queue
+from pathlib import Path
 from queue import Empty
 from threading import Lock, Thread
 from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from src.booking.foreup_client import ForeUpBookingClient
 from src.config import load_config
-from src.discovery.foreup_client import ForeUpDiscoveryClient, ForeUpError
+from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError
+
+STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 
 app = FastAPI(title="Golfbot Web UI")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+class ConnectRequest(BaseModel):
+    username: str = ""
+    password: str = ""
+    booking_url: str = ""
+    schedule_id: str = ""
+    course_id: str = ""
 
 
 class StartJobRequest(BaseModel):
-    course_id: str
+    course_id: str = ""
+    schedule_id: str = ""
     play_date: str
     players: int = Field(ge=1, le=4)
     time_start: str
     time_end: str
+    holes: int = Field(default=18, ge=9, le=18)
     dry_run: bool = True
     foreup_booking_url: str | None = None
+    username: str = ""
+    password: str = ""
 
 
 @dataclass
@@ -79,47 +96,36 @@ def _emit_event(
 
 def _select_slot(slots: list[dict[str, Any]], payload: dict[str, Any]) -> dict[str, Any] | None:
     for slot in slots:
-        starts_at = str(slot.get("starts_at") or slot.get("time") or "")[:5]
-        spots = int(slot.get("spots") or slot.get("available_spots") or 0)
-        if spots >= payload["players"] and payload["time_start"] <= starts_at <= payload["time_end"]:
+        slot_time = slot.get("time", "")[:5]
+        spots = int(slot.get("available_spots", slot.get("spots", 0)))
+        if spots >= payload["players"] and payload["time_start"] <= slot_time <= payload["time_end"]:
             return slot
     return None
 
 
-def _normalize_course(record: dict[str, Any]) -> dict[str, Any]:
-    course_id = str(
-        record.get("course_id")
-        or record.get("id")
-        or record.get("courseId")
-        or record.get("slug")
-        or ""
-    ).strip()
-    display_name = str(record.get("name") or record.get("course_name") or record.get("title") or course_id).strip()
-    return {
-        "course_id": course_id,
-        "display_name": display_name,
-        "raw": record,
-    }
-
-
-
-
-def _extract_foreup_target(booking_url: str | None, fallback_base_url: str, fallback_course_id: str) -> tuple[str, str]:
+def _extract_foreup_target(booking_url: str | None, fallback_base_url: str, fallback_schedule_id: str, fallback_course_id: str) -> tuple[str, str, str]:
     if not booking_url:
-        return fallback_base_url, fallback_course_id
+        return fallback_base_url, fallback_schedule_id, fallback_course_id
 
     parsed = urlparse(booking_url)
     if not parsed.scheme or not parsed.netloc:
-        return fallback_base_url, fallback_course_id
+        return fallback_base_url, fallback_schedule_id, fallback_course_id
 
     path_parts = [part for part in parsed.path.split("/") if part]
     base_url = f"{parsed.scheme}://{parsed.netloc}"
+    schedule_id = fallback_schedule_id
     course_id = fallback_course_id
+
     if "booking" in path_parts:
         booking_ix = path_parts.index("booking")
-        if booking_ix + 2 < len(path_parts):
-            course_id = path_parts[booking_ix + 2]
-    return base_url, course_id
+        remaining = path_parts[booking_ix + 1:]
+        if len(remaining) >= 1:
+            schedule_id = remaining[0]
+        if len(remaining) >= 2:
+            course_id = remaining[1]
+
+    return base_url, schedule_id, course_id
+
 
 def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
     queue.put({"type": "status", "status": "running"})
@@ -127,14 +133,32 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
     def _finalize_worker() -> None:
         queue.put({"type": "worker_done"})
 
-    default_base_url = os.getenv("FOREUP_BASE_URL", "http://localhost:8080")
-    base_url, resolved_course_id = _extract_foreup_target(
+    default_base_url = os.getenv("FOREUP_BASE_URL", "https://foreupsoftware.com")
+    default_schedule_id = os.getenv("FOREUP_SCHEDULE_ID", "")
+    default_course_id = os.getenv("FOREUP_COURSE_ID", "")
+
+    base_url, resolved_schedule_id, resolved_course_id = _extract_foreup_target(
         payload.get("foreup_booking_url"),
         fallback_base_url=default_base_url,
-        fallback_course_id=payload["course_id"],
+        fallback_schedule_id=payload.get("schedule_id") or default_schedule_id,
+        fallback_course_id=payload.get("course_id") or default_course_id,
     )
-    username = os.getenv("FOREUP_USERNAME", "")
-    password = os.getenv("FOREUP_PASSWORD", "")
+
+    username = payload.get("username") or os.getenv("FOREUP_USERNAME", "")
+    password = payload.get("password") or os.getenv("FOREUP_PASSWORD", "")
+    holes = payload.get("holes", 18)
+
+    if not resolved_schedule_id:
+        _emit_event(
+            queue,
+            phase="confirm",
+            stage="terminal",
+            message="No schedule_id provided. Enter a ForeUp booking URL or set FOREUP_SCHEDULE_ID.",
+            terminal="failed",
+        )
+        queue.put({"type": "status", "status": "failed"})
+        _finalize_worker()
+        return
 
     discovery = ForeUpDiscoveryClient(base_url=base_url)
     booking = ForeUpBookingClient(base_url=base_url)
@@ -157,25 +181,25 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
                 queue,
                 phase="auth",
                 stage="session",
-                message="Skipping ForeUp bootstrap (credentials not configured)",
+                message="No credentials provided — attempting unauthenticated lookup",
                 latency_ms=round((time.perf_counter() - auth_started) * 1000, 2),
             )
 
         fetch_started = time.perf_counter()
-        availability = discovery.lookup_availability(
-            course_id=resolved_course_id, date=payload["play_date"], players=payload["players"], request_id=request_id
+        slots = discovery.lookup_availability(
+            schedule_id=resolved_schedule_id,
+            date=payload["play_date"],
+            players=payload["players"],
+            holes=holes,
+            request_id=request_id,
         )
         _emit_event(
             queue,
             phase="discovery",
             stage="course_availability_fetch",
-            message="Fetched course availability",
+            message=f"Fetched {len(slots)} available tee times",
             latency_ms=round((time.perf_counter() - fetch_started) * 1000, 2),
         )
-
-        slots = availability.get("slots") if isinstance(availability, dict) else None
-        if not isinstance(slots, list):
-            slots = []
 
         filter_started = time.perf_counter()
         selected = _select_slot(slots, payload)
@@ -193,7 +217,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
                 queue,
                 phase="confirm",
                 stage="terminal",
-                message="No matching tee times found",
+                message="No matching tee times found in the requested window",
                 terminal="failed",
             )
             queue.put({"type": "status", "status": "failed"})
@@ -205,7 +229,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
                 queue,
                 phase="confirm",
                 stage="booking_confirmation",
-                message="Dry run enabled; booking submit skipped",
+                message=f"Dry run — found slot at {selected['time']} with {selected['available_spots']} spots (${selected.get('green_fee', '?')})",
                 terminal="dry_run_stopped",
                 slot=selected,
             )
@@ -214,24 +238,20 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
             return
 
         submit_started = time.perf_counter()
-        booking_payload = {
-            "course_id": resolved_course_id,
-            "date": payload["play_date"],
-            "players": payload["players"],
-            "tee_time_id": selected.get("tee_time_id"),
-        }
-        confirm_payload = dict(booking_payload)
         booking_response, booking_latency = booking.book_slot(
             idempotency_key=f"job-{job_id}-{selected.get('tee_time_id', 'unknown')}",
-            slot_payload=booking_payload,
-            confirm_payload=confirm_payload,
+            slot=selected,
+            schedule_id=resolved_schedule_id,
+            date=payload["play_date"],
+            players=payload["players"],
+            holes=holes,
             request_id=request_id,
         )
         _emit_event(
             queue,
             phase="checkout",
             stage="booking_submit",
-            message="Submitted booking request",
+            message="Submitted booking reservation",
             latency_ms=round((time.perf_counter() - submit_started) * 1000, 2),
             provider_latency_ms=booking_latency.total_ms,
         )
@@ -245,6 +265,17 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
         )
         queue.put({"type": "status", "status": "succeeded"})
         _finalize_worker()
+
+    except AntiBotDetectedError as exc:
+        _emit_event(
+            queue,
+            phase="auth",
+            stage="antibot",
+            message=f"Anti-bot protection detected: {exc}. Attempting Playwright fallback...",
+        )
+        _run_playwright_fallback(job_id, payload, queue, base_url, username, password)
+        _finalize_worker()
+
     except ForeUpError as exc:
         _emit_event(queue, phase="confirm", stage="terminal", message=f"ForeUp request failed: {exc}", terminal="failed")
         queue.put({"type": "status", "status": "failed"})
@@ -253,6 +284,82 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
         _emit_event(queue, phase="confirm", stage="terminal", message=f"Unexpected worker error: {exc}", terminal="failed")
         queue.put({"type": "status", "status": "failed"})
         _finalize_worker()
+
+
+def _run_playwright_fallback(
+    job_id: str,
+    payload: dict[str, Any],
+    queue: Queue,
+    base_url: str,
+    username: str,
+    password: str,
+) -> None:
+    try:
+        from src.booking.playwright_fallback import PlaywrightBookingClient, PlaywrightBookingError
+
+        booking_url = payload.get("foreup_booking_url") or base_url
+        pw_client = PlaywrightBookingClient()
+
+        try:
+            pw_started = time.perf_counter()
+            pw_client.login(booking_url, username, password)
+            _emit_event(
+                queue,
+                phase="auth",
+                stage="playwright_login",
+                message="Playwright login successful",
+                latency_ms=round((time.perf_counter() - pw_started) * 1000, 2),
+            )
+
+            find_started = time.perf_counter()
+            pw_slots = pw_client.find_times(payload["play_date"], payload["players"])
+            _emit_event(
+                queue,
+                phase="discovery",
+                stage="playwright_discovery",
+                message=f"Playwright found {len(pw_slots)} slots",
+                latency_ms=round((time.perf_counter() - find_started) * 1000, 2),
+            )
+
+            matching = None
+            for ps in pw_slots:
+                t = ps.time[:5]
+                if payload["time_start"] <= t <= payload["time_end"]:
+                    matching = ps
+                    break
+
+            if not matching:
+                _emit_event(queue, phase="confirm", stage="terminal", message="Playwright: no matching slots", terminal="failed")
+                queue.put({"type": "status", "status": "failed"})
+                return
+
+            dry_run = payload.get("dry_run", True)
+            result = pw_client.book_slot(matching, dry_run=dry_run)
+            terminal = "dry_run_stopped" if dry_run else ("success" if result.get("status") == "confirmed" else "unknown")
+            _emit_event(
+                queue,
+                phase="confirm",
+                stage="playwright_booking",
+                message=f"Playwright booking result: {result.get('status', 'unknown')}",
+                terminal=terminal,
+                confirmation=result,
+            )
+            queue.put({"type": "status", "status": "succeeded" if terminal != "failed" else "failed"})
+        finally:
+            pw_client.close()
+
+    except ImportError:
+        _emit_event(
+            queue,
+            phase="confirm",
+            stage="terminal",
+            message="Playwright not installed. Run: pip install playwright && playwright install chromium",
+            terminal="failed",
+        )
+        queue.put({"type": "status", "status": "failed"})
+    except Exception as exc:  # noqa: BLE001
+        _emit_event(queue, phase="confirm", stage="terminal", message=f"Playwright fallback failed: {exc}", terminal="failed")
+        queue.put({"type": "status", "status": "failed"})
 
 
 def _watch_worker(job_id: str, queue: Queue, process: Process) -> None:
@@ -276,7 +383,51 @@ def _watch_worker(job_id: str, queue: Queue, process: Process) -> None:
     process.join(timeout=1)
 
 
-@app.post("/jobs")
+# --- Routes ---
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/api/connect")
+def connect(req: ConnectRequest) -> dict[str, Any]:
+    base_url = os.getenv("FOREUP_BASE_URL", "https://foreupsoftware.com")
+    schedule_id = req.schedule_id
+    course_id = req.course_id
+
+    if req.booking_url:
+        base_url, parsed_sched, parsed_course = _extract_foreup_target(
+            req.booking_url, base_url, schedule_id, course_id
+        )
+        schedule_id = schedule_id or parsed_sched
+        course_id = course_id or parsed_course
+
+    username = req.username or os.getenv("FOREUP_USERNAME", "")
+    password = req.password or os.getenv("FOREUP_PASSWORD", "")
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Username and password are required")
+
+    try:
+        client = ForeUpDiscoveryClient(base_url=base_url)
+        client.bootstrap_session(username=username, password=password, request_id=f"connect-{uuid.uuid4().hex[:8]}")
+    except AntiBotDetectedError:
+        raise HTTPException(status_code=403, detail="Anti-bot protection detected. This course may require Playwright fallback.")
+    except ForeUpError as exc:
+        raise HTTPException(status_code=401, detail=f"ForeUp login failed: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Connection error: {exc}")
+
+    return {
+        "connected": True,
+        "base_url": base_url,
+        "schedule_id": schedule_id,
+        "course_id": course_id,
+    }
+
+
+@app.post("/api/jobs")
 def start_job(req: StartJobRequest) -> dict[str, str]:
     job_id = uuid.uuid4().hex[:12]
     state = JobState(job_id=job_id)
@@ -284,49 +435,26 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
         JOBS[job_id] = state
 
     payload = req.model_dump()
+    payload.pop("password", None)
+    safe_payload = {k: v for k, v in payload.items() if k != "password"}
+
+    full_payload = req.model_dump()
     queue: Queue = Queue()
-    proc = Process(target=_worker_main, args=(job_id, payload, queue), daemon=True)
+    proc = Process(target=_worker_main, args=(job_id, full_payload, queue), daemon=True)
     proc.start()
 
     watcher = Thread(target=_watch_worker, args=(job_id, queue, proc), daemon=True)
     watcher.start()
 
     with JOB_LOCK:
-        _event(JOBS[job_id], "job", "Job started", request=payload)
+        _event(JOBS[job_id], "job", "Job started", request=safe_payload)
 
     return {"job_id": job_id}
 
 
-@app.get("/courses")
-def list_courses(q: str = "", live: bool = True, booking_url: str | None = None) -> dict[str, Any]:
+@app.get("/api/courses")
+def list_courses(q: str = "") -> dict[str, Any]:
     query = q.strip().lower()
-    username = os.getenv("FOREUP_USERNAME", "")
-    password = os.getenv("FOREUP_PASSWORD", "")
-
-    if live:
-        if not username or not password:
-            raise HTTPException(
-                status_code=503,
-                detail="Live course lookup requires FOREUP_USERNAME and FOREUP_PASSWORD.",
-            )
-        env_base_url = os.getenv("FOREUP_BASE_URL", "http://localhost:8080")
-        base_url, _ = _extract_foreup_target(
-            booking_url,
-            fallback_base_url=env_base_url,
-            fallback_course_id="",
-        )
-        courses_path = os.getenv("FOREUP_COURSES_PATH", "/api/courses")
-        discovery = ForeUpDiscoveryClient(base_url=base_url)
-        request_id = f"courses-{uuid.uuid4().hex[:8]}"
-        try:
-            discovery.bootstrap_session(username=username, password=password, request_id=request_id)
-            live_courses = discovery.lookup_courses(request_id=request_id, path=courses_path)
-            normalized = [_normalize_course(course) for course in live_courses]
-            filtered = [course for course in normalized if course["course_id"] and (not query or query in course["course_id"].lower() or query in course["display_name"].lower())]
-            return {"source": "foreup_live", "courses": filtered}
-        except ForeUpError as exc:
-            raise HTTPException(status_code=503, detail=f"Live course lookup failed: {exc}") from exc
-
     matches = []
     for course_id, settings in APP_CONFIG.courses.items():
         if query and query not in course_id.lower():
@@ -336,14 +464,18 @@ def list_courses(q: str = "", live: bool = True, booking_url: str | None = None)
                 "course_id": course_id,
                 "display_name": course_id.replace("_", " ").title(),
                 "default_players": settings.player_count,
+                "schedule_id": settings.schedule_id,
+                "foreup_course_id": settings.foreup_course_id,
+                "booking_url": settings.booking_url,
+                "holes": settings.holes,
                 "poll_interval_seconds": settings.poll_interval_seconds,
-                "target_windows": [{"start": window.start, "end": window.end} for window in settings.target_windows],
+                "target_windows": [{"start": w.start, "end": w.end} for w in settings.target_windows],
             }
         )
-    return {"source": "config/courses.yaml", "courses": matches, "warning": "live lookup disabled (live=false)"}
+    return {"source": "config/courses.yaml", "courses": matches}
 
 
-@app.get("/jobs/{job_id}")
+@app.get("/api/jobs/{job_id}")
 def get_job(job_id: str) -> dict[str, Any]:
     with JOB_LOCK:
         job = JOBS.get(job_id)
@@ -358,60 +490,6 @@ def get_job(job_id: str) -> dict[str, Any]:
         }
 
 
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    return """
-<!doctype html><html><body>
-<h2>Golfbot Web UI</h2>
-<form id='f'>
-  ForeUp Booking URL <input name='foreup_booking_url' placeholder='https://foreupsoftware.com/index.php/booking/19765/2431#teetimes' size='90'><br/>
-  Course ID <input name='course_id' list='course-options' value='pebble_beach'><br/>
-  <datalist id='course-options'></datalist>
-  Play Date <input name='play_date' value='2026-05-10'><br/>
-  Players <input name='players' value='2' type='number' min='1' max='4'><br/>
-  Time Start <input name='time_start' value='07:00'><br/>
-  Time End <input name='time_end' value='09:00'><br/>
-  Dry Run <input name='dry_run' type='checkbox' checked><br/>
-  <button>Start Job</button>
-</form>
-<pre id='out'></pre>
-<script>
-const out = document.getElementById('out');
-const courseList = document.getElementById('course-options');
-
-async function loadCourses() {
-  const bookingUrl = document.querySelector("input[name='foreup_booking_url']")?.value?.trim();
-  const endpoint = bookingUrl ? `/courses?booking_url=${encodeURIComponent(bookingUrl)}` : '/courses';
-  const res = await fetch(endpoint);
-  const payload = await res.json();
-  courseList.innerHTML = '';
-  for (const course of payload.courses || []) {
-    const option = document.createElement('option');
-    option.value = course.course_id;
-    option.label = `default players: ${course.default_players}`;
-    courseList.appendChild(option);
-  }
-}
-
-loadCourses();
-document.querySelector("input[name='foreup_booking_url']")?.addEventListener('change', loadCourses);
-document.getElementById('f').onsubmit = async (e) => {
-  e.preventDefault();
-  const fd = new FormData(e.target);
-  const payload = Object.fromEntries(fd.entries());
-  payload.players = Number(payload.players);
-  payload.dry_run = fd.get('dry_run') === 'on';
-  const res = await fetch('/jobs', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload)});
-  const {job_id} = await res.json();
-  out.textContent = 'job ' + job_id + '\n';
-
-  const timer = setInterval(async () => {
-    const jr = await fetch('/jobs/' + job_id);
-    const js = await jr.json();
-    out.textContent = JSON.stringify(js, null, 2);
-    if (['succeeded','failed'].includes(js.status)) clearInterval(timer);
-  }, 400);
-}
-</script>
-</body></html>
-"""
+@app.get("/")
+def index():
+    return FileResponse(str(STATIC_DIR / "index.html"))

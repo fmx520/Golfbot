@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Golfbot</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <div class="app-container">
+
+    <!-- Header -->
+    <header class="app-header">
+      <h1><span>&#9971;</span> Golfbot</h1>
+      <div class="connection-badge" id="connectionBadge">Not Connected</div>
+    </header>
+
+    <!-- Step Indicator -->
+    <div class="step-indicator">
+      <div class="step-group">
+        <div class="step-circle active" data-step="1">1</div>
+        <div class="step-label active" data-step="1">Connect</div>
+      </div>
+      <div class="step-line" data-after="1"></div>
+      <div class="step-group">
+        <div class="step-circle" data-step="2">2</div>
+        <div class="step-label" data-step="2">Find Times</div>
+      </div>
+      <div class="step-line" data-after="2"></div>
+      <div class="step-group">
+        <div class="step-circle" data-step="3">3</div>
+        <div class="step-label" data-step="3">Results</div>
+      </div>
+    </div>
+
+    <!-- Step 1: Connect -->
+    <section id="step1" class="step-content active">
+      <h2 class="page-title">Connect to ForeUp</h2>
+      <p class="page-description">Enter your ForeUp credentials and the booking URL for the course you want to book.</p>
+
+      <div class="alert alert-error" id="connectError"></div>
+
+      <div class="card">
+        <div class="card-title">ForeUp Booking URL</div>
+        <div class="card-subtitle">Paste the booking page URL from your course's website. The schedule and course IDs will be extracted automatically.</div>
+        <div class="form-group">
+          <label for="bookingUrl">Booking URL</label>
+          <input type="url" id="bookingUrl" placeholder="https://foreupsoftware.com/index.php/booking/19765/2431#teetimes">
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="scheduleId">Schedule ID</label>
+            <input type="text" id="scheduleId" placeholder="e.g. 19765">
+          </div>
+          <div class="form-group">
+            <label for="courseId">Course ID</label>
+            <input type="text" id="courseId" placeholder="e.g. 2431">
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Login Credentials</div>
+        <div class="card-subtitle">Your ForeUp account email and password. Credentials are sent directly to ForeUp and never stored.</div>
+        <div class="form-group">
+          <label for="username">Email</label>
+          <input type="email" id="username" placeholder="your_email@example.com">
+        </div>
+        <div class="form-group">
+          <label for="password">Password</label>
+          <input type="password" id="password" placeholder="Your ForeUp password">
+        </div>
+      </div>
+
+      <button class="btn btn-primary btn-block" id="connectBtn">Connect</button>
+    </section>
+
+    <!-- Step 2: Find Tee Times -->
+    <section id="step2" class="step-content">
+      <h2 class="page-title">Find Tee Times</h2>
+      <p class="page-description">Set your date, time window, and player count to search for available tee times.</p>
+
+      <div class="alert alert-error" id="searchError"></div>
+
+      <div class="card">
+        <div class="card-title">Search Criteria</div>
+        <div class="form-group">
+          <label for="playDate">Play Date</label>
+          <input type="date" id="playDate">
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="timeStart">Earliest Time</label>
+            <input type="time" id="timeStart" value="07:00">
+          </div>
+          <div class="form-group">
+            <label for="timeEnd">Latest Time</label>
+            <input type="time" id="timeEnd" value="09:00">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="players">Players</label>
+            <select id="players">
+              <option value="1">1</option>
+              <option value="2" selected>2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="holes">Holes</label>
+            <select id="holes">
+              <option value="18" selected>18 Holes</option>
+              <option value="9">9 Holes</option>
+            </select>
+          </div>
+        </div>
+        <div class="checkbox-group">
+          <input type="checkbox" id="dryRun" checked>
+          <label for="dryRun">Dry Run (find times only, don't book)</label>
+        </div>
+      </div>
+
+      <button class="btn btn-primary btn-block" id="searchBtn">Search Tee Times</button>
+
+      <div class="mt-2" id="eventLogContainer" class="hidden">
+        <div class="card">
+          <div class="card-title">Job Progress</div>
+          <div class="event-log" id="eventLog"></div>
+        </div>
+      </div>
+
+      <div id="slotsContainer" class="hidden mt-2">
+        <div class="card">
+          <div class="card-title">Available Tee Times</div>
+          <div class="table-container">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Spots</th>
+                  <th>Green Fee</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="slotsBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <button class="btn btn-secondary mt-2" onclick="backToStep(1)">Back to Connect</button>
+    </section>
+
+    <!-- Step 3: Results -->
+    <section id="step3" class="step-content">
+      <h2 class="page-title">Results</h2>
+      <p class="page-description">Your tee time search results.</p>
+
+      <div id="resultsContent">
+        <div class="empty-state">No results yet.</div>
+      </div>
+
+      <div class="mt-2">
+        <div class="card">
+          <div class="card-title">Event Log</div>
+          <div class="event-log" id="resultsEventLog"></div>
+        </div>
+      </div>
+
+      <button class="btn btn-secondary mt-2" onclick="backToStep(2)">Search Again</button>
+    </section>
+
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

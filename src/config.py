@@ -25,6 +25,10 @@ DEFAULT_COURSE_SETTINGS = {
     "target_windows": [],
     "retry_profile": DEFAULT_RETRY_PROFILE,
     "player_count": 4,
+    "schedule_id": "",
+    "foreup_course_id": "",
+    "booking_url": "",
+    "holes": 18,
 }
 
 DEFAULT_SECRET_KEYS = {
@@ -63,6 +67,10 @@ class CourseSettings:
     target_windows: tuple[TargetWindow, ...] = ()
     retry_profile: RetryProfile = RetryProfile()
     player_count: int = 4
+    schedule_id: str = ""
+    foreup_course_id: str = ""
+    booking_url: str = ""
+    holes: int = 18
 
 
 @dataclass(frozen=True)
@@ -131,11 +139,19 @@ def _parse_course_settings(value: Any, base: dict[str, Any] | None = None) -> Co
     if not isinstance(player_count, int) or not (1 <= player_count <= 4):
         raise ValueError("player_count must be an integer between 1 and 4")
 
+    holes = merged.get("holes", 18)
+    if not isinstance(holes, int) or holes not in (9, 18):
+        raise ValueError("holes must be 9 or 18")
+
     return CourseSettings(
         poll_interval_seconds=poll_interval,
         target_windows=_parse_windows(merged.get("target_windows")),
         retry_profile=_parse_retry_profile(merged.get("retry_profile")),
         player_count=player_count,
+        schedule_id=str(merged.get("schedule_id", "")),
+        foreup_course_id=str(merged.get("foreup_course_id", "")),
+        booking_url=str(merged.get("booking_url", "")),
+        holes=holes,
     )
 
 
@@ -169,6 +185,10 @@ def load_config(path: str | Path = "config/courses.yaml") -> AppConfig:
             "max_backoff_seconds": defaults.retry_profile.max_backoff_seconds,
         },
         "player_count": defaults.player_count,
+        "schedule_id": defaults.schedule_id,
+        "foreup_course_id": defaults.foreup_course_id,
+        "booking_url": defaults.booking_url,
+        "holes": defaults.holes,
     }
 
     courses = {
@@ -210,7 +230,11 @@ def configure_logger(name: str, level: int = logging.INFO) -> logging.Logger:
 
 def env_secrets() -> dict[str, str]:
     """Read environment secrets without logging raw values."""
-    keys = ["API_TOKEN", "SESSION_COOKIE", "USER_EMAIL", "USER_PHONE", "PLAYER_NAME"]
+    keys = [
+        "FOREUP_USERNAME", "FOREUP_PASSWORD", "FOREUP_BASE_URL",
+        "FOREUP_SCHEDULE_ID", "FOREUP_COURSE_ID",
+        "API_TOKEN", "SESSION_COOKIE", "USER_EMAIL", "USER_PHONE", "PLAYER_NAME",
+    ]
     return {k: os.getenv(k, "") for k in keys}
 
 

@@ -10,7 +10,17 @@ from typing import Any, Optional
 
 import httpx
 
-from src.discovery.foreup_client import ForeUpError, ForeUpDiscoveryClient, RetryableHttpError, StaleSlotError
+from src.discovery.foreup_client import (
+    FOREUP_API_KEY,
+    FOREUP_RESERVATIONS_PATH,
+    FOREUP_TIMES_PATH,
+    AntiBotDetectedError,
+    ForeUpDiscoveryClient,
+    ForeUpError,
+    RetryableHttpError,
+    StaleSlotError,
+    iso_to_foreup_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +47,11 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         self,
         *,
         idempotency_key: str,
-        slot_payload: dict[str, Any],
-        confirm_payload: dict[str, Any],
+        slot: dict[str, Any],
+        schedule_id: str,
+        date: str,
+        players: int,
+        holes: int = 18,
         request_id: Optional[str] = None,
     ) -> tuple[dict[str, Any], BookingLatency]:
         req_id = request_id or str(uuid.uuid4())
@@ -49,25 +62,37 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         try:
             stage_latencies["slot_validation"] = self._timed_stage(
                 "slot_validation",
-                lambda: self._request("POST", "/api/slots/validate", stage="slot_validation", request_id=req_id, retry_safe=False, json=slot_payload),
-            )
-            stage_latencies["slot_hold"] = self._timed_stage(
-                "slot_hold",
-                lambda: self._request("POST", "/api/slots/hold", stage="slot_hold", request_id=req_id, retry_safe=False, json=slot_payload),
+                lambda: self._validate_slot_still_available(
+                    schedule_id=schedule_id,
+                    date=date,
+                    slot=slot,
+                    request_id=req_id,
+                ),
             )
 
+            reservation_payload = {
+                "time": slot.get("raw_time", slot.get("time", "")),
+                "date": iso_to_foreup_date(date),
+                "holes": holes,
+                "players": players,
+                "schedule_id": schedule_id,
+                "booking_class_id": slot.get("booking_class_id", ""),
+                "teesheet_id": slot.get("teesheet_id", ""),
+                "green_fee": slot.get("green_fee", ""),
+                "api_key": FOREUP_API_KEY,
+            }
+
             response: dict[str, Any] = {}
-            stage_latencies["final_booking"] = self._timed_stage(
-                "final_booking",
+            stage_latencies["reservation_submit"] = self._timed_stage(
+                "reservation_submit",
                 lambda: response.update(
                     self._request(
                         "POST",
-                        "/api/bookings/confirm",
-                        stage="final_booking",
+                        FOREUP_RESERVATIONS_PATH,
+                        stage="reservation_submit",
                         request_id=req_id,
                         retry_safe=False,
-                        headers={"Idempotency-Key": idempotency_key},
-                        json=confirm_payload,
+                        json=reservation_payload,
                     ).json()
                 ),
             )
@@ -76,20 +101,57 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             total_ms = round((time.perf_counter() - flow_started) * 1000, 2)
             self._log_flow(req_id, flow_started, total_ms, stage_latencies, "ok")
             return response, BookingLatency(request_id=req_id, total_ms=total_ms, stages=stage_latencies)
-        except RetryableHttpError:
+        except (RetryableHttpError, ForeUpError):
             self._release_idempotency_key(idempotency_key)
             self._log_flow(req_id, flow_started, None, stage_latencies, "error")
             raise
-        except ForeUpError:
-            self._release_idempotency_key(idempotency_key)
-            self._log_flow(req_id, flow_started, None, stage_latencies, "error")
-            raise
+
+    def _validate_slot_still_available(
+        self,
+        *,
+        schedule_id: str,
+        date: str,
+        slot: dict[str, Any],
+        request_id: str,
+    ) -> None:
+        response = self._request(
+            "GET",
+            FOREUP_TIMES_PATH,
+            stage="slot_validation",
+            request_id=request_id,
+            params={
+                "schedule_id": schedule_id,
+                "date": iso_to_foreup_date(date),
+                "api_key": FOREUP_API_KEY,
+            },
+            retry_safe=True,
+        )
+        try:
+            raw = response.json()
+        except Exception:
+            raise ForeUpError("Could not parse availability response during validation")
+
+        items = raw if isinstance(raw, list) else raw.get("times", raw.get("slots", []))
+        if not isinstance(items, list):
+            raise ForeUpError("Unexpected availability response format")
+
+        target_time = slot.get("time", "")
+        target_id = slot.get("tee_time_id", "")
+        for item in items:
+            item_time = str(item.get("time", item.get("starts_at", "")))
+            item_id = str(item.get("tee_time_id", item.get("teeTimeId", item.get("id", ""))))
+            available = int(item.get("available_spots", item.get("spots", item.get("openSpots", 0))))
+            if (item_id and item_id == target_id) or target_time in item_time:
+                if available >= 1:
+                    return
+                raise StaleSlotError(f"Slot {target_time} no longer available (0 spots)")
+        raise StaleSlotError(f"Slot {target_time} not found in current availability")
 
     def _timed_stage(self, stage_name: str, fn: Any) -> float:
         started = time.perf_counter()
         try:
             fn()
-        except RetryableHttpError:
+        except (RetryableHttpError, AntiBotDetectedError):
             raise
         except ForeUpError:
             raise

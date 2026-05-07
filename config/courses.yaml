@@ -10,9 +10,15 @@ defaults:
     backoff_seconds: 2
     max_backoff_seconds: 30
   player_count: 4
+  holes: 18
 
 courses:
   pebble_beach:
+    # Replace schedule_id and foreup_course_id with real values from the booking URL
+    # e.g. https://foreupsoftware.com/index.php/booking/19765/2431#teetimes
+    schedule_id: ""
+    foreup_course_id: ""
+    booking_url: ""
     poll_interval_seconds: 20
     target_windows:
       - start: "07:00"
@@ -24,5 +30,7 @@ courses:
     player_count: 2
 
   torrey_pines:
-    # Inherits defaults for omitted values
+    schedule_id: ""
+    foreup_course_id: ""
+    booking_url: ""
     player_count: 3
