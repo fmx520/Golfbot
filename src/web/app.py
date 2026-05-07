@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -12,6 +13,9 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+
+from src.booking.foreup_client import ForeUpBookingClient
+from src.discovery.foreup_client import ForeUpDiscoveryClient, ForeUpError
 
 app = FastAPI(title="Golfbot Web UI")
 
@@ -43,49 +47,160 @@ def _event(job: JobState, stage: str, message: str, **extra: Any) -> None:
     job.events.append({"ts": job.updated_at, "stage": stage, "message": message, **extra})
 
 
-def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
-    """Timing-sensitive worker process.
+def _emit_event(
+    queue: Queue,
+    *,
+    phase: str,
+    stage: str,
+    message: str,
+    terminal: str | None = None,
+    retry_count: int = 0,
+    latency_ms: float | None = None,
+    **extra: Any,
+) -> None:
+    queue.put(
+        {
+            "type": "event",
+            "provider": "foreup",
+            "phase": phase,
+            "stage": stage,
+            "message": message,
+            "retry_count": retry_count,
+            "latency_ms": latency_ms,
+            "terminal": terminal,
+            **extra,
+        }
+    )
 
-    This process is intentionally isolated from web request handling so UI rendering
-    cannot block booking-loop timing.
-    """
+
+def _select_slot(slots: list[dict[str, Any]], payload: dict[str, Any]) -> dict[str, Any] | None:
+    for slot in slots:
+        starts_at = str(slot.get("starts_at") or slot.get("time") or "")[:5]
+        spots = int(slot.get("spots") or slot.get("available_spots") or 0)
+        if spots >= payload["players"] and payload["time_start"] <= starts_at <= payload["time_end"]:
+            return slot
+    return None
+
+
+def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
     queue.put({"type": "status", "status": "running"})
 
-    # Placeholder fast loop (replace with BookingExecutor wiring).
-    poll_interval = 0.05
-    timeout_seconds = 5.0
-    start = time.monotonic()
-    found = None
+    base_url = os.getenv("FOREUP_BASE_URL", "http://localhost:8080")
+    username = os.getenv("FOREUP_USERNAME", "")
+    password = os.getenv("FOREUP_PASSWORD", "")
 
-    slots = [
-        {"starts_at": "07:10", "spots": 4, "price": 129.0, "tee_time_id": f"{payload['course_id']}-1"},
-        {"starts_at": "07:40", "spots": 2, "price": 149.0, "tee_time_id": f"{payload['course_id']}-2"},
-        {"starts_at": "08:20", "spots": 4, "price": 139.0, "tee_time_id": f"{payload['course_id']}-3"},
-    ]
+    discovery = ForeUpDiscoveryClient(base_url=base_url)
+    booking = ForeUpBookingClient(base_url=base_url)
 
-    while time.monotonic() - start <= timeout_seconds:
-        for slot in slots:
-            if slot["spots"] >= payload["players"] and payload["time_start"] <= slot["starts_at"] <= payload["time_end"]:
-                found = slot
-                break
-        if found:
-            break
-        time.sleep(poll_interval)
+    request_id = f"job-{job_id}"
 
-    if not found:
-        queue.put({"type": "event", "stage": "discovery", "message": "No matching tee time before timeout"})
-        queue.put({"type": "status", "status": "failed"})
-        return
+    try:
+        auth_started = time.perf_counter()
+        if username and password:
+            discovery.bootstrap_session(username=username, password=password, request_id=request_id)
+            _emit_event(
+                queue,
+                phase="auth",
+                stage="session",
+                message="ForeUp session bootstrapped",
+                latency_ms=round((time.perf_counter() - auth_started) * 1000, 2),
+            )
+        else:
+            _emit_event(
+                queue,
+                phase="auth",
+                stage="session",
+                message="Skipping ForeUp bootstrap (credentials not configured)",
+                latency_ms=round((time.perf_counter() - auth_started) * 1000, 2),
+            )
 
-    queue.put({"type": "event", "stage": "discovery", "message": "Found matching tee time", "slot": found})
+        fetch_started = time.perf_counter()
+        availability = discovery.lookup_availability(
+            course_id=payload["course_id"], date=payload["play_date"], players=payload["players"], request_id=request_id
+        )
+        _emit_event(
+            queue,
+            phase="discovery",
+            stage="course_availability_fetch",
+            message="Fetched course availability",
+            latency_ms=round((time.perf_counter() - fetch_started) * 1000, 2),
+        )
 
-    if payload.get("dry_run", True):
-        queue.put({"type": "event", "stage": "confirmation_gate", "message": "Dry run enabled; not submitting"})
+        slots = availability.get("slots") if isinstance(availability, dict) else None
+        if not isinstance(slots, list):
+            slots = []
+
+        filter_started = time.perf_counter()
+        selected = _select_slot(slots, payload)
+        _emit_event(
+            queue,
+            phase="discovery",
+            stage="tee_time_filtering",
+            message="Filtered tee times for requested window",
+            latency_ms=round((time.perf_counter() - filter_started) * 1000, 2),
+            candidates=len(slots),
+        )
+
+        if not selected:
+            _emit_event(
+                queue,
+                phase="confirm",
+                stage="terminal",
+                message="No matching tee times found",
+                terminal="failed",
+            )
+            queue.put({"type": "status", "status": "failed"})
+            return
+
+        if payload.get("dry_run", True):
+            _emit_event(
+                queue,
+                phase="confirm",
+                stage="booking_confirmation",
+                message="Dry run enabled; booking submit skipped",
+                terminal="dry_run_stopped",
+                slot=selected,
+            )
+            queue.put({"type": "status", "status": "succeeded"})
+            return
+
+        submit_started = time.perf_counter()
+        booking_payload = {
+            "course_id": payload["course_id"],
+            "date": payload["play_date"],
+            "players": payload["players"],
+            "tee_time_id": selected.get("tee_time_id"),
+        }
+        confirm_payload = dict(booking_payload)
+        booking_response, booking_latency = booking.book_slot(
+            idempotency_key=f"job-{job_id}-{selected.get('tee_time_id', 'unknown')}",
+            slot_payload=booking_payload,
+            confirm_payload=confirm_payload,
+            request_id=request_id,
+        )
+        _emit_event(
+            queue,
+            phase="checkout",
+            stage="booking_submit",
+            message="Submitted booking request",
+            latency_ms=round((time.perf_counter() - submit_started) * 1000, 2),
+            provider_latency_ms=booking_latency.total_ms,
+        )
+        _emit_event(
+            queue,
+            phase="confirm",
+            stage="booking_confirmation",
+            message="Booking confirmed",
+            terminal="success",
+            confirmation=booking_response,
+        )
         queue.put({"type": "status", "status": "succeeded"})
-        return
-
-    queue.put({"type": "event", "stage": "confirmation_gate", "message": "Submitted booking request (simulated)", "slot": found})
-    queue.put({"type": "status", "status": "succeeded"})
+    except ForeUpError as exc:
+        _emit_event(queue, phase="confirm", stage="terminal", message=f"ForeUp request failed: {exc}", terminal="failed")
+        queue.put({"type": "status", "status": "failed"})
+    except Exception as exc:  # noqa: BLE001
+        _emit_event(queue, phase="confirm", stage="terminal", message=f"Unexpected worker error: {exc}", terminal="failed")
+        queue.put({"type": "status", "status": "failed"})
 
 
 def _watch_worker(job_id: str, queue: Queue, process: Process) -> None:
