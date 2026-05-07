@@ -260,6 +260,11 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
                     message=f"Slot raw keys: {raw_keys} | raw sample: {dict(list(selected.get('raw', {}).items())[:15])}")
 
         submit_started = time.perf_counter()
+
+        def _booking_debug(event: str, data: dict[str, Any]) -> None:
+            _emit_event(queue, phase="checkout", stage=f"debug_{event}",
+                        message=f"{event}: {data}")
+
         booking_response, booking_latency = booking.book_slot(
             idempotency_key=f"job-{job_id}-{selected.get('tee_time_id', 'unknown')}",
             slot=selected,
@@ -269,6 +274,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
             players=payload["players"],
             holes=holes,
             request_id=request_id,
+            debug_callback=_booking_debug,
         )
         _emit_event(
             queue,
@@ -560,6 +566,10 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                                               request_id=request_id)
                 submit_started = time.perf_counter()
                 token_msg = " (with CAPTCHA token)" if captcha_token else ""
+                def _sniper_debug(event: str, data: dict[str, Any]) -> None:
+                    _emit_event(queue, phase="checkout", stage=f"debug_{event}",
+                                message=f"{event}: {data}")
+
                 booking_response, booking_latency = booking.book_slot(
                     idempotency_key=f"sniper-{job_id}-{selected.get('tee_time_id', 'unknown')}",
                     slot=selected, schedule_id=teesheet_id,
@@ -567,6 +577,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     date=play_date, players=payload["players"], holes=holes,
                     request_id=request_id,
                     captcha_token=captcha_token,
+                    debug_callback=_sniper_debug,
                 )
                 _emit_event(queue, phase="checkout", stage="booking_submit",
                             message=f"Booking submitted{token_msg}",

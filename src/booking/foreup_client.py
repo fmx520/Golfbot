@@ -6,7 +6,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -55,6 +55,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         holes: int = 18,
         request_id: Optional[str] = None,
         captcha_token: Optional[str] = None,
+        debug_callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
     ) -> tuple[dict[str, Any], BookingLatency]:
         req_id = request_id or str(uuid.uuid4())
         flow_started = time.perf_counter()
@@ -88,20 +89,38 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                 reservation_payload["g-recaptcha-response"] = captcha_token
 
             logger.info("reservation_payload", extra={"payload": reservation_payload, "slot_raw": slot})
+            if debug_callback:
+                try:
+                    debug_callback("reservation_payload", {"payload": reservation_payload})
+                except Exception:
+                    pass
 
             def _submit_reservation() -> None:
-                resp = self._request(
-                    "POST",
-                    FOREUP_RESERVATIONS_PATH,
-                    stage="reservation_submit",
-                    request_id=req_id,
-                    retry_safe=False,
-                    json=reservation_payload,
-                )
+                try:
+                    resp = self._request(
+                        "POST",
+                        FOREUP_RESERVATIONS_PATH,
+                        stage="reservation_submit",
+                        request_id=req_id,
+                        retry_safe=False,
+                        json=reservation_payload,
+                    )
+                except ForeUpError as exc:
+                    if debug_callback:
+                        try:
+                            debug_callback("reservation_error", {"error": str(exc)})
+                        except Exception:
+                            pass
+                    raise
                 try:
                     response.update(resp.json())
                 except Exception:
                     response.update({"raw_body": resp.text[:1000], "status_code": resp.status_code})
+                if debug_callback:
+                    try:
+                        debug_callback("reservation_response", {"response": response, "status": resp.status_code})
+                    except Exception:
+                        pass
 
             response: dict[str, Any] = {}
             stage_latencies["reservation_submit"] = self._timed_stage(
