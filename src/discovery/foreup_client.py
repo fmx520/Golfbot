@@ -114,7 +114,8 @@ class ForeUpDiscoveryClient:
 
     def bootstrap_session(self, username: str, password: str, schedule_id: str = "", course_id: str = "", request_id: Optional[str] = None) -> dict[str, Any]:
         req_id = request_id or str(uuid.uuid4())
-        self._init_session(schedule_id or "19765")
+        sid = schedule_id or "19765"
+        self._init_session(sid)
         response = self._request(
             "POST",
             FOREUP_LOGIN_PATH,
@@ -125,7 +126,7 @@ class ForeUpDiscoveryClient:
                 "password": password,
                 "api_key": FOREUP_API_KEY,
                 "booking_class_id": "",
-                "course_id": course_id,
+                "course_id": sid,
             },
             retry_safe=False,
         )
