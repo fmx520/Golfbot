@@ -11,6 +11,7 @@ const S = {
   selectedSlot: null,
   jobStatus: null,
   jobEvents: [],
+  sniperMode: false,
 };
 
 function $(id) { return document.getElementById(id); }
@@ -134,8 +135,16 @@ async function connect() {
 async function searchTeeTimes() {
   hideAlert('searchError');
   const btn = $('searchBtn');
+  const isSniper = $('sniperMode').checked;
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner-inline"></span> Searching...';
+  btn.innerHTML = isSniper
+    ? '<span class="spinner-inline"></span> Sniper Armed...'
+    : '<span class="spinner-inline"></span> Searching...';
+
+  if (isSniper) {
+    $('eventLogContainer')?.classList.add('sniper-armed');
+    requestNotificationPermission();
+  }
 
   show('eventLogContainer');
   $('eventLog').innerHTML = '';
@@ -143,6 +152,7 @@ async function searchTeeTimes() {
   S.slots = [];
   S.selectedSlot = null;
   S.jobEvents = [];
+  S.sniperMode = isSniper;
 
   const scheduleId = S.scheduleId || $('scheduleId').value.trim();
   const courseId = S.courseId || $('courseId').value.trim();
@@ -151,7 +161,7 @@ async function searchTeeTimes() {
   if (!scheduleId && !bookingUrl) {
     showAlert('searchError', 'No schedule ID or booking URL. Go back to Step 1 and connect first.');
     btn.disabled = false;
-    btn.innerHTML = 'Search Tee Times';
+    btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
     return;
   }
 
@@ -167,6 +177,9 @@ async function searchTeeTimes() {
     time_start: $('timeStart').value,
     time_end: $('timeEnd').value,
     dry_run: $('dryRun').checked,
+    sniper_mode: isSniper,
+    release_time: isSniper ? $('releaseTime').value : '',
+    auto_book: isSniper ? $('autoBook').checked : false,
   };
 
   try {
@@ -182,7 +195,8 @@ async function searchTeeTimes() {
   } catch (e) {
     showAlert('searchError', e.message);
     btn.disabled = false;
-    btn.innerHTML = 'Search Tee Times';
+    btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
+    $('eventLogContainer')?.classList.remove('sniper-armed');
   }
 }
 
@@ -205,9 +219,11 @@ function startPolling() {
 
         const btn = $('searchBtn');
         btn.disabled = false;
-        btn.innerHTML = 'Search Tee Times';
+        btn.innerHTML = S.sniperMode ? 'Arm Sniper' : 'Search Tee Times';
+        $('eventLogContainer')?.classList.remove('sniper-armed');
 
         if (data.status === 'succeeded') {
+          fireNotification(data);
           extractSlotsFromEvents(data.events);
           if (S.slots.length > 0) {
             renderSlots();
@@ -248,6 +264,7 @@ function addEvent(phase, stage, message, latencyMs) {
   if (phase === 'auth') phaseClass = 'badge-info';
   else if (phase === 'discovery') phaseClass = 'badge-warning';
   else if (phase === 'checkout' || phase === 'confirm') phaseClass = 'badge-success';
+  else if (phase === 'sniper') phaseClass = 'badge-sniper';
 
   line.innerHTML =
     `<span class="event-time">${esc(now)}</span>` +
@@ -285,22 +302,35 @@ function renderSlots() {
 function renderResults(jobData) {
   const container = $('resultsContent');
   const isDryRun = S.jobEvents.some(ev => ev.terminal === 'dry_run_stopped');
+  const isSniperAlert = S.jobEvents.some(ev => ev.terminal === 'sniper_alert');
   const isSuccess = S.jobEvents.some(ev => ev.terminal === 'success');
   const isFailed = S.jobEvents.some(ev => ev.terminal === 'failed');
 
+  const sniperEvent = S.jobEvents.find(ev => ev.terminal === 'sniper_alert' || ev.terminal === 'dry_run_stopped');
+  const bookingUrl = sniperEvent?.booking_url || '';
+  const sniperStats = sniperEvent?.sniper_stats;
+
   let statusHtml = '';
-  if (isDryRun && S.selectedSlot) {
+  if ((isDryRun || isSniperAlert) && S.selectedSlot) {
+    const statusBadge = isSniperAlert
+      ? '<span class="badge badge-sniper">Sniper Alert</span>'
+      : '<span class="badge badge-warning">Dry Run</span>';
+    const alertMsg = isSniperAlert
+      ? 'SLOT FOUND — Book it now before it\'s gone!'
+      : 'Dry run complete — tee time found and available for booking.';
     statusHtml = `
-      <div class="alert alert-success show">Dry run complete — tee time found and available for booking.</div>
+      <div class="alert alert-success show">${esc(alertMsg)}</div>
       <div class="summary-card">
         <div class="summary-row"><span class="summary-key">Tee Time</span><span class="summary-value">${esc(S.selectedSlot.time || 'N/A')}</span></div>
         <div class="summary-row"><span class="summary-key">Available Spots</span><span class="summary-value">${S.selectedSlot.available_spots || '?'}</span></div>
         <div class="summary-row"><span class="summary-key">Green Fee</span><span class="summary-value">${S.selectedSlot.green_fee ? '$' + S.selectedSlot.green_fee : 'N/A'}</span></div>
         <div class="summary-row"><span class="summary-key">Date</span><span class="summary-value">${esc($('playDate').value)}</span></div>
         <div class="summary-row"><span class="summary-key">Players</span><span class="summary-value">${$('players').value}</span></div>
-        <div class="summary-row"><span class="summary-key">Status</span><span class="summary-value"><span class="badge badge-warning">Dry Run</span></span></div>
+        <div class="summary-row"><span class="summary-key">Status</span><span class="summary-value">${statusBadge}</span></div>
+        ${sniperStats ? `<div class="summary-row"><span class="summary-key">Sniper Stats</span><span class="summary-value">${sniperStats.polls} polls in ${Math.round(sniperStats.total_ms)}ms</span></div>` : ''}
       </div>
-      <p class="text-sm text-muted mt-1">To book this tee time, uncheck "Dry Run" in Step 2 and search again.</p>
+      ${bookingUrl ? `<a href="${esc(bookingUrl)}" target="_blank" class="btn btn-primary btn-block mt-1">Open ForeUp Booking Page</a>` : ''}
+      ${isDryRun ? '<p class="text-sm text-muted mt-1">To book this tee time, uncheck "Dry Run" in Step 2 and search again.</p>' : ''}
     `;
   } else if (isSuccess) {
     statusHtml = `
@@ -330,6 +360,43 @@ function backToStep(n) {
   goToStep(n);
 }
 
+// Notifications
+function requestNotificationPermission() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+function fireNotification(data) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+
+  const slotEv = (data.events || []).find(ev => ev.slot);
+  const slot = slotEv?.slot || S.selectedSlot;
+  const title = S.sniperMode ? 'Sniper: Tee Time Found!' : 'Tee Time Found!';
+  const body = slot
+    ? `${slot.time} — ${slot.available_spots} spots — $${slot.green_fee || '?'}`
+    : 'A matching tee time is available.';
+
+  try {
+    const n = new Notification(title, { body, icon: '⛳', tag: 'golfbot-slot' });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch {}
+}
+
+// Sniper toggle
+function toggleSniperMode() {
+  const checked = $('sniperMode').checked;
+  const fields = $('sniperFields');
+  const btn = $('searchBtn');
+  if (checked) {
+    fields.classList.remove('hidden');
+    btn.textContent = 'Arm Sniper';
+  } else {
+    fields.classList.add('hidden');
+    btn.textContent = 'Search Tee Times';
+  }
+}
+
 // Init
 document.addEventListener('DOMContentLoaded', () => {
   goToStep(1);
@@ -337,6 +404,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('bookingUrl').addEventListener('input', (e) => parseBookingUrl(e.target.value));
   $('connectBtn').addEventListener('click', connect);
   $('searchBtn').addEventListener('click', searchTeeTimes);
+  $('sniperMode').addEventListener('change', toggleSniperMode);
 
   // Set default date to tomorrow
   const tomorrow = new Date();

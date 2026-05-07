@@ -290,6 +290,50 @@ class ForeUpDiscoveryClient:
 
         return self._fetch_times_for_class(base_params, req_id, schedule_id)
 
+    def refresh_session(self, schedule_id: str = "", course_id: str = "", username: str = "", password: str = "", request_id: Optional[str] = None) -> None:
+        """Re-warm cookies and JWT before a sniper release window."""
+        req_id = request_id or str(uuid.uuid4())
+        sid = schedule_id or "19765"
+        self._init_session(sid, teesheet_id=course_id)
+        if username and password:
+            self.bootstrap_session(username=username, password=password, schedule_id=sid, course_id=course_id, request_id=req_id)
+
+    def lookup_availability_fast(
+        self,
+        *,
+        schedule_id: str,
+        date: str,
+        players: int,
+        holes: int = 18,
+        booking_class: str = "",
+        request_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Stripped-down lookup for sniper polling: cached booking class, no retries, short timeout."""
+        req_id = request_id or str(uuid.uuid4())
+        params: dict[str, Any] = {
+            "time": "all",
+            "date": iso_to_foreup_date(date),
+            "holes": holes,
+            "players": players,
+            "schedule_id": schedule_id,
+            "specials_only": 0,
+            "api_key": FOREUP_API_KEY,
+        }
+
+        bc = booking_class or (self._booking_classes[0] if self._booking_classes else "")
+        if bc:
+            params["booking_class"] = bc
+
+        response = self._request(
+            "GET",
+            FOREUP_TIMES_PATH,
+            stage="sniper_poll",
+            request_id=req_id,
+            params=params,
+            retry_safe=False,
+        )
+        return self._parse_times_response(response, schedule_id)
+
     def _request(self, method: str, path: str, *, stage: str, request_id: str, retry_safe: bool, **kwargs: Any) -> httpx.Response:
         url = f"{self.base_url}{path}"
         attempts = self.config.max_retries + 1 if retry_safe else 1

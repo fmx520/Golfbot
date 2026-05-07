@@ -47,6 +47,9 @@ class StartJobRequest(BaseModel):
     foreup_booking_url: str | None = None
     username: str = ""
     password: str = ""
+    sniper_mode: bool = False
+    release_time: str = ""
+    auto_book: bool = False
 
 
 @dataclass
@@ -287,6 +290,204 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
         _finalize_worker()
 
 
+def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
+    """Sniper mode: pre-auth, wait for release, poll aggressively, grab slot."""
+    queue.put({"type": "status", "status": "running"})
+
+    def _finalize_worker() -> None:
+        queue.put({"type": "worker_done"})
+
+    default_base_url = os.getenv("FOREUP_BASE_URL", "https://foreupsoftware.com")
+    default_schedule_id = os.getenv("FOREUP_SCHEDULE_ID", "")
+    default_course_id = os.getenv("FOREUP_COURSE_ID", "")
+
+    base_url, resolved_schedule_id, resolved_course_id = _extract_foreup_target(
+        payload.get("foreup_booking_url"),
+        fallback_base_url=default_base_url,
+        fallback_schedule_id=payload.get("schedule_id") or default_schedule_id,
+        fallback_course_id=payload.get("course_id") or default_course_id,
+    )
+
+    username = payload.get("username") or os.getenv("FOREUP_USERNAME", "")
+    password = payload.get("password") or os.getenv("FOREUP_PASSWORD", "")
+    holes = payload.get("holes", 18)
+    teesheet_id = resolved_course_id or resolved_schedule_id
+    auto_book = payload.get("auto_book", False)
+    release_time_str = payload.get("release_time", "")
+    play_date = payload["play_date"]
+
+    if not resolved_schedule_id:
+        _emit_event(queue, phase="confirm", stage="terminal", message="No schedule_id provided.", terminal="failed")
+        queue.put({"type": "status", "status": "failed"})
+        _finalize_worker()
+        return
+
+    from datetime import date as date_cls
+
+    release_hh, release_mm = 19, 0
+    if release_time_str:
+        parts = release_time_str.split(":")
+        release_hh, release_mm = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+
+    now = datetime.now()
+    release_dt = now.replace(hour=release_hh, minute=release_mm, second=0, microsecond=0)
+    if release_dt <= now:
+        release_dt = release_dt.replace(day=release_dt.day + 1)
+
+    request_id = f"sniper-{job_id}"
+    discovery = ForeUpDiscoveryClient(base_url=base_url)
+
+    try:
+        auth_started = time.perf_counter()
+        if username and password:
+            discovery.bootstrap_session(
+                username=username, password=password,
+                schedule_id=resolved_schedule_id, course_id=resolved_course_id,
+                request_id=request_id,
+            )
+            _emit_event(queue, phase="auth", stage="session",
+                        message="ForeUp session bootstrapped",
+                        latency_ms=round((time.perf_counter() - auth_started) * 1000, 2))
+        else:
+            _emit_event(queue, phase="auth", stage="session", message="No credentials — unauthenticated mode",
+                        latency_ms=round((time.perf_counter() - auth_started) * 1000, 2))
+
+        seconds_until = (release_dt - datetime.now()).total_seconds()
+        release_display = release_dt.strftime("%I:%M:%S %p")
+        _emit_event(queue, phase="sniper", stage="armed",
+                    message=f"Armed — release at {release_display} ({int(seconds_until)}s from now)")
+
+        prewarm_lead = 5.0
+        wait_seconds = max(0, seconds_until - prewarm_lead)
+        if wait_seconds > 0:
+            sleep_chunk = 2.0
+            slept = 0.0
+            last_update = 0.0
+            while slept < wait_seconds:
+                chunk = min(sleep_chunk, wait_seconds - slept)
+                time.sleep(chunk)
+                slept += chunk
+                remaining = max(0, (release_dt - datetime.now()).total_seconds())
+                if remaining <= 10 or (slept - last_update) >= 10:
+                    _emit_event(queue, phase="sniper", stage="countdown",
+                                message=f"Countdown: {int(remaining)}s remaining")
+                    last_update = slept
+
+        rewarm_started = time.perf_counter()
+        if username and password:
+            discovery.refresh_session(
+                schedule_id=resolved_schedule_id, course_id=resolved_course_id,
+                username=username, password=password, request_id=request_id,
+            )
+            _emit_event(queue, phase="auth", stage="rewarm",
+                        message="Session re-warmed",
+                        latency_ms=round((time.perf_counter() - rewarm_started) * 1000, 2))
+
+        remaining = (release_dt - datetime.now()).total_seconds()
+        if remaining > 0:
+            time.sleep(remaining)
+
+        _emit_event(queue, phase="sniper", stage="polling", message="Polling started — checking every 200ms")
+
+        poll_interval = 0.2
+        timeout = 90.0
+        poll_start = time.perf_counter()
+        poll_count = 0
+        last_status_emit = 0.0
+        selected = None
+
+        while time.perf_counter() - poll_start < timeout:
+            loop_start = time.perf_counter()
+            poll_count += 1
+
+            try:
+                slots = discovery.lookup_availability_fast(
+                    schedule_id=teesheet_id,
+                    date=play_date,
+                    players=payload["players"],
+                    holes=holes,
+                    request_id=f"{request_id}-p{poll_count}",
+                )
+            except ForeUpError:
+                slots = []
+
+            loop_ms = round((time.perf_counter() - loop_start) * 1000, 1)
+
+            if slots:
+                selected = _select_slot(slots, payload)
+                if selected:
+                    _emit_event(queue, phase="sniper", stage="found",
+                                message=f"Poll #{poll_count}: {len(slots)} slots — TARGET FOUND: {selected['time']} ({selected['available_spots']} spots, ${selected.get('green_fee', '?')})",
+                                latency_ms=loop_ms, slot=selected)
+                    break
+
+            elapsed = time.perf_counter() - poll_start
+            if elapsed - last_status_emit >= 2.0:
+                _emit_event(queue, phase="sniper", stage="poll_status",
+                            message=f"Poll #{poll_count}: {len(slots)} slots ({loop_ms}ms)",
+                            latency_ms=loop_ms)
+                last_status_emit = elapsed
+
+            sleep_remaining = poll_interval - (time.perf_counter() - loop_start)
+            if sleep_remaining > 0:
+                time.sleep(sleep_remaining)
+
+        total_ms = round((time.perf_counter() - poll_start) * 1000, 2)
+
+        if not selected:
+            _emit_event(queue, phase="confirm", stage="terminal",
+                        message=f"Sniper timed out after {poll_count} polls ({total_ms}ms) — no matching slots found",
+                        terminal="failed")
+            queue.put({"type": "status", "status": "failed"})
+            _finalize_worker()
+            return
+
+        if auto_book and not payload.get("dry_run", True):
+            try:
+                booking = ForeUpBookingClient(base_url=base_url)
+                submit_started = time.perf_counter()
+                booking_response, booking_latency = booking.book_slot(
+                    idempotency_key=f"sniper-{job_id}-{selected.get('tee_time_id', 'unknown')}",
+                    slot=selected, schedule_id=teesheet_id,
+                    date=play_date, players=payload["players"], holes=holes,
+                    request_id=request_id,
+                )
+                _emit_event(queue, phase="checkout", stage="booking_submit",
+                            message="Booking submitted",
+                            latency_ms=round((time.perf_counter() - submit_started) * 1000, 2))
+                _emit_event(queue, phase="confirm", stage="booking_confirmation",
+                            message="Booking confirmed", terminal="success",
+                            confirmation=booking_response, slot=selected)
+                queue.put({"type": "status", "status": "succeeded"})
+                _finalize_worker()
+                return
+            except ForeUpError as exc:
+                _emit_event(queue, phase="checkout", stage="booking_failed",
+                            message=f"Auto-book failed: {exc} — slot details shown below")
+
+        booking_url = payload.get("foreup_booking_url") or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}#teetimes"
+        terminal = "dry_run_stopped" if payload.get("dry_run", True) else "sniper_alert"
+        _emit_event(queue, phase="confirm", stage="sniper_result",
+                    message=f"Slot found: {selected['time']} | {selected['available_spots']} spots | ${selected.get('green_fee', '?')}",
+                    terminal=terminal, slot=selected, booking_url=booking_url,
+                    sniper_stats={"polls": poll_count, "total_ms": total_ms})
+        queue.put({"type": "status", "status": "succeeded"})
+        _finalize_worker()
+
+    except AntiBotDetectedError as exc:
+        _emit_event(queue, phase="auth", stage="antibot", message=f"Anti-bot detected: {exc}", terminal="failed")
+        queue.put({"type": "status", "status": "failed"})
+        _finalize_worker()
+    except ForeUpError as exc:
+        _emit_event(queue, phase="confirm", stage="terminal", message=f"Sniper failed: {exc}", terminal="failed")
+        queue.put({"type": "status", "status": "failed"})
+        _finalize_worker()
+    except Exception as exc:  # noqa: BLE001
+        _emit_event(queue, phase="confirm", stage="terminal", message=f"Sniper error: {exc}", terminal="failed")
+        queue.put({"type": "status", "status": "failed"})
+        _finalize_worker()
+
+
 def _run_playwright_fallback(
     job_id: str,
     payload: dict[str, Any],
@@ -441,7 +642,8 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
 
     full_payload = req.model_dump()
     queue: Queue = Queue()
-    proc = Process(target=_worker_main, args=(job_id, full_payload, queue), daemon=True)
+    worker_fn = _sniper_worker_main if full_payload.get("sniper_mode") else _worker_main
+    proc = Process(target=worker_fn, args=(job_id, full_payload, queue), daemon=True)
     proc.start()
 
     watcher = Thread(target=_watch_worker, args=(job_id, queue, proc), daemon=True)
