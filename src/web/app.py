@@ -379,7 +379,7 @@ const out = document.getElementById('out');
 const courseList = document.getElementById('course-options');
 
 async function loadCourses() {
-  const bookingUrl = document.querySelector(\"input[name='foreup_booking_url']\")?.value?.trim();
+  const bookingUrl = document.querySelector("input[name='foreup_booking_url']")?.value?.trim();
   const endpoint = bookingUrl ? `/courses?booking_url=${encodeURIComponent(bookingUrl)}` : '/courses';
   const res = await fetch(endpoint);
   const payload = await res.json();
@@ -393,7 +393,7 @@ async function loadCourses() {
 }
 
 loadCourses();
-document.querySelector(\"input[name='foreup_booking_url']\")?.addEventListener('change', loadCourses);
+document.querySelector("input[name='foreup_booking_url']")?.addEventListener('change', loadCourses);
 document.getElementById('f').onsubmit = async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
