@@ -99,7 +99,7 @@ def _fetch_inventory(
 
     if username and password:
         print(f"  Logging in as {username}...")
-        client.bootstrap_session(username=username, password=password, request_id=request_id)
+        client.bootstrap_session(username=username, password=password, schedule_id=schedule_id, request_id=request_id)
         print("  Login successful.")
 
     print(f"  Fetching tee times for {play_date} (schedule {schedule_id})...")

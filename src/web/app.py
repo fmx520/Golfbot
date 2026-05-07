@@ -168,7 +168,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
     try:
         auth_started = time.perf_counter()
         if username and password:
-            discovery.bootstrap_session(username=username, password=password, request_id=request_id)
+            discovery.bootstrap_session(username=username, password=password, schedule_id=resolved_schedule_id, request_id=request_id)
             _emit_event(
                 queue,
                 phase="auth",
@@ -411,7 +411,7 @@ def connect(req: ConnectRequest) -> dict[str, Any]:
 
     try:
         client = ForeUpDiscoveryClient(base_url=base_url)
-        client.bootstrap_session(username=username, password=password, request_id=f"connect-{uuid.uuid4().hex[:8]}")
+        client.bootstrap_session(username=username, password=password, schedule_id=schedule_id, request_id=f"connect-{uuid.uuid4().hex[:8]}")
     except AntiBotDetectedError:
         raise HTTPException(status_code=403, detail="Anti-bot protection detected. This course may require Playwright fallback.")
     except ForeUpError as exc:

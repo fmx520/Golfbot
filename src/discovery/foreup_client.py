@@ -77,6 +77,16 @@ def foreup_time_to_24h(foreup_time: str) -> str:
     return f"{hour:02d}:{minute}"
 
 
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin": "https://foreupsoftware.com",
+    "Referer": "https://foreupsoftware.com/index.php/booking/",
+}
+
+
 class ForeUpDiscoveryClient:
     _shared_client: Optional[httpx.Client] = None
     _client_lock = Lock()
@@ -94,18 +104,23 @@ class ForeUpDiscoveryClient:
                     timeout=httpx.Timeout(timeout_seconds),
                     limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
                     follow_redirects=True,
+                    headers=BROWSER_HEADERS,
                 )
         return cls._shared_client
 
-    def bootstrap_session(self, username: str, password: str, request_id: Optional[str] = None) -> dict[str, Any]:
+    def _init_session(self, schedule_id: str = "19765") -> None:
+        """Load the booking page to establish a PHPSESSID cookie before login."""
+        self.client.get(f"{self.base_url}/index.php/booking/{schedule_id}")
+
+    def bootstrap_session(self, username: str, password: str, schedule_id: str = "", request_id: Optional[str] = None) -> dict[str, Any]:
         req_id = request_id or str(uuid.uuid4())
+        self._init_session(schedule_id or "19765")
         response = self._request(
             "POST",
             FOREUP_LOGIN_PATH,
             stage="bootstrap",
             request_id=req_id,
             data={"username": username, "password": password, "api_key": FOREUP_API_KEY, "booking_class_id": ""},
-            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
             retry_safe=False,
         )
         try:
