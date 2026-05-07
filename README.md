@@ -64,3 +64,4 @@ The analyzer reports:
 - attempt counts
 - success rate
 - average race loss points (where latency was spent)
+README.md
