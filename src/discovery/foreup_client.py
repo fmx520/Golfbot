@@ -169,8 +169,18 @@ class ForeUpDiscoveryClient:
         except Exception:
             return []
 
+        if isinstance(raw, bool) or raw is None:
+            return []
+        if isinstance(raw, dict):
+            if not raw.get("success", True):
+                return []
+            items = raw.get("times", raw.get("slots", []))
+        elif isinstance(raw, list):
+            items = raw
+        else:
+            return []
+
         slots: list[dict[str, Any]] = []
-        items = raw if isinstance(raw, list) else raw.get("times", raw.get("slots", []))
         if not isinstance(items, list):
             items = []
 
