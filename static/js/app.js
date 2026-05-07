@@ -243,9 +243,15 @@ function startPolling() {
         addEvent(ev.phase || 'system', ev.stage, ev.message, ev.latency_ms);
       }
 
+      if (data.status === 'awaiting_input') {
+        showVerificationForm();
+        fireNotification({ events: [{ slot: null }] });
+      }
+
       if (data.status === 'succeeded' || data.status === 'failed') {
         clearInterval(S.pollTimer);
         S.pollTimer = null;
+        hideVerificationForm();
 
         const btn = $('searchBtn');
         btn.disabled = false;
@@ -296,6 +302,7 @@ function addEvent(phase, stage, message, latencyMs) {
   else if (phase === 'checkout' || phase === 'confirm') phaseClass = 'badge-success';
   else if (phase === 'sniper') phaseClass = 'badge-sniper';
   else if (phase === 'captcha') phaseClass = 'badge-captcha';
+  else if (phase === 'verify') phaseClass = 'badge-verify';
 
   line.innerHTML =
     `<span class="event-time">${esc(now)}</span>` +
@@ -449,6 +456,42 @@ function updateDateRange() {
     dateSelect.value = prevValue;
   } else if (dateSelect.options.length > 1) {
     dateSelect.value = dateSelect.options[1].value;
+  }
+}
+
+// Verification code form
+function showVerificationForm() {
+  show('verificationContainer');
+  $('verificationCode').focus();
+  $('searchBtn').innerHTML = 'Awaiting Verification Code...';
+}
+
+function hideVerificationForm() {
+  hide('verificationContainer');
+  $('verificationCode').value = '';
+}
+
+async function submitVerificationCode() {
+  const code = $('verificationCode').value.trim();
+  if (!code) return;
+
+  const btn = $('submitCodeBtn');
+  btn.disabled = true;
+  btn.textContent = 'Submitting...';
+
+  try {
+    await api('/jobs/' + S.jobId + '/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    hideVerificationForm();
+    $('searchBtn').innerHTML = '<span class="spinner-inline"></span> Verifying...';
+  } catch (e) {
+    showAlert('searchError', 'Failed to submit code: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Verify';
   }
 }
 

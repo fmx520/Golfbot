@@ -74,6 +74,7 @@ class JobState:
 
 
 JOBS: dict[str, JobState] = {}
+CMD_QUEUES: dict[str, Queue] = {}
 JOB_LOCK = Lock()
 APP_CONFIG = load_config()
 
@@ -142,7 +143,7 @@ def _extract_foreup_target(booking_url: str | None, fallback_base_url: str, fall
     return base_url, schedule_id, course_id
 
 
-def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
+def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: Queue | None = None) -> None:
     queue.put({"type": "status", "status": "running"})
 
     def _finalize_worker() -> None:
@@ -277,6 +278,49 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
             latency_ms=round((time.perf_counter() - submit_started) * 1000, 2),
             provider_latency_ms=booking_latency.total_ms,
         )
+
+        resp_str = str(booking_response).lower()
+        needs_code = (
+            booking_response.get("requires_code")
+            or "booking_code" in resp_str
+            or "verification" in resp_str
+            or "booking code" in resp_str
+        )
+
+        if needs_code and cmd_queue is not None:
+            reservation_id = booking_response.get("reservation_id", booking_response.get("id", ""))
+            _emit_event(
+                queue, phase="verify", stage="awaiting_code",
+                message=f"Verification code sent to your email — enter it below (5 min timeout). Response: {booking_response}",
+                terminal="awaiting_code",
+            )
+            queue.put({"type": "status", "status": "awaiting_input"})
+
+            try:
+                cmd = cmd_queue.get(timeout=300)
+                code = cmd.get("code", "")
+                _emit_event(queue, phase="verify", stage="submitting_code", message=f"Submitting verification code: {code}")
+                queue.put({"type": "status", "status": "running"})
+
+                verify_response = booking.submit_booking_code(
+                    code=code,
+                    reservation_id=str(reservation_id),
+                    schedule_id=teesheet_id,
+                    request_id=request_id,
+                )
+                _emit_event(
+                    queue, phase="confirm", stage="booking_confirmation",
+                    message=f"Verification submitted — response: {verify_response}",
+                    terminal="success", confirmation=verify_response,
+                )
+                queue.put({"type": "status", "status": "succeeded"})
+            except Empty:
+                _emit_event(queue, phase="confirm", stage="terminal",
+                            message="Verification code timeout — slot hold expired", terminal="failed")
+                queue.put({"type": "status", "status": "failed"})
+            _finalize_worker()
+            return
+
         _emit_event(
             queue,
             phase="confirm",
@@ -310,7 +354,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
         _finalize_worker()
 
 
-def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
+def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: Queue | None = None) -> None:
     """Sniper mode: pre-auth, wait for release, poll aggressively, grab slot."""
     queue.put({"type": "status", "status": "running"})
 
@@ -527,6 +571,41 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
                 _emit_event(queue, phase="checkout", stage="booking_submit",
                             message=f"Booking submitted{token_msg}",
                             latency_ms=round((time.perf_counter() - submit_started) * 1000, 2))
+
+                resp_str = str(booking_response).lower()
+                needs_code = (
+                    booking_response.get("requires_code")
+                    or "booking_code" in resp_str
+                    or "verification" in resp_str
+                    or "booking code" in resp_str
+                )
+
+                if needs_code and cmd_queue is not None:
+                    reservation_id = booking_response.get("reservation_id", booking_response.get("id", ""))
+                    _emit_event(queue, phase="verify", stage="awaiting_code",
+                                message=f"Verification code sent to your email — enter it below (5 min timeout). Response: {booking_response}",
+                                terminal="awaiting_code")
+                    queue.put({"type": "status", "status": "awaiting_input"})
+                    try:
+                        cmd = cmd_queue.get(timeout=300)
+                        code = cmd.get("code", "")
+                        _emit_event(queue, phase="verify", stage="submitting_code", message=f"Submitting verification code: {code}")
+                        queue.put({"type": "status", "status": "running"})
+                        verify_response = booking.submit_booking_code(
+                            code=code, reservation_id=str(reservation_id),
+                            schedule_id=teesheet_id, request_id=request_id,
+                        )
+                        _emit_event(queue, phase="confirm", stage="booking_confirmation",
+                                    message=f"Verification submitted — response: {verify_response}",
+                                    terminal="success", confirmation=verify_response, slot=selected)
+                        queue.put({"type": "status", "status": "succeeded"})
+                    except Empty:
+                        _emit_event(queue, phase="confirm", stage="terminal",
+                                    message="Verification code timeout — slot hold expired", terminal="failed")
+                        queue.put({"type": "status", "status": "failed"})
+                    _finalize_worker()
+                    return
+
                 _emit_event(queue, phase="confirm", stage="booking_confirmation",
                             message="Booking confirmed", terminal="success",
                             confirmation=booking_response, slot=selected)
@@ -642,7 +721,7 @@ def _run_playwright_fallback(
         queue.put({"type": "status", "status": "failed"})
 
 
-def _watch_worker(job_id: str, queue: Queue, process: Process) -> None:
+def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str = "") -> None:
     worker_done = False
     while not worker_done or process.is_alive():
         try:
@@ -661,11 +740,12 @@ def _watch_worker(job_id: str, queue: Queue, process: Process) -> None:
                 worker_done = True
 
     process.join(timeout=1)
+    CMD_QUEUES.pop(cleanup_id, None)
 
 
 # --- Routes ---
 
-APP_VERSION = "0.30"
+APP_VERSION = "0.33"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -723,11 +803,13 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
 
     full_payload = req.model_dump()
     queue: Queue = Queue()
+    cmd_queue: Queue = Queue()
+    CMD_QUEUES[job_id] = cmd_queue
     worker_fn = _sniper_worker_main if full_payload.get("sniper_mode") else _worker_main
-    proc = Process(target=worker_fn, args=(job_id, full_payload, queue), daemon=True)
+    proc = Process(target=worker_fn, args=(job_id, full_payload, queue, cmd_queue), daemon=True)
     proc.start()
 
-    watcher = Thread(target=_watch_worker, args=(job_id, queue, proc), daemon=True)
+    watcher = Thread(target=_watch_worker, args=(job_id, queue, proc, job_id), daemon=True)
     watcher.start()
 
     with JOB_LOCK:
@@ -772,6 +854,27 @@ def get_job(job_id: str) -> dict[str, Any]:
             "updated_at": job.updated_at,
             "events": job.events,
         }
+
+
+class VerifyCodeRequest(BaseModel):
+    code: str
+
+
+@app.post("/api/jobs/{job_id}/verify")
+def submit_verification_code(job_id: str, req: VerifyCodeRequest) -> dict[str, str]:
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status != "awaiting_input":
+            raise HTTPException(status_code=400, detail=f"Job not awaiting input (status={job.status})")
+
+    cmd_queue = CMD_QUEUES.get(job_id)
+    if not cmd_queue:
+        raise HTTPException(status_code=400, detail="No command queue for this job")
+
+    cmd_queue.put({"type": "code", "code": req.code})
+    return {"status": "submitted"}
 
 
 @app.get("/")

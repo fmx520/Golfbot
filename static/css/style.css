@@ -379,6 +379,7 @@ body {
 .badge-neutral { background: var(--bg-tertiary); color: var(--text-muted); }
 .badge-sniper { background: rgba(219, 39, 119, 0.15); color: #f472b6; }
 .badge-captcha { background: rgba(6, 182, 212, 0.15); color: #22d3ee; }
+.badge-verify { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
 
 /* Sniper armed state */
 .sniper-armed .card {

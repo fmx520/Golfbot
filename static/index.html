@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.32</span>
+        <span class="version-badge">v0.33</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -160,6 +160,21 @@
         <div class="card">
           <div class="card-title">Job Progress</div>
           <div class="event-log" id="eventLog"></div>
+        </div>
+      </div>
+
+      <div id="verificationContainer" class="hidden mt-2">
+        <div class="card">
+          <div class="card-title">Booking Verification</div>
+          <div class="card-subtitle">A verification code was sent to your email. Enter it to complete the booking.</div>
+          <div class="form-row">
+            <div class="form-group" style="flex:1">
+              <input type="text" id="verificationCode" placeholder="Enter 6-digit code" maxlength="10" inputmode="numeric" autocomplete="one-time-code">
+            </div>
+            <div class="form-group" style="flex:0">
+              <button class="btn btn-primary" id="submitCodeBtn" onclick="submitVerificationCode()">Verify</button>
+            </div>
+          </div>
         </div>
       </div>
 

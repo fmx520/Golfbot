@@ -118,6 +118,37 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             self._log_flow(req_id, flow_started, None, stage_latencies, "error")
             raise
 
+    def submit_booking_code(
+        self,
+        *,
+        code: str,
+        reservation_id: str = "",
+        schedule_id: str = "",
+        request_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        req_id = request_id or str(uuid.uuid4())
+        payload: dict[str, Any] = {
+            "booking_code": code,
+            "api_key": FOREUP_API_KEY,
+        }
+        if reservation_id:
+            payload["reservation_id"] = reservation_id
+        if schedule_id:
+            payload["schedule_id"] = schedule_id
+
+        resp = self._request(
+            "POST",
+            f"{FOREUP_RESERVATIONS_PATH}/verify",
+            stage="verify_code",
+            request_id=req_id,
+            retry_safe=False,
+            json=payload,
+        )
+        try:
+            return resp.json()
+        except Exception:
+            return {"raw_body": resp.text[:1000], "status_code": resp.status_code}
+
     def _validate_slot_still_available(
         self,
         *,
