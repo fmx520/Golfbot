@@ -90,6 +90,18 @@ export default function HomePage() {
     await new Promise<void>((resolve, reject) => {
       const stream = new EventSource(`${API_BASE}/jobs/${id}/stream`);
 
+      const syncTerminalStatus = async () => {
+        try {
+          const response = await fetch(`${API_BASE}/jobs/${id}`, { cache: "no-store" });
+          if (!response.ok) return;
+          const job = (await response.json()) as JobResponse;
+          setStatus(job.status);
+          setEvents(job.events);
+        } catch {
+          // Non-fatal: keep latest streamed state
+        }
+      };
+
       stream.addEventListener("message", (event) => {
         const payload = JSON.parse((event as MessageEvent).data) as { status: JobStatus; event: JobEvent };
         setStatus(payload.status);
@@ -98,7 +110,7 @@ export default function HomePage() {
 
       stream.addEventListener("done", () => {
         stream.close();
-        resolve();
+        void syncTerminalStatus().finally(resolve);
       });
 
       stream.addEventListener("error", () => {
