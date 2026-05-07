@@ -64,8 +64,14 @@ def iso_to_foreup_date(iso_date: str) -> str:
 
 
 def foreup_time_to_24h(foreup_time: str) -> str:
-    """Convert ForeUp time format (e.g. '7:30 AM', '1:00 PM') to 24h HH:MM."""
+    """Convert ForeUp time format to 24h HH:MM.
+
+    Handles: '7:30 AM', '1:00 PM', '14:09', '2026-05-09 14:09'.
+    """
     foreup_time = foreup_time.strip()
+    dt_match = re.match(r"^\d{4}-\d{2}-\d{2}\s+(\d{2}:\d{2})", foreup_time)
+    if dt_match:
+        return dt_match.group(1)
     match = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)$", foreup_time, re.IGNORECASE)
     if not match:
         if re.match(r"^\d{2}:\d{2}$", foreup_time):
