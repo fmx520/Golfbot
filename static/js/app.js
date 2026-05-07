@@ -185,6 +185,22 @@ async function searchTeeTimes() {
     return;
   }
 
+  const dateInput = $('playDate');
+  if (dateInput.min && dateInput.value < dateInput.min) {
+    showAlert('searchError', 'Selected date is too early. Earliest available: ' + dateInput.min);
+    btn.disabled = false;
+    btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
+    $('eventLogContainer')?.classList.remove('sniper-armed');
+    return;
+  }
+  if (dateInput.max && dateInput.value > dateInput.max) {
+    showAlert('searchError', 'Selected date is too far out for your booking class. Latest available: ' + dateInput.max);
+    btn.disabled = false;
+    btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
+    $('eventLogContainer')?.classList.remove('sniper-armed');
+    return;
+  }
+
   const payload = {
     username: $('username').value.trim(),
     password: $('password').value.trim(),
@@ -427,7 +443,7 @@ function updateDateRange() {
   const maxDate = new Date(today);
   maxDate.setDate(maxDate.getDate() + maxDays);
 
-  const fmt = d => d.toISOString().split('T')[0];
+  const fmt = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   dateInput.min = fmt(minDate);
   dateInput.max = fmt(maxDate);
 
