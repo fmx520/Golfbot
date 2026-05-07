@@ -96,6 +96,7 @@ class ForeUpDiscoveryClient:
         self.config = config or RequestConfig()
         self.client = self._get_or_create_client(self.config.timeout_seconds)
         self._jwt: Optional[str] = None
+        self._booking_classes: list[str] = []
 
     @classmethod
     def _get_or_create_client(cls, timeout_seconds: float) -> httpx.Client:
@@ -110,8 +111,19 @@ class ForeUpDiscoveryClient:
         return cls._shared_client
 
     def _init_session(self, schedule_id: str = "19765") -> None:
-        """Load the booking page to establish a PHPSESSID cookie before login."""
-        self.client.get(f"{self.base_url}/index.php/booking/{schedule_id}")
+        """Load the booking page to establish a PHPSESSID cookie and extract booking classes."""
+        response = self.client.get(f"{self.base_url}/index.php/booking/{schedule_id}")
+        self._booking_classes = re.findall(
+            r'"booking_class_id"\s*:\s*"(\d+)"', response.text
+        )
+        # deduplicate while preserving order
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for bc in self._booking_classes:
+            if bc not in seen:
+                seen.add(bc)
+                deduped.append(bc)
+        self._booking_classes = deduped
 
     def bootstrap_session(self, username: str, password: str, schedule_id: str = "", course_id: str = "", request_id: Optional[str] = None) -> dict[str, Any]:
         req_id = request_id or str(uuid.uuid4())
@@ -142,38 +154,7 @@ class ForeUpDiscoveryClient:
 
         return result
 
-    def lookup_availability(
-        self,
-        *,
-        schedule_id: str,
-        date: str,
-        players: int,
-        holes: int = 18,
-        booking_class: str = "",
-        request_id: Optional[str] = None,
-    ) -> list[dict[str, Any]]:
-        req_id = request_id or str(uuid.uuid4())
-        params: dict[str, Any] = {
-            "time": "all",
-            "date": iso_to_foreup_date(date),
-            "holes": holes,
-            "players": players,
-            "schedule_id": schedule_id,
-            "specials_only": 0,
-            "api_key": FOREUP_API_KEY,
-        }
-        if booking_class:
-            params["booking_class"] = booking_class
-
-        response = self._request(
-            "GET",
-            FOREUP_TIMES_PATH,
-            stage="availability_lookup",
-            request_id=req_id,
-            params=params,
-            retry_safe=True,
-        )
-
+    def _parse_times_response(self, response: httpx.Response, schedule_id: str) -> list[dict[str, Any]]:
         try:
             raw = response.json()
         except Exception:
@@ -190,10 +171,10 @@ class ForeUpDiscoveryClient:
         else:
             return []
 
-        slots: list[dict[str, Any]] = []
         if not isinstance(items, list):
-            items = []
+            return []
 
+        slots: list[dict[str, Any]] = []
         for item in items:
             available = int(item.get("available_spots", item.get("spots", item.get("openSpots", 0))))
             if available < 1:
@@ -219,6 +200,60 @@ class ForeUpDiscoveryClient:
 
         slots.sort(key=lambda s: s["time"])
         return slots
+
+    def _fetch_times_for_class(
+        self,
+        params: dict[str, Any],
+        request_id: str,
+        schedule_id: str,
+    ) -> list[dict[str, Any]]:
+        response = self._request(
+            "GET",
+            FOREUP_TIMES_PATH,
+            stage="availability_lookup",
+            request_id=request_id,
+            params=params,
+            retry_safe=True,
+        )
+        return self._parse_times_response(response, schedule_id)
+
+    def lookup_availability(
+        self,
+        *,
+        schedule_id: str,
+        date: str,
+        players: int,
+        holes: int = 18,
+        booking_class: str = "",
+        request_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        req_id = request_id or str(uuid.uuid4())
+        base_params: dict[str, Any] = {
+            "time": "all",
+            "date": iso_to_foreup_date(date),
+            "holes": holes,
+            "players": players,
+            "schedule_id": schedule_id,
+            "specials_only": 0,
+            "api_key": FOREUP_API_KEY,
+        }
+
+        if booking_class:
+            base_params["booking_class"] = booking_class
+            return self._fetch_times_for_class(base_params, req_id, schedule_id)
+
+        if self._booking_classes:
+            for bc in self._booking_classes:
+                params = {**base_params, "booking_class": bc}
+                try:
+                    result = self._fetch_times_for_class(params, req_id, schedule_id)
+                    if result:
+                        return result
+                except ForeUpError:
+                    continue
+            return []
+
+        return self._fetch_times_for_class(base_params, req_id, schedule_id)
 
     def _request(self, method: str, path: str, *, stage: str, request_id: str, retry_safe: bool, **kwargs: Any) -> httpx.Response:
         url = f"{self.base_url}{path}"
