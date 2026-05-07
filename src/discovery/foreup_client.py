@@ -88,6 +88,25 @@ class ForeUpDiscoveryClient:
         )
         return response.json()
 
+    def lookup_courses(self, request_id: Optional[str] = None, path: str = "/api/courses") -> list[dict[str, Any]]:
+        req_id = request_id or str(uuid.uuid4())
+        response = self._request(
+            "GET",
+            path,
+            stage="course_catalog_lookup",
+            request_id=req_id,
+            retry_safe=True,
+        )
+        payload = response.json()
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            for key in ("courses", "results", "items", "data"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+        return []
+
     def _request(self, method: str, path: str, *, stage: str, request_id: str, retry_safe: bool, **kwargs: Any) -> httpx.Response:
         url = f"{self.base_url}{path}"
         attempts = self.config.max_retries + 1 if retry_safe else 1
