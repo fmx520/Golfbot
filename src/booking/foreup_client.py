@@ -77,6 +77,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                 "holes": str(holes),
                 "players": str(players),
                 "schedule_id": str(schedule_id),
+                "course_id": str(slot.get("schedule_id", schedule_id)),
                 "booking_class_id": str(slot.get("booking_class_id", "")),
                 "teesheet_id": str(slot.get("teesheet_id", "")),
                 "green_fee": str(slot.get("green_fee", "")),
