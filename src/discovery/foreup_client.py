@@ -105,6 +105,7 @@ class ForeUpDiscoveryClient:
         self.client = self._get_or_create_client(self.config.timeout_seconds)
         self._jwt: Optional[str] = None
         self._booking_classes: list[str] = []
+        self._booking_class_info: list[dict[str, str]] = []
         self._recaptcha_sitekey: Optional[str] = None
         self._last_page_html: Optional[str] = None
 
@@ -147,17 +148,18 @@ class ForeUpDiscoveryClient:
             bcs = sched.get("booking_classes", [])
             if not bcs:
                 continue
-            visible = [
-                bc["booking_class_id"] for bc in bcs
+            visible_bcs = [
+                bc for bc in bcs
                 if bc.get("active") == "1" and bc.get("hidden") != "1"
             ]
-            if visible:
-                unprotected = [
-                    bc["booking_class_id"] for bc in bcs
-                    if bc.get("active") == "1" and bc.get("hidden") != "1"
-                    and bc.get("online_booking_protected") != "1"
+            if visible_bcs:
+                unprotected = [bc for bc in visible_bcs if bc.get("online_booking_protected") != "1"]
+                ordered = unprotected + [bc for bc in visible_bcs if bc not in unprotected]
+                self._booking_class_info = [
+                    {"id": bc["booking_class_id"], "name": bc.get("booking_class_name", bc.get("name", f"Class {bc['booking_class_id']}"))}
+                    for bc in ordered
                 ]
-                return unprotected + [v for v in visible if v not in unprotected]
+                return [bc["booking_class_id"] for bc in ordered]
         return self._extract_booking_classes_fallback(html)
 
     def _extract_booking_classes_fallback(self, html: str) -> list[str]:
@@ -172,6 +174,9 @@ class ForeUpDiscoveryClient:
             return m.group(1)
         m = re.search(r"grecaptcha\.render\([^,]+,\s*\{[^}]*['\"]sitekey['\"]\s*:\s*['\"]([^'\"]+)['\"]", html)
         return m.group(1) if m else None
+
+    def get_booking_class_options(self) -> list[dict[str, str]]:
+        return self._booking_class_info
 
     def extract_recaptcha_sitekey(self, schedule_id: str = "") -> Optional[str]:
         if self._recaptcha_sitekey:

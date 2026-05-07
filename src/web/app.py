@@ -1,6 +1,16 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path as _Path
+
+_env_file = _Path(__file__).resolve().parents[2] / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -47,6 +57,7 @@ class StartJobRequest(BaseModel):
     foreup_booking_url: str | None = None
     username: str = ""
     password: str = ""
+    booking_class: str = ""
     sniper_mode: bool = False
     release_time: str = ""
     auto_book: bool = False
@@ -196,6 +207,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
             date=payload["play_date"],
             players=payload["players"],
             holes=holes,
+            booking_class=payload.get("booking_class", ""),
             request_id=request_id,
         )
         _emit_event(
@@ -448,6 +460,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
                     date=play_date,
                     players=payload["players"],
                     holes=holes,
+                    booking_class=payload.get("booking_class", ""),
                     request_id=f"{request_id}-p{poll_count}",
                 )
             except ForeUpError:
@@ -680,6 +693,7 @@ def connect(req: ConnectRequest) -> dict[str, Any]:
         "base_url": base_url,
         "schedule_id": schedule_id,
         "course_id": course_id,
+        "booking_classes": client.get_booking_class_options(),
     }
 
 

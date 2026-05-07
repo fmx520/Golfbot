@@ -122,6 +122,17 @@ async function connect() {
     if (data.schedule_id) $('scheduleId').value = data.schedule_id;
     if (data.course_id) $('courseId').value = data.course_id;
 
+    const bcSelect = $('bookingClass');
+    bcSelect.innerHTML = '<option value="">Auto-detect</option>';
+    if (data.booking_classes && data.booking_classes.length > 0) {
+      data.booking_classes.forEach(bc => {
+        const opt = document.createElement('option');
+        opt.value = bc.id;
+        opt.textContent = bc.name;
+        bcSelect.appendChild(opt);
+      });
+    }
+
     goToStep(2);
   } catch (e) {
     showAlert('connectError', e.message);
@@ -176,6 +187,7 @@ async function searchTeeTimes() {
     holes: parseInt($('holes').value),
     time_start: $('timeStart').value,
     time_end: $('timeEnd').value,
+    booking_class: $('bookingClass').value,
     dry_run: $('dryRun').checked,
     sniper_mode: isSniper,
     release_time: isSniper ? $('releaseTime').value : '',
