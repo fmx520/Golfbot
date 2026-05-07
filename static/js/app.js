@@ -180,6 +180,7 @@ async function searchTeeTimes() {
     sniper_mode: isSniper,
     release_time: isSniper ? $('releaseTime').value : '',
     auto_book: isSniper ? $('autoBook').checked : false,
+    anticaptcha_api_key: (isSniper && $('autoBook').checked) ? $('captchaApiKey').value.trim() : '',
   };
 
   try {
@@ -265,6 +266,7 @@ function addEvent(phase, stage, message, latencyMs) {
   else if (phase === 'discovery') phaseClass = 'badge-warning';
   else if (phase === 'checkout' || phase === 'confirm') phaseClass = 'badge-success';
   else if (phase === 'sniper') phaseClass = 'badge-sniper';
+  else if (phase === 'captcha') phaseClass = 'badge-captcha';
 
   line.innerHTML =
     `<span class="event-time">${esc(now)}</span>` +
@@ -395,6 +397,14 @@ function toggleSniperMode() {
     fields.classList.add('hidden');
     btn.textContent = 'Search Tee Times';
   }
+  toggleCaptchaKey();
+}
+
+function toggleCaptchaKey() {
+  const show = $('sniperMode').checked && $('autoBook').checked;
+  const group = $('captchaKeyGroup');
+  if (show) group.classList.remove('hidden');
+  else group.classList.add('hidden');
 }
 
 // Init
@@ -405,6 +415,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('connectBtn').addEventListener('click', connect);
   $('searchBtn').addEventListener('click', searchTeeTimes);
   $('sniperMode').addEventListener('change', toggleSniperMode);
+  $('autoBook').addEventListener('change', toggleCaptchaKey);
 
   // Set default date to tomorrow
   const tomorrow = new Date();

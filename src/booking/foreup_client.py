@@ -53,6 +53,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         players: int,
         holes: int = 18,
         request_id: Optional[str] = None,
+        captcha_token: Optional[str] = None,
     ) -> tuple[dict[str, Any], BookingLatency]:
         req_id = request_id or str(uuid.uuid4())
         flow_started = time.perf_counter()
@@ -81,6 +82,8 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                 "green_fee": slot.get("green_fee", ""),
                 "api_key": FOREUP_API_KEY,
             }
+            if captcha_token:
+                reservation_payload["g-recaptcha-response"] = captcha_token
 
             response: dict[str, Any] = {}
             stage_latencies["reservation_submit"] = self._timed_stage(

@@ -50,6 +50,7 @@ class StartJobRequest(BaseModel):
     sniper_mode: bool = False
     release_time: str = ""
     auto_book: bool = False
+    anticaptcha_api_key: str = ""
 
 
 @dataclass
@@ -315,6 +316,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
     auto_book = payload.get("auto_book", False)
     release_time_str = payload.get("release_time", "")
     play_date = payload["play_date"]
+    anticaptcha_key = payload.get("anticaptcha_api_key") or os.getenv("ANTICAPTCHA_API_KEY", "")
 
     if not resolved_schedule_id:
         _emit_event(queue, phase="confirm", stage="terminal", message="No schedule_id provided.", terminal="failed")
@@ -336,6 +338,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
 
     request_id = f"sniper-{job_id}"
     discovery = ForeUpDiscoveryClient(base_url=base_url)
+    captcha_solver = None
 
     try:
         auth_started = time.perf_counter()
@@ -351,6 +354,33 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
         else:
             _emit_event(queue, phase="auth", stage="session", message="No credentials — unauthenticated mode",
                         latency_ms=round((time.perf_counter() - auth_started) * 1000, 2))
+
+        captcha_token: str | None = None
+        captcha_solved_at: float = 0
+        captcha_solver = None
+        CAPTCHA_TOKEN_TTL = 110.0
+
+        if auto_book and anticaptcha_key:
+            site_key = discovery.extract_recaptcha_sitekey(schedule_id=resolved_schedule_id)
+            if site_key:
+                from src.captcha.anticaptcha import AntiCaptchaSolver, CaptchaSolveError
+                captcha_solver = AntiCaptchaSolver(api_key=anticaptcha_key)
+                booking_page_url = payload.get("foreup_booking_url") or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}"
+                _emit_event(queue, phase="captcha", stage="solving",
+                            message=f"reCAPTCHA detected (site key: {site_key[:12]}...) — solving via Anti-Captcha")
+                try:
+                    captcha_started = time.perf_counter()
+                    captcha_token = captcha_solver.solve(booking_page_url, site_key, timeout=120)
+                    captcha_solved_at = time.monotonic()
+                    _emit_event(queue, phase="captcha", stage="solved",
+                                message="CAPTCHA solved — token cached",
+                                latency_ms=round((time.perf_counter() - captcha_started) * 1000, 2))
+                except CaptchaSolveError as exc:
+                    _emit_event(queue, phase="captcha", stage="failed",
+                                message=f"CAPTCHA solve failed: {exc} — will attempt booking without token")
+            else:
+                _emit_event(queue, phase="captcha", stage="skipped",
+                            message="No reCAPTCHA detected on booking page — skipping solver")
 
         seconds_until = (release_dt - datetime.now()).total_seconds()
         release_display = release_dt.strftime("%I:%M:%S %p")
@@ -372,6 +402,18 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
                     _emit_event(queue, phase="sniper", stage="countdown",
                                 message=f"Countdown: {int(remaining)}s remaining")
                     last_update = slept
+
+                if captcha_token and captcha_solved_at and (time.monotonic() - captcha_solved_at) > CAPTCHA_TOKEN_TTL:
+                    if captcha_solver:
+                        _emit_event(queue, phase="captcha", stage="refreshing", message="CAPTCHA token expired — requesting fresh solve")
+                        try:
+                            booking_page_url = payload.get("foreup_booking_url") or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}"
+                            site_key = discovery.extract_recaptcha_sitekey(schedule_id=resolved_schedule_id)
+                            captcha_token = captcha_solver.solve(booking_page_url, site_key, timeout=120)
+                            captcha_solved_at = time.monotonic()
+                            _emit_event(queue, phase="captcha", stage="solved", message="Fresh CAPTCHA token cached")
+                        except Exception:
+                            _emit_event(queue, phase="captcha", stage="failed", message="CAPTCHA refresh failed — will use expired token")
 
         rewarm_started = time.perf_counter()
         if username and password:
@@ -445,15 +487,21 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
         if auto_book and not payload.get("dry_run", True):
             try:
                 booking = ForeUpBookingClient(base_url=base_url)
+                if username and password:
+                    booking.bootstrap_session(username=username, password=password,
+                                              schedule_id=resolved_schedule_id, course_id=resolved_course_id,
+                                              request_id=request_id)
                 submit_started = time.perf_counter()
+                token_msg = " (with CAPTCHA token)" if captcha_token else ""
                 booking_response, booking_latency = booking.book_slot(
                     idempotency_key=f"sniper-{job_id}-{selected.get('tee_time_id', 'unknown')}",
                     slot=selected, schedule_id=teesheet_id,
                     date=play_date, players=payload["players"], holes=holes,
                     request_id=request_id,
+                    captcha_token=captcha_token,
                 )
                 _emit_event(queue, phase="checkout", stage="booking_submit",
-                            message="Booking submitted",
+                            message=f"Booking submitted{token_msg}",
                             latency_ms=round((time.perf_counter() - submit_started) * 1000, 2))
                 _emit_event(queue, phase="confirm", stage="booking_confirmation",
                             message="Booking confirmed", terminal="success",
@@ -486,6 +534,12 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
         _emit_event(queue, phase="confirm", stage="terminal", message=f"Sniper error: {exc}", terminal="failed")
         queue.put({"type": "status", "status": "failed"})
         _finalize_worker()
+    finally:
+        if captcha_solver:
+            try:
+                captcha_solver.close()
+            except Exception:
+                pass
 
 
 def _run_playwright_fallback(

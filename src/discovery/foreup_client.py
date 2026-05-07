@@ -105,6 +105,8 @@ class ForeUpDiscoveryClient:
         self.client = self._get_or_create_client(self.config.timeout_seconds)
         self._jwt: Optional[str] = None
         self._booking_classes: list[str] = []
+        self._recaptcha_sitekey: Optional[str] = None
+        self._last_page_html: Optional[str] = None
 
     @classmethod
     def _get_or_create_client(cls, timeout_seconds: float) -> httpx.Client:
@@ -121,10 +123,13 @@ class ForeUpDiscoveryClient:
     def _init_session(self, schedule_id: str = "19765", teesheet_id: str = "") -> None:
         """Load the booking page to establish a PHPSESSID cookie and extract booking classes."""
         response = self.client.get(f"{self.base_url}/index.php/booking/{schedule_id}")
+        self._last_page_html = response.text
         self._booking_classes = self._extract_booking_classes(response.text, teesheet_id)
+        self._recaptcha_sitekey = self._extract_sitekey(response.text)
         logger.info("extracted_booking_classes", extra={
             "teesheet_id": teesheet_id,
             "booking_classes": self._booking_classes,
+            "recaptcha_sitekey": self._recaptcha_sitekey,
         })
 
     def _extract_booking_classes(self, html: str, teesheet_id: str) -> list[str]:
@@ -159,6 +164,23 @@ class ForeUpDiscoveryClient:
         raw = re.findall(r'"booking_class_id"\s*:\s*"(\d+)"', html)
         seen: set[str] = set()
         return [bc for bc in raw if bc not in seen and not seen.add(bc)]
+
+    @staticmethod
+    def _extract_sitekey(html: str) -> Optional[str]:
+        m = re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
+        if m:
+            return m.group(1)
+        m = re.search(r"grecaptcha\.render\([^,]+,\s*\{[^}]*['\"]sitekey['\"]\s*:\s*['\"]([^'\"]+)['\"]", html)
+        return m.group(1) if m else None
+
+    def extract_recaptcha_sitekey(self, schedule_id: str = "") -> Optional[str]:
+        if self._recaptcha_sitekey:
+            return self._recaptcha_sitekey
+        if not self._last_page_html and schedule_id:
+            response = self.client.get(f"{self.base_url}/index.php/booking/{schedule_id}")
+            self._last_page_html = response.text
+            self._recaptcha_sitekey = self._extract_sitekey(response.text)
+        return self._recaptcha_sitekey
 
     def bootstrap_session(self, username: str, password: str, schedule_id: str = "", course_id: str = "", request_id: Optional[str] = None) -> dict[str, Any]:
         req_id = request_id or str(uuid.uuid4())

@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.13</span>
+        <span class="version-badge">v0.14</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -142,6 +142,13 @@
           <div class="checkbox-group">
             <input type="checkbox" id="autoBook">
             <label for="autoBook">Auto-book when slot found (skip for courses with 2FA)</label>
+          </div>
+          <div id="captchaKeyGroup" class="hidden">
+            <div class="form-group">
+              <label for="captchaApiKey">Anti-Captcha API Key</label>
+              <input type="password" id="captchaApiKey" placeholder="Your anti-captcha.com API key">
+              <div class="form-hint">Required for auto-booking on reCAPTCHA-protected courses</div>
+            </div>
           </div>
         </div>
       </div>

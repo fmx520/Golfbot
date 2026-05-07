@@ -378,6 +378,7 @@ body {
 .badge-info { background: var(--info-bg); color: var(--info); }
 .badge-neutral { background: var(--bg-tertiary); color: var(--text-muted); }
 .badge-sniper { background: rgba(219, 39, 119, 0.15); color: #f472b6; }
+.badge-captcha { background: rgba(6, 182, 212, 0.15); color: #22d3ee; }
 
 /* Sniper armed state */
 .sniper-armed .card {
@@ -595,6 +596,12 @@ body {
 .text-muted { color: var(--text-muted); }
 .text-sm { font-size: var(--fs-sm); }
 .text-center { text-align: center; }
+
+.form-hint {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  margin-top: 4px;
+}
 
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
