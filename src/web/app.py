@@ -259,6 +259,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
             idempotency_key=f"job-{job_id}-{selected.get('tee_time_id', 'unknown')}",
             slot=selected,
             schedule_id=teesheet_id,
+            course_id=resolved_schedule_id,
             date=payload["play_date"],
             players=payload["players"],
             holes=holes,
@@ -512,6 +513,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
                 booking_response, booking_latency = booking.book_slot(
                     idempotency_key=f"sniper-{job_id}-{selected.get('tee_time_id', 'unknown')}",
                     slot=selected, schedule_id=teesheet_id,
+                    course_id=resolved_schedule_id,
                     date=play_date, players=payload["players"], holes=holes,
                     request_id=request_id,
                     captcha_token=captcha_token,
