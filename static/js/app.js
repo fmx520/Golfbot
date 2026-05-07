@@ -144,18 +144,29 @@ async function searchTeeTimes() {
   S.selectedSlot = null;
   S.jobEvents = [];
 
+  const scheduleId = S.scheduleId || $('scheduleId').value.trim();
+  const courseId = S.courseId || $('courseId').value.trim();
+  const bookingUrl = $('bookingUrl').value.trim();
+
+  if (!scheduleId && !bookingUrl) {
+    showAlert('searchError', 'No schedule ID or booking URL. Go back to Step 1 and connect first.');
+    btn.disabled = false;
+    btn.innerHTML = 'Search Tee Times';
+    return;
+  }
+
   const payload = {
     username: $('username').value.trim(),
     password: $('password').value.trim(),
-    foreup_booking_url: $('bookingUrl').value.trim(),
-    schedule_id: S.scheduleId || $('scheduleId').value.trim(),
-    course_id: S.courseId || $('courseId').value.trim(),
+    foreup_booking_url: bookingUrl,
+    schedule_id: scheduleId,
+    course_id: courseId,
     play_date: $('playDate').value,
     players: parseInt($('players').value),
     holes: parseInt($('holes').value),
     time_start: $('timeStart').value,
     time_end: $('timeEnd').value,
-    dry_run: true,
+    dry_run: $('dryRun').checked,
   };
 
   try {
