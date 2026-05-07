@@ -104,7 +104,8 @@ class ForeUpDiscoveryClient:
             FOREUP_LOGIN_PATH,
             stage="bootstrap",
             request_id=req_id,
-            data={"username": username, "password": password, "api_key": FOREUP_API_KEY},
+            data={"username": username, "password": password, "api_key": FOREUP_API_KEY, "booking_class_id": ""},
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
             retry_safe=False,
         )
         try:
