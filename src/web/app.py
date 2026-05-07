@@ -441,9 +441,11 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
         if remaining > 0:
             time.sleep(remaining)
 
-        _emit_event(queue, phase="sniper", stage="polling", message="Polling started — checking every 200ms")
+        import random as _rand
+        _emit_event(queue, phase="sniper", stage="polling", message="Polling started — jittered ~200ms interval")
 
-        poll_interval = 0.2
+        poll_base = 0.15
+        poll_jitter = 0.15
         timeout = 90.0
         poll_start = time.perf_counter()
         poll_count = 0
@@ -483,7 +485,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> N
                             latency_ms=loop_ms)
                 last_status_emit = elapsed
 
-            sleep_remaining = poll_interval - (time.perf_counter() - loop_start)
+            jittered_interval = poll_base + _rand.uniform(0, poll_jitter)
+            sleep_remaining = jittered_interval - (time.perf_counter() - loop_start)
             if sleep_remaining > 0:
                 time.sleep(sleep_remaining)
 
