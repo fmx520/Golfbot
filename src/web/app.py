@@ -295,7 +295,9 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue) -> None:
         _finalize_worker()
 
     except ForeUpError as exc:
-        _emit_event(queue, phase="confirm", stage="terminal", message=f"ForeUp request failed: {exc}", terminal="failed")
+        _emit_event(queue, phase="confirm", stage="terminal",
+                    message=f"ForeUp request failed: {exc} [schedule={resolved_schedule_id}, teesheet={teesheet_id}]",
+                    terminal="failed")
         queue.put({"type": "status", "status": "failed"})
         _finalize_worker()
     except Exception as exc:  # noqa: BLE001
@@ -659,9 +661,11 @@ def _watch_worker(job_id: str, queue: Queue, process: Process) -> None:
 
 # --- Routes ---
 
+APP_VERSION = "0.30"
+
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @app.post("/api/connect")
