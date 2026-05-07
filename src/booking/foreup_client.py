@@ -73,16 +73,47 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                 ),
             )
 
-            reservation_payload = {
+            raw = slot.get("raw", slot) if isinstance(slot.get("raw"), dict) else slot
+
+            def _pick(key: str, default: Any = "") -> Any:
+                val = raw.get(key, slot.get(key, default))
+                return default if val is None else val
+
+            reservation_payload: dict[str, Any] = {
                 "time": slot.get("raw_time", slot.get("time", "")),
                 "date": iso_to_foreup_date(date),
                 "holes": holes,
                 "players": players,
+                "carts": "false",
                 "schedule_id": int(schedule_id),
                 "course_id": int(course_id or schedule_id),
-                "booking_class_id": slot.get("booking_class_id", ""),
-                "teesheet_id": slot.get("teesheet_id", ""),
-                "green_fee": slot.get("green_fee", ""),
+                "booking_class_id": _pick("booking_class_id"),
+                "teesheet_id": _pick("teesheet_id", schedule_id),
+                "teesheet_side_id": _pick("teesheet_side_id"),
+                "start_front": _pick("start_front"),
+                "duration": 1,
+                "promo_code": "",
+                "special_id": _pick("special_id"),
+                "pay_online": _pick("pay_online", "no"),
+                "foreup_discount": _pick("foreup_discount", False),
+                "foreup_trade_discount_rate": _pick("foreup_trade_discount_rate", 0),
+                "is_designated_trade": _pick("is_designated_trade", False),
+                "booking_fee_required": _pick("booking_fee_required", False),
+                "booking_fee_price": _pick("booking_fee_price", 0),
+                "booking_fee_per_person": _pick("booking_fee_per_person", False),
+                "rate_type": _pick("rate_type", "walking"),
+                "green_fee": _pick("green_fee", 0),
+                "green_fee_tax": _pick("green_fee_tax", 0),
+                "green_fee_tax_rate": _pick("green_fee_tax_rate", 0),
+                "cart_fee": _pick("cart_fee", 0),
+                "cart_fee_tax": _pick("cart_fee_tax", 0),
+                "cart_fee_tax_rate": _pick("cart_fee_tax_rate", 0),
+                "guest_green_fee": _pick("guest_green_fee", 0),
+                "guest_green_fee_tax": _pick("guest_green_fee_tax", 0),
+                "guest_green_fee_tax_rate": _pick("guest_green_fee_tax_rate", 0),
+                "guest_cart_fee": _pick("guest_cart_fee", 0),
+                "guest_cart_fee_tax": _pick("guest_cart_fee_tax", 0),
+                "guest_cart_fee_tax_rate": _pick("guest_cart_fee_tax_rate", 0),
                 "api_key": FOREUP_API_KEY,
             }
             if captcha_token:
