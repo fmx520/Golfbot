@@ -209,6 +209,52 @@
       <button class="btn btn-secondary mt-2" onclick="backToStep(2)">Search Again</button>
     </section>
 
+    <!-- FAQ -->
+    <section class="faq-section">
+      <h2 class="page-title">How It Works</h2>
+
+      <details class="faq-item">
+        <summary>What is Dry Run?</summary>
+        <p>Dry Run searches for tee times but does not book anything. Use it to preview availability and confirm your filters are correct before committing to a real booking.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>What is Sniper Mode?</summary>
+        <p>Sniper Mode is designed to beat other bots when courses release tee times at a fixed time (e.g., 7:00 PM). It pre-authenticates your session, then at release time polls the ForeUp API every 200ms (5 requests/second) until a matching slot appears. The booking fires within milliseconds of the slot showing up — before a human could even see it on screen. The 90-second timeout stops polling if nothing is released.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>What is Auto-Book?</summary>
+        <p>When enabled alongside Sniper Mode, the bot will automatically submit the booking the instant a matching slot is found — no manual intervention needed. If the course uses reCAPTCHA (like Sunken Meadow or Bethpage), you'll also need an Anti-Captcha API key so the CAPTCHA is pre-solved during the countdown and ready to submit with the booking.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>What is the Anti-Captcha API Key?</summary>
+        <p>Some courses protect their booking confirmation with a reCAPTCHA checkbox. The Anti-Captcha service solves it programmatically (~5-15 seconds, fractions of a cent per solve). The bot pre-solves the CAPTCHA during the sniper countdown so the token is cached and ready the instant a slot is found. Get a key at <a href="https://anti-captcha.com" target="_blank">anti-captcha.com</a>. You can also set it as the <code>ANTICAPTCHA_API_KEY</code> environment variable.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>What is the Booking Class?</summary>
+        <p>ForeUp courses offer different booking classes (e.g., Resident, Non Resident, Verified NYS Resident) with different pricing and availability. After connecting, the dropdown populates with the options for your course. Pick the one that matches your status to see the right times and prices. "Auto-detect" tries unprotected classes first.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>What does the Release Time mean?</summary>
+        <p>This is the time your course publishes new tee times — for example, many NY state courses release at 7:00 PM for the following week. Set this to match your course's release schedule. The sniper arms early, pre-warms your session at T-5 seconds, and starts polling at exactly this time.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>Sniper timeline</summary>
+        <p>
+          <strong>T-120s</strong> — Authenticate &amp; pre-solve CAPTCHA<br>
+          <strong>T-5s</strong> — Re-warm session (fresh cookies + JWT)<br>
+          <strong>T-0s</strong> — Start polling every 200ms<br>
+          <strong>T+match</strong> — Slot found → book instantly or alert<br>
+          <strong>T+90s</strong> — Timeout if no slots found
+        </p>
+      </details>
+    </section>
+
   </div>
 
   <script src="/static/js/app.js"></script>
