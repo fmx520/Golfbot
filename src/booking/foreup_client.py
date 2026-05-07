@@ -75,13 +75,13 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             reservation_payload = {
                 "time": slot.get("raw_time", slot.get("time", "")),
                 "date": iso_to_foreup_date(date),
-                "holes": str(holes),
-                "players": str(players),
-                "schedule_id": str(schedule_id),
-                "course_id": str(course_id or schedule_id),
-                "booking_class_id": str(slot.get("booking_class_id", "")),
-                "teesheet_id": str(slot.get("teesheet_id", "")),
-                "green_fee": str(slot.get("green_fee", "")),
+                "holes": holes,
+                "players": players,
+                "schedule_id": int(schedule_id),
+                "course_id": int(course_id or schedule_id),
+                "booking_class_id": slot.get("booking_class_id", ""),
+                "teesheet_id": slot.get("teesheet_id", ""),
+                "green_fee": slot.get("green_fee", ""),
                 "api_key": FOREUP_API_KEY,
             }
             if captcha_token:
@@ -96,7 +96,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                     stage="reservation_submit",
                     request_id=req_id,
                     retry_safe=False,
-                    data=reservation_payload,
+                    json=reservation_payload,
                 )
                 try:
                     response.update(resp.json())
