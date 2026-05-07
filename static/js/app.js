@@ -123,7 +123,7 @@ async function connect() {
     if (data.course_id) $('courseId').value = data.course_id;
 
     const bcSelect = $('bookingClass');
-    bcSelect.innerHTML = '<option value="">Auto-detect</option>';
+    bcSelect.innerHTML = '<option value="" disabled selected>Select a booking class</option>';
     if (data.booking_classes && data.booking_classes.length > 0) {
       data.booking_classes.forEach(bc => {
         const opt = document.createElement('option');
@@ -173,6 +173,14 @@ async function searchTeeTimes() {
     showAlert('searchError', 'No schedule ID or booking URL. Go back to Step 1 and connect first.');
     btn.disabled = false;
     btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
+    return;
+  }
+
+  if (!$('bookingClass').value) {
+    showAlert('searchError', 'Please select a booking class before searching.');
+    btn.disabled = false;
+    btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
+    $('eventLogContainer')?.classList.remove('sniper-armed');
     return;
   }
 

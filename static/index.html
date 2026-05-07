@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.16</span>
+        <span class="version-badge">v0.17</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -121,8 +121,8 @@
         </div>
         <div class="form-group" id="bookingClassGroup">
           <label for="bookingClass">Booking Class</label>
-          <select id="bookingClass">
-            <option value="">Auto-detect</option>
+          <select id="bookingClass" required>
+            <option value="" disabled selected>Select a booking class</option>
           </select>
         </div>
         <div class="checkbox-group">
