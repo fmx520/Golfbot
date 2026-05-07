@@ -117,16 +117,20 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         slot: dict[str, Any],
         request_id: str,
     ) -> None:
+        params: dict[str, Any] = {
+            "time": "all",
+            "schedule_id": schedule_id,
+            "date": iso_to_foreup_date(date),
+            "api_key": FOREUP_API_KEY,
+        }
+        if slot.get("booking_class_id"):
+            params["booking_class"] = slot["booking_class_id"]
         response = self._request(
             "GET",
             FOREUP_TIMES_PATH,
             stage="slot_validation",
             request_id=request_id,
-            params={
-                "schedule_id": schedule_id,
-                "date": iso_to_foreup_date(date),
-                "api_key": FOREUP_API_KEY,
-            },
+            params=params,
             retry_safe=True,
         )
         try:
