@@ -402,6 +402,10 @@ class ForeUpDiscoveryClient:
             except AntiBotDetectedError:
                 self._log(stage, request_id, started_at, started, "antibot", attempt, 0, None)
                 raise
+            except httpx.HTTPStatusError as exc:
+                body_preview = exc.response.text[:500] if exc.response else ""
+                self._log(stage, request_id, started_at, started, "error", attempt, exc.response.status_code if exc.response else 0, None)
+                raise ForeUpError(f"{exc} | Body: {body_preview}") from exc
             except httpx.TimeoutException as exc:
                 if retry_safe and attempt < attempts:
                     delay = self._retry_delay(attempt)

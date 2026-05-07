@@ -74,30 +74,37 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             reservation_payload = {
                 "time": slot.get("raw_time", slot.get("time", "")),
                 "date": iso_to_foreup_date(date),
-                "holes": holes,
-                "players": players,
-                "schedule_id": schedule_id,
-                "booking_class_id": slot.get("booking_class_id", ""),
-                "teesheet_id": slot.get("teesheet_id", ""),
-                "green_fee": slot.get("green_fee", ""),
+                "holes": str(holes),
+                "players": str(players),
+                "schedule_id": str(schedule_id),
+                "booking_class_id": str(slot.get("booking_class_id", "")),
+                "teesheet_id": str(slot.get("teesheet_id", "")),
+                "green_fee": str(slot.get("green_fee", "")),
                 "api_key": FOREUP_API_KEY,
             }
             if captcha_token:
                 reservation_payload["g-recaptcha-response"] = captcha_token
 
+            logger.info("reservation_payload", extra={"payload": reservation_payload, "slot_raw": slot})
+
+            def _submit_reservation() -> None:
+                resp = self._request(
+                    "POST",
+                    FOREUP_RESERVATIONS_PATH,
+                    stage="reservation_submit",
+                    request_id=req_id,
+                    retry_safe=False,
+                    data=reservation_payload,
+                )
+                try:
+                    response.update(resp.json())
+                except Exception:
+                    response.update({"raw_body": resp.text[:1000], "status_code": resp.status_code})
+
             response: dict[str, Any] = {}
             stage_latencies["reservation_submit"] = self._timed_stage(
                 "reservation_submit",
-                lambda: response.update(
-                    self._request(
-                        "POST",
-                        FOREUP_RESERVATIONS_PATH,
-                        stage="reservation_submit",
-                        request_id=req_id,
-                        retry_safe=False,
-                        data=reservation_payload,
-                    ).json()
-                ),
+                _submit_reservation,
             )
 
             self._mark_idempotent_complete(idempotency_key)
