@@ -21,6 +21,7 @@ FOREUP_API_KEY = "no_limits"
 FOREUP_LOGIN_PATH = "/index.php/api/booking/users/login"
 FOREUP_TIMES_PATH = "/index.php/api/booking/times"
 FOREUP_RESERVATIONS_PATH = "/index.php/api/booking/users/reservations"
+FOREUP_PENDING_RESERVATION_PATH = "/index.php/api/booking/pending_reservation"
 
 ANTIBOT_MARKERS = (
     "g-recaptcha",

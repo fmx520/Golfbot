@@ -267,6 +267,31 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
         _emit_event(queue, phase="checkout", stage="debug",
                     message=f"Slot constraints: {constraint_fields} | requested players={payload.get('players')} holes={holes}")
 
+        captcha_token: str | None = None
+        anticaptcha_key = payload.get("anticaptcha_api_key") or os.getenv("ANTICAPTCHA_API_KEY", "")
+        if anticaptcha_key:
+            try:
+                site_key = discovery.extract_recaptcha_sitekey(schedule_id=resolved_schedule_id)
+                if site_key:
+                    from src.captcha.anticaptcha import AntiCaptchaSolver, CaptchaSolveError
+                    booking_page_url = (
+                        payload.get("foreup_booking_url")
+                        or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}"
+                    )
+                    _emit_event(queue, phase="captcha", stage="solving",
+                                message=f"Solving reCAPTCHA (site_key={site_key[:12]}…)")
+                    captcha_token = AntiCaptchaSolver(api_key=anticaptcha_key).solve(
+                        booking_page_url, site_key, timeout=120
+                    )
+                    _emit_event(queue, phase="captcha", stage="solved",
+                                message="reCAPTCHA solved — token attached to booking")
+                else:
+                    _emit_event(queue, phase="captcha", stage="skipped",
+                                message="No reCAPTCHA site key found on booking page")
+            except Exception as exc:  # noqa: BLE001
+                _emit_event(queue, phase="captcha", stage="error",
+                            message=f"CAPTCHA solve failed: {exc} — proceeding without token")
+
         submit_started = time.perf_counter()
 
         def _booking_debug(event: str, data: dict[str, Any]) -> None:
@@ -282,6 +307,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
             players=payload["players"],
             holes=holes,
             request_id=request_id,
+            captcha_token=captcha_token,
             debug_callback=_booking_debug,
         )
         _emit_event(
@@ -764,7 +790,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.36"
+APP_VERSION = "0.40"
 
 @app.get("/health")
 def health() -> dict[str, str]:

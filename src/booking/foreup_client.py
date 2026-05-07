@@ -12,6 +12,7 @@ import httpx
 
 from src.discovery.foreup_client import (
     FOREUP_API_KEY,
+    FOREUP_PENDING_RESERVATION_PATH,
     FOREUP_RESERVATIONS_PATH,
     FOREUP_TIMES_PATH,
     AntiBotDetectedError,
@@ -73,58 +74,87 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                 ),
             )
 
-            raw = slot.get("raw", slot) if isinstance(slot.get("raw"), dict) else slot
+            raw = slot.get("raw") if isinstance(slot.get("raw"), dict) else slot
 
             def _pick(key: str, default: Any = "") -> Any:
                 val = raw.get(key, slot.get(key, default))
                 return default if val is None else val
 
-            reservation_payload: dict[str, Any] = {
+            def _emit(event: str, data: dict[str, Any]) -> None:
+                if debug_callback:
+                    try:
+                        debug_callback(event, data)
+                    except Exception:
+                        pass
+
+            # ---- Step 1: pending_reservation (form-encoded) -> returns TTID ----
+            pending_payload = {
                 "time": slot.get("raw_time", slot.get("time", "")),
-                "date": iso_to_foreup_date(date),
                 "holes": holes,
                 "players": players,
                 "carts": "false",
                 "schedule_id": int(schedule_id),
+                "teesheet_side_id": _pick("teesheet_side_id"),
                 "course_id": int(course_id or schedule_id),
                 "booking_class_id": _pick("booking_class_id"),
-                "teesheet_id": _pick("teesheet_id", schedule_id),
-                "teesheet_side_id": _pick("teesheet_side_id"),
-                "start_front": _pick("start_front"),
                 "duration": 1,
-                "promo_code": "",
-                "special_id": _pick("special_id"),
-                "pay_online": _pick("pay_online", "no"),
-                "foreup_discount": _pick("foreup_discount", False),
-                "foreup_trade_discount_rate": _pick("foreup_trade_discount_rate", 0),
-                "is_designated_trade": _pick("is_designated_trade", False),
-                "booking_fee_required": _pick("booking_fee_required", False),
-                "booking_fee_price": _pick("booking_fee_price", 0),
-                "booking_fee_per_person": _pick("booking_fee_per_person", False),
-                "rate_type": _pick("rate_type", "walking"),
-                "green_fee": _pick("green_fee", 0),
-                "green_fee_tax": _pick("green_fee_tax", 0),
-                "green_fee_tax_rate": _pick("green_fee_tax_rate", 0),
+                "foreup_discount": "false",
+                "foreup_trade_discount_rate": 0,
+                "trade_min_players": _pick("trade_min_players", 0),
                 "cart_fee": _pick("cart_fee", 0),
                 "cart_fee_tax": _pick("cart_fee_tax", 0),
-                "cart_fee_tax_rate": _pick("cart_fee_tax_rate", 0),
-                "guest_green_fee": _pick("guest_green_fee", 0),
-                "guest_green_fee_tax": _pick("guest_green_fee_tax", 0),
-                "guest_green_fee_tax_rate": _pick("guest_green_fee_tax_rate", 0),
-                "guest_cart_fee": _pick("guest_cart_fee", 0),
-                "guest_cart_fee_tax": _pick("guest_cart_fee_tax", 0),
-                "guest_cart_fee_tax_rate": _pick("guest_cart_fee_tax_rate", 0),
-                "api_key": FOREUP_API_KEY,
+                "green_fee": _pick("green_fee", 0),
+                "green_fee_tax": _pick("green_fee_tax", 0),
             }
-            if captcha_token:
-                reservation_payload["g-recaptcha-response"] = captcha_token
+            _emit("pending_payload", {"payload": pending_payload})
 
-            logger.info("reservation_payload", extra={"payload": reservation_payload, "slot_raw": slot})
-            if debug_callback:
+            pending_response: dict[str, Any] = {}
+
+            def _create_pending() -> None:
                 try:
-                    debug_callback("reservation_payload", {"payload": reservation_payload})
+                    resp = self._request(
+                        "POST",
+                        FOREUP_PENDING_RESERVATION_PATH,
+                        stage="pending_reservation",
+                        request_id=req_id,
+                        retry_safe=False,
+                        data=pending_payload,
+                    )
+                except ForeUpError as exc:
+                    _emit("pending_error", {"error": str(exc)})
+                    raise
+                try:
+                    pending_response.update(resp.json())
                 except Exception:
-                    pass
+                    pending_response.update({"raw_body": resp.text[:1000], "status_code": resp.status_code})
+                _emit("pending_response", {"response": pending_response})
+
+            stage_latencies["pending_reservation"] = self._timed_stage(
+                "pending_reservation", _create_pending
+            )
+
+            pending_reservation_id = pending_response.get("reservation_id", "")
+            if not pending_reservation_id:
+                raise ForeUpError(
+                    f"pending_reservation did not return a reservation_id: {pending_response}"
+                )
+
+            # ---- Step 2: build the full reservation payload (JSON) ----
+            full_payload = self._build_full_reservation_payload(
+                slot=slot,
+                raw=raw,
+                schedule_id=schedule_id,
+                course_id=course_id or schedule_id,
+                players=players,
+                holes=holes,
+                pending_reservation_id=pending_reservation_id,
+                captcha_token=captcha_token,
+                validate_only=False,
+            )
+            logger.info("reservation_payload", extra={"payload": full_payload, "slot_raw": slot})
+            _emit("reservation_payload", {"payload": full_payload})
+
+            response: dict[str, Any] = {}
 
             def _submit_reservation() -> None:
                 try:
@@ -134,26 +164,17 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                         stage="reservation_submit",
                         request_id=req_id,
                         retry_safe=False,
-                        json=reservation_payload,
+                        json=full_payload,
                     )
                 except ForeUpError as exc:
-                    if debug_callback:
-                        try:
-                            debug_callback("reservation_error", {"error": str(exc)})
-                        except Exception:
-                            pass
+                    _emit("reservation_error", {"error": str(exc)})
                     raise
                 try:
                     response.update(resp.json())
                 except Exception:
                     response.update({"raw_body": resp.text[:1000], "status_code": resp.status_code})
-                if debug_callback:
-                    try:
-                        debug_callback("reservation_response", {"response": response, "status": resp.status_code})
-                    except Exception:
-                        pass
+                _emit("reservation_response", {"response": response, "status": resp.status_code})
 
-            response: dict[str, Any] = {}
             stage_latencies["reservation_submit"] = self._timed_stage(
                 "reservation_submit",
                 _submit_reservation,
@@ -198,6 +219,149 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             return resp.json()
         except Exception:
             return {"raw_body": resp.text[:1000], "status_code": resp.status_code}
+
+    def _build_full_reservation_payload(
+        self,
+        *,
+        slot: dict[str, Any],
+        raw: dict[str, Any],
+        schedule_id: str,
+        course_id: str,
+        players: int,
+        holes: int,
+        pending_reservation_id: str,
+        captcha_token: Optional[str],
+        validate_only: bool,
+    ) -> dict[str, Any]:
+        def _pick(key: str, default: Any = "") -> Any:
+            val = raw.get(key, slot.get(key, default))
+            return default if val is None else val
+
+        green_fee = _pick("green_fee", 0)
+        green_fee_18 = _pick("green_fee_18", green_fee)
+        guest_green_fee = _pick("guest_green_fee", green_fee)
+        subtotal = green_fee
+        time_str = slot.get("raw_time", slot.get("time", ""))
+
+        air_quotes_cart = []
+        if green_fee:
+            air_quotes_cart.append({
+                "type": "item",
+                "description": "Green Fee",
+                "price": green_fee,
+                "quantity": int(players),
+                "subtotal": green_fee * int(players),
+            })
+
+        return {
+            "validate_only": validate_only,
+            "time": time_str,
+            "start_front": _pick("start_front"),
+            "course_id": int(course_id),
+            "course_name": _pick("course_name", ""),
+            "schedule_id": int(schedule_id),
+            "schedule_name": _pick("schedule_name", ""),
+            "teesheet_id": _pick("teesheet_id", schedule_id),
+            "teesheet_holes": _pick("teesheet_holes", holes),
+            "teesheet_side_id": _pick("teesheet_side_id"),
+            "teesheet_side_name": _pick("teesheet_side_name", ""),
+            "teesheet_side_order": _pick("teesheet_side_order", 1),
+            "reround_teesheet_side_id": _pick("reround_teesheet_side_id"),
+            "reround_teesheet_side_name": _pick("reround_teesheet_side_name", ""),
+            "booking_class_id": _pick("booking_class_id"),
+            "pending_reservation_id": pending_reservation_id,
+            "captchaid": captcha_token or "",
+            "holes": str(holes),
+            "players": str(players),
+            "carts": False,
+            "duration": 1,
+            "rate_type": _pick("rate_type", "walking"),
+            "reservation_type": "tee",
+            "pay_online": _pick("pay_online", "no"),
+            "pay_players": str(players),
+            "pay_carts": 0,
+            "pay_subtotal": subtotal,
+            "pay_total": subtotal,
+            "subtotal": subtotal,
+            "preTaxSubtotal": subtotal,
+            "total": subtotal,
+            "totalWithTax": subtotal,
+            "estimatedTax": 0,
+            "discount": 0,
+            "discount_percent": 0,
+            "promo_code": "",
+            "promo_discount": 0,
+            "customer_message": "",
+            "details": "",
+            "end_datetime": "",
+            "notes": [],
+            "player_list": False,
+            "purchased": False,
+            "paid_player_count": 0,
+            "reservation_confirmation_uid": "",
+            "showTaxDetails": False,
+            "display_capacity": _pick("display_capacity", False),
+            "max_capacity": 0,
+            "minimum_players": _pick("minimum_players", 1),
+            "maximum_players_per_booking": _pick("maximum_players_per_booking", 4),
+            "allowed_group_sizes": _pick("allowed_group_sizes", ["1", "2", "3", "4"]),
+            "available_spots": _pick("available_spots", 1),
+            "available_spots_9": _pick("available_spots_9", 0),
+            "available_spots_18": _pick("available_spots_18", 1),
+            "available_duration": None,
+            "availableHoles": str(_pick("teesheet_holes", holes)),
+            "increment_amount": None,
+            "blockReservationDueToExistingReservation": False,
+            "allow_mobile_checkin": 0,
+            "airQuotesCart": air_quotes_cart,
+            "green_fee": green_fee,
+            "green_fee_9": _pick("green_fee_9", 0),
+            "green_fee_18": green_fee_18,
+            "green_fee_tax": _pick("green_fee_tax", 0),
+            "green_fee_tax_9": _pick("green_fee_tax_9", 0),
+            "green_fee_tax_18": _pick("green_fee_tax_18", 0),
+            "green_fee_tax_rate": _pick("green_fee_tax_rate", False),
+            "guest_green_fee": guest_green_fee,
+            "guest_green_fee_9": _pick("guest_green_fee_9", 0),
+            "guest_green_fee_18": _pick("guest_green_fee_18", guest_green_fee),
+            "guest_green_fee_tax": _pick("guest_green_fee_tax", 0),
+            "guest_green_fee_tax_9": _pick("guest_green_fee_tax_9", 0),
+            "guest_green_fee_tax_18": _pick("guest_green_fee_tax_18", 0),
+            "guest_green_fee_tax_rate": _pick("guest_green_fee_tax_rate", False),
+            "cart_fee": _pick("cart_fee", 0),
+            "cart_fee_9": _pick("cart_fee_9", 0),
+            "cart_fee_18": _pick("cart_fee_18", 0),
+            "cart_fee_tax": _pick("cart_fee_tax", 0),
+            "cart_fee_tax_9": _pick("cart_fee_tax_9", 0),
+            "cart_fee_tax_18": _pick("cart_fee_tax_18", 0),
+            "cart_fee_tax_rate": _pick("cart_fee_tax_rate", False),
+            "guest_cart_fee": _pick("guest_cart_fee", 0),
+            "guest_cart_fee_9": _pick("guest_cart_fee_9", 0),
+            "guest_cart_fee_18": _pick("guest_cart_fee_18", 0),
+            "guest_cart_fee_tax": _pick("guest_cart_fee_tax", 0),
+            "guest_cart_fee_tax_9": _pick("guest_cart_fee_tax_9", 0),
+            "guest_cart_fee_tax_18": _pick("guest_cart_fee_tax_18", 0),
+            "guest_cart_fee_tax_rate": _pick("guest_cart_fee_tax_rate", False),
+            "booking_fee_required": _pick("booking_fee_required", False),
+            "booking_fee_price": _pick("booking_fee_price", False),
+            "booking_fee_per_person": _pick("booking_fee_per_person", False),
+            "has_special": _pick("has_special", False),
+            "special_id": _pick("special_id", False),
+            "special_was_price": _pick("special_was_price", None),
+            "special_discount_percentage": _pick("special_discount_percentage", 0),
+            "group_id": _pick("group_id", False),
+            "foreup_discount": _pick("foreup_discount", False),
+            "foreup_trade_discount_rate": _pick("foreup_trade_discount_rate", 0),
+            "foreup_trade_discount_information": [],
+            "foreup_trade_refund_amount": 0,
+            "is_designated_trade": _pick("is_designated_trade", False),
+            "is_foreup_trade_reservation": False,
+            "trade_available_players": _pick("trade_available_players", 0),
+            "trade_cart_requirement": _pick("trade_cart_requirement", "both"),
+            "trade_hole_requirement": _pick("trade_hole_requirement", "all"),
+            "trade_min_players": _pick("trade_min_players", 0),
+            "require_credit_card": _pick("require_credit_card", False),
+        }
 
     def _validate_slot_still_available(
         self,
