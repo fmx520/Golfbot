@@ -156,7 +156,12 @@ class ForeUpDiscoveryClient:
         self._course_options = [
             {
                 "teesheet_id": str(sched.get("teesheet_id", "")),
-                "name": sched.get("schedule_name") or sched.get("name") or f"Course {sched.get('teesheet_id', '?')}",
+                "name": (
+                    sched.get("title")
+                    or sched.get("schedule_name")
+                    or sched.get("name")
+                    or f"Course {sched.get('teesheet_id', '?')}"
+                ),
                 "course_id": str(sched.get("course_id", "")),
                 "holes": str(sched.get("holes", "")),
             }
