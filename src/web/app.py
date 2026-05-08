@@ -446,9 +446,24 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
         _finalize_worker()
 
     except ForeUpError as exc:
-        _emit_event(queue, phase="confirm", stage="terminal",
-                    message=f"ForeUp request failed: {exc} [schedule={resolved_schedule_id}, teesheet={teesheet_id}]",
-                    terminal="failed")
+        msg = str(exc)
+        if "booking code" in msg.lower() or "requires a booking code" in msg.lower():
+            _emit_event(
+                queue,
+                phase="verify",
+                stage="booking_code_required",
+                message=(
+                    "This course requires an email booking code (2FA). The bot does not yet "
+                    "implement the request-code endpoint for this course. The slot was held briefly "
+                    "but will be released. To finish booking, complete it manually on foreupsoftware.com."
+                ),
+                terminal="failed",
+                provider_message=msg,
+            )
+        else:
+            _emit_event(queue, phase="confirm", stage="terminal",
+                        message=f"ForeUp request failed: {exc} [schedule={resolved_schedule_id}, teesheet={teesheet_id}]",
+                        terminal="failed")
         queue.put({"type": "status", "status": "failed"})
         _finalize_worker()
     except Exception as exc:  # noqa: BLE001
@@ -853,7 +868,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.45"
+APP_VERSION = "0.46"
 
 @app.get("/health")
 def health() -> dict[str, str]:
