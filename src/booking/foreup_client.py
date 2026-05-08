@@ -349,7 +349,6 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             "player_list": False,
             "purchased": False,
             "paid_player_count": 0,
-            "reservation_confirmation_uid": "",
             "showTaxDetails": False,
             "display_capacity": _pick("display_capacity", False),
             "max_capacity": 0,
