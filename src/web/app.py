@@ -253,13 +253,15 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
         else:
             course_ids = [c for c in (payload.get("course_ids") or []) if c] or [default_teesheet]
             slots = []
+            requested_class = payload.get("booking_class", "")
             for priority_index, tid in enumerate(course_ids):
+                resolved_class = discovery.resolve_booking_class(tid, requested_class)
                 course_slots = discovery.lookup_availability(
                     schedule_id=tid,
                     date=payload["play_date"],
                     players=payload["players"],
                     holes=holes,
-                    booking_class=payload.get("booking_class", ""),
+                    booking_class=resolved_class,
                     request_id=request_id,
                 )
                 for s in course_slots:
@@ -851,7 +853,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.44"
+APP_VERSION = "0.45"
 
 @app.get("/health")
 def health() -> dict[str, str]:

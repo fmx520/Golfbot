@@ -130,18 +130,30 @@ async function connect() {
     if (data.schedule_id) $('scheduleId').value = data.schedule_id;
     if (data.course_id) $('courseId').value = data.course_id;
 
+    const courses = data.courses || [];
+    S.courses = courses;
+
     const bcSelect = $('bookingClass');
     bcSelect.innerHTML = '<option value="" disabled selected>Select a booking class</option>';
-    if (data.booking_classes && data.booking_classes.length > 0) {
-      data.booking_classes.forEach(bc => {
-        const opt = document.createElement('option');
-        opt.value = bc.id;
-        opt.textContent = bc.name;
-        bcSelect.appendChild(opt);
-      });
-    }
 
-    const courses = data.courses || [];
+    // Build the booking-class option list from the union of names across all
+    // courses so picks are course-agnostic; backend resolves per course.
+    const nameSet = new Map();
+    courses.forEach(c => (c.classes || []).forEach(cls => {
+      if (cls.name && !nameSet.has(cls.name)) nameSet.set(cls.name, cls);
+    }));
+    const classOptions = Array.from(nameSet.values());
+    if (classOptions.length === 0 && data.booking_classes) {
+      // Single-course fallback (legacy path)
+      data.booking_classes.forEach(bc => classOptions.push({ id: bc.id, name: bc.name }));
+    }
+    classOptions.forEach(cls => {
+      const opt = document.createElement('option');
+      opt.value = cls.name || cls.id;  // send the name; backend resolves per course
+      opt.textContent = cls.name;
+      bcSelect.appendChild(opt);
+    });
+
     const coursesGroup = $('coursesGroup');
     const rankingGroup = $('rankingGroup');
     const courseBox = $('courseCheckboxes');

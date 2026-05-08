@@ -117,6 +117,7 @@ class ForeUpDiscoveryClient:
         self._booking_classes: list[str] = []
         self._booking_class_info: list[dict[str, str]] = []
         self._course_options: list[dict[str, str]] = []
+        self._classes_by_course: dict[str, list[dict[str, str]]] = {}
         self._recaptcha_sitekey: Optional[str] = None
         self._last_page_html: Optional[str] = None
 
@@ -153,21 +154,38 @@ class ForeUpDiscoveryClient:
         except (ValueError, _json.JSONDecodeError):
             return self._extract_booking_classes_fallback(html)
 
-        self._course_options = [
-            {
-                "teesheet_id": str(sched.get("teesheet_id", "")),
+        self._course_options = []
+        self._classes_by_course = {}
+        for sched in schedules:
+            tid = str(sched.get("teesheet_id", ""))
+            if not tid:
+                continue
+            visible_bcs = [
+                bc for bc in (sched.get("booking_classes") or [])
+                if bc.get("active") == "1" and bc.get("hidden") != "1"
+            ]
+            unprotected = [bc for bc in visible_bcs if bc.get("online_booking_protected") != "1"]
+            ordered = unprotected + [bc for bc in visible_bcs if bc not in unprotected]
+            classes = [
+                {
+                    "id": str(bc["booking_class_id"]),
+                    "name": bc.get("name") or bc.get("booking_class_name") or f"Class {bc['booking_class_id']}",
+                }
+                for bc in ordered
+            ]
+            self._classes_by_course[tid] = classes
+            self._course_options.append({
+                "teesheet_id": tid,
                 "name": (
                     sched.get("title")
                     or sched.get("schedule_name")
                     or sched.get("name")
-                    or f"Course {sched.get('teesheet_id', '?')}"
+                    or f"Course {tid}"
                 ),
                 "course_id": str(sched.get("course_id", "")),
                 "holes": str(sched.get("holes", "")),
-            }
-            for sched in schedules
-            if sched.get("teesheet_id")
-        ]
+                "classes": classes,
+            })
 
         for sched in schedules:
             if teesheet_id and sched.get("teesheet_id") != teesheet_id:
@@ -205,8 +223,23 @@ class ForeUpDiscoveryClient:
     def get_booking_class_options(self) -> list[dict[str, str]]:
         return self._booking_class_info
 
-    def get_course_options(self) -> list[dict[str, str]]:
+    def get_course_options(self) -> list[dict[str, Any]]:
         return self._course_options
+
+    def resolve_booking_class(self, teesheet_id: str, name_or_id: str) -> str:
+        """Look up the booking_class_id for a given course by name or ID.
+
+        Falls back to the first class for the course, then the literal input.
+        """
+        if not name_or_id:
+            return ""
+        classes = self._classes_by_course.get(str(teesheet_id), [])
+        for c in classes:
+            if c["id"] == str(name_or_id) or c["name"].lower() == str(name_or_id).lower():
+                return c["id"]
+        if classes:
+            return classes[0]["id"]
+        return str(name_or_id)
 
     def extract_recaptcha_sitekey(self, schedule_id: str = "") -> Optional[str]:
         if self._recaptcha_sitekey:
