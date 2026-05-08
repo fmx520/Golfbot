@@ -838,7 +838,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.42"
+APP_VERSION = "0.43"
 
 @app.get("/health")
 def health() -> dict[str, str]:

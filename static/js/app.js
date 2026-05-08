@@ -151,7 +151,7 @@ async function connect() {
         const checked = (c.teesheet_id === S.courseId) || (i === 0 && !S.courseId);
         const row = document.createElement('label');
         row.className = 'checkbox-row';
-        row.innerHTML = `<input type="checkbox" value="${c.teesheet_id}" ${checked ? 'checked' : ''}> ${c.name} <span class="muted">(${c.teesheet_id})</span>`;
+        row.innerHTML = `<input type="checkbox" value="${c.teesheet_id}" ${checked ? 'checked' : ''}> ${c.name}`;
         courseBox.appendChild(row);
       });
       coursesGroup.classList.remove('hidden');
@@ -378,9 +378,12 @@ function renderResults(jobData) {
     const alertMsg = isSniperAlert
       ? 'SLOT FOUND — Book it now before it\'s gone!'
       : 'Dry run complete — tee time found and available for booking.';
+    const slotRaw = S.selectedSlot.raw || {};
+    const courseLabel = slotRaw.schedule_name || slotRaw.course_name || S.selectedSlot.schedule_name || '';
     statusHtml = `
       <div class="alert alert-success show">${esc(alertMsg)}</div>
       <div class="summary-card">
+        ${courseLabel ? `<div class="summary-row"><span class="summary-key">Course</span><span class="summary-value">${esc(courseLabel)}</span></div>` : ''}
         <div class="summary-row"><span class="summary-key">Tee Time</span><span class="summary-value">${esc(fmt12(S.selectedSlot.time))}</span></div>
         <div class="summary-row"><span class="summary-key">Available Spots</span><span class="summary-value">${S.selectedSlot.available_spots || '?'}</span></div>
         <div class="summary-row"><span class="summary-key">Green Fee</span><span class="summary-value">${S.selectedSlot.green_fee ? '$' + S.selectedSlot.green_fee : 'N/A'}</span></div>
@@ -389,8 +392,8 @@ function renderResults(jobData) {
         <div class="summary-row"><span class="summary-key">Status</span><span class="summary-value">${statusBadge}</span></div>
         ${sniperStats ? `<div class="summary-row"><span class="summary-key">Sniper Stats</span><span class="summary-value">${sniperStats.polls} polls in ${Math.round(sniperStats.total_ms)}ms</span></div>` : ''}
       </div>
-      ${bookingUrl ? `<a href="${esc(bookingUrl)}" target="_blank" class="btn btn-primary btn-block mt-1">Open ForeUp Booking Page</a>` : ''}
-      ${isDryRun ? '<p class="text-sm text-muted mt-1">To book this tee time, uncheck "Dry Run" in Step 2 and search again.</p>' : ''}
+      ${isDryRun ? '<button class="btn btn-primary btn-block mt-1" id="bookNowBtn">Book this tee time now</button>' : ''}
+      ${bookingUrl ? `<a href="${esc(bookingUrl)}" target="_blank" class="btn btn-secondary btn-block mt-1">Open ForeUp Booking Page</a>` : ''}
     `;
   } else if (isSuccess) {
     statusHtml = `
@@ -409,6 +412,16 @@ function renderResults(jobData) {
   }
 
   container.innerHTML = statusHtml;
+
+  const bookNow = $('bookNowBtn');
+  if (bookNow) {
+    bookNow.onclick = () => {
+      if (!confirm('Book this tee time now? This will submit a real reservation.')) return;
+      $('dryRun').checked = false;
+      goToStep(2);
+      searchTeeTimes();
+    };
+  }
 }
 
 // Navigation helpers
