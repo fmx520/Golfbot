@@ -165,45 +165,27 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                     f"pending_reservation did not return a reservation_id: {pending_response}"
                 )
 
-            # ---- Step 1.5 (optional): request booking code, wait for user ----
-            confirmation_code: Optional[str] = None
-            if request_code_callback is not None:
-                if not customer_id:
-                    raise ForeUpError("request_code_callback set but customer_id missing")
-                _emit("request_booking_code", {
-                    "course_id": course_id, "customer_id": customer_id,
-                    "ttid": pending_reservation_id,
-                })
-                self.request_booking_code(
-                    course_id=str(course_id or schedule_id),
-                    customer_id=str(customer_id),
-                    pending_reservation_id=pending_reservation_id,
-                    request_id=req_id,
-                )
-                _emit("awaiting_booking_code", {"ttid": pending_reservation_id})
-                confirmation_code = request_code_callback(pending_reservation_id)
-                if not confirmation_code:
-                    raise ForeUpError("Booking code was not provided in time")
-
-            # ---- Step 2: build the full reservation payload (JSON) ----
-            full_payload = self._build_full_reservation_payload(
-                slot=slot,
-                raw=raw,
-                schedule_id=schedule_id,
-                course_id=course_id or schedule_id,
-                players=players,
-                holes=holes,
-                pending_reservation_id=pending_reservation_id,
-                captcha_token=captcha_token,
-                validate_only=False,
-                confirmation_code=confirmation_code,
-            )
-            logger.info("reservation_payload", extra={"payload": full_payload, "slot_raw": slot})
-            _emit("reservation_payload", {"payload": full_payload})
-
+            # ---- Step 2: submit reservations; if course requires booking
+            # code, ForeUp returns a 400 with that exact message — recover by
+            # calling request_booking_code, waiting for the user to enter the
+            # emailed code, and retrying the same submission with the code. ----
             response: dict[str, Any] = {}
 
-            def _submit_reservation() -> None:
+            def _submit(confirmation_code: Optional[str]) -> None:
+                full_payload = self._build_full_reservation_payload(
+                    slot=slot,
+                    raw=raw,
+                    schedule_id=schedule_id,
+                    course_id=course_id or schedule_id,
+                    players=players,
+                    holes=holes,
+                    pending_reservation_id=pending_reservation_id,
+                    captcha_token=captcha_token,
+                    validate_only=False,
+                    confirmation_code=confirmation_code,
+                )
+                logger.info("reservation_payload", extra={"payload": full_payload, "slot_raw": slot})
+                _emit("reservation_payload", {"payload": full_payload, "with_code": bool(confirmation_code)})
                 try:
                     resp = self._request(
                         "POST",
@@ -222,9 +204,29 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                     response.update({"raw_body": resp.text[:1000], "status_code": resp.status_code})
                 _emit("reservation_response", {"response": response, "status": resp.status_code})
 
+            def _submit_with_2fa_recovery() -> None:
+                try:
+                    _submit(None)
+                except ForeUpError as exc:
+                    msg = str(exc).lower()
+                    if "booking code" not in msg or request_code_callback is None or not customer_id:
+                        raise
+                    _emit("booking_code_required_detected", {"ttid": pending_reservation_id})
+                    self.request_booking_code(
+                        course_id=str(course_id or schedule_id),
+                        customer_id=str(customer_id),
+                        pending_reservation_id=pending_reservation_id,
+                        request_id=req_id,
+                    )
+                    _emit("awaiting_booking_code", {"ttid": pending_reservation_id})
+                    code = request_code_callback(pending_reservation_id)
+                    if not code:
+                        raise ForeUpError("Booking code was not provided in time")
+                    _submit(code)
+
             stage_latencies["reservation_submit"] = self._timed_stage(
                 "reservation_submit",
-                _submit_reservation,
+                _submit_with_2fa_recovery,
             )
 
             self._mark_idempotent_complete(idempotency_key)
