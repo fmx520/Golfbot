@@ -172,14 +172,17 @@ async function connect() {
 }
 
 // Step 2: Search tee times
-async function searchTeeTimes() {
+async function searchTeeTimes(opts = {}) {
+  const preselected = opts.preselected || null;
   hideAlert('searchError');
   const btn = $('searchBtn');
-  const isSniper = $('sniperMode').checked;
+  const isSniper = !preselected && $('sniperMode').checked;
   btn.disabled = true;
-  btn.innerHTML = isSniper
-    ? '<span class="spinner-inline"></span> Sniper Armed...'
-    : '<span class="spinner-inline"></span> Searching...';
+  btn.innerHTML = preselected
+    ? '<span class="spinner-inline"></span> Booking...'
+    : isSniper
+      ? '<span class="spinner-inline"></span> Sniper Armed...'
+      : '<span class="spinner-inline"></span> Searching...';
 
   if (isSniper) {
     $('eventLogContainer')?.classList.add('sniper-armed');
@@ -190,7 +193,7 @@ async function searchTeeTimes() {
   $('eventLog').innerHTML = '';
   hide('slotsContainer');
   S.slots = [];
-  S.selectedSlot = null;
+  if (!preselected) S.selectedSlot = null;
   S.jobEvents = [];
   S.sniperMode = isSniper;
 
@@ -227,6 +230,7 @@ async function searchTeeTimes() {
     booking_class: $('bookingClass').value,
     course_ids: Array.from(document.querySelectorAll('#courseCheckboxes input[type=checkbox]:checked')).map(el => el.value),
     ranking: ($('ranking') && $('ranking').value) || 'earliest',
+    preselected_slot: preselected,
     dry_run: $('dryRun').checked,
     sniper_mode: isSniper,
     release_time: isSniper ? $('releaseTime').value : '',
@@ -416,10 +420,10 @@ function renderResults(jobData) {
   const bookNow = $('bookNowBtn');
   if (bookNow) {
     bookNow.onclick = () => {
-      if (!confirm('Book this tee time now? This will submit a real reservation.')) return;
+      if (!confirm('Book this tee time now? This will submit a real reservation for the exact slot shown above.')) return;
       $('dryRun').checked = false;
       goToStep(2);
-      searchTeeTimes();
+      searchTeeTimes({ preselected: S.selectedSlot });
     };
   }
 }

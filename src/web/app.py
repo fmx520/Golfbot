@@ -64,6 +64,7 @@ class StartJobRequest(BaseModel):
     anticaptcha_api_key: str = ""
     course_ids: list[str] = Field(default_factory=list)
     ranking: str = "earliest"
+    preselected_slot: dict[str, Any] | None = None
 
 
 @dataclass
@@ -237,34 +238,46 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
 
         fetch_started = time.perf_counter()
         default_teesheet = resolved_course_id or resolved_schedule_id
-        course_ids: list[str] = [c for c in (payload.get("course_ids") or []) if c] or [default_teesheet]
+        preselected = payload.get("preselected_slot")
 
-        slots: list[dict[str, Any]] = []
-        for priority_index, tid in enumerate(course_ids):
-            course_slots = discovery.lookup_availability(
-                schedule_id=tid,
-                date=payload["play_date"],
-                players=payload["players"],
-                holes=holes,
-                booking_class=payload.get("booking_class", ""),
-                request_id=request_id,
+        if preselected:
+            slots = [preselected]
+            course_ids = [str(preselected.get("_source_teesheet_id") or default_teesheet)]
+            _emit_event(
+                queue,
+                phase="discovery",
+                stage="preselected_slot",
+                message=f"Using preselected slot from prior dry run: {preselected.get('time')}",
+                latency_ms=round((time.perf_counter() - fetch_started) * 1000, 2),
             )
-            for s in course_slots:
-                s["_course_priority"] = priority_index
-                s["_source_teesheet_id"] = tid
-            slots.extend(course_slots)
+        else:
+            course_ids = [c for c in (payload.get("course_ids") or []) if c] or [default_teesheet]
+            slots = []
+            for priority_index, tid in enumerate(course_ids):
+                course_slots = discovery.lookup_availability(
+                    schedule_id=tid,
+                    date=payload["play_date"],
+                    players=payload["players"],
+                    holes=holes,
+                    booking_class=payload.get("booking_class", ""),
+                    request_id=request_id,
+                )
+                for s in course_slots:
+                    s["_course_priority"] = priority_index
+                    s["_source_teesheet_id"] = tid
+                slots.extend(course_slots)
 
-        _emit_event(
-            queue,
-            phase="discovery",
-            stage="course_availability_fetch",
-            message=f"Fetched {len(slots)} available tee times across {len(course_ids)} course(s)",
-            latency_ms=round((time.perf_counter() - fetch_started) * 1000, 2),
-            courses=len(course_ids),
-        )
+            _emit_event(
+                queue,
+                phase="discovery",
+                stage="course_availability_fetch",
+                message=f"Fetched {len(slots)} available tee times across {len(course_ids)} course(s)",
+                latency_ms=round((time.perf_counter() - fetch_started) * 1000, 2),
+                courses=len(course_ids),
+            )
 
         filter_started = time.perf_counter()
-        selected = _select_slot(slots, payload)
+        selected = preselected if preselected else _select_slot(slots, payload)
         _emit_event(
             queue,
             phase="discovery",
@@ -838,7 +851,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.43"
+APP_VERSION = "0.44"
 
 @app.get("/health")
 def health() -> dict[str, str]:
