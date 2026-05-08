@@ -44,6 +44,30 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         self._inflight_keys: set[str] = set()
         self._completed_keys: set[str] = set()
 
+    def request_booking_code(
+        self,
+        *,
+        course_id: str,
+        customer_id: str,
+        pending_reservation_id: str,
+        request_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Trigger ForeUp's email-based 2FA. Empty-body POST."""
+        req_id = request_id or str(uuid.uuid4())
+        path = f"/api_rest/index.php/courses/{course_id}/teetime/confirmation/{pending_reservation_id}/{customer_id}"
+        resp = self._request(
+            "POST",
+            path,
+            stage="request_booking_code",
+            request_id=req_id,
+            retry_safe=False,
+            content=b"",
+        )
+        try:
+            return resp.json()
+        except Exception:
+            return {"raw_body": resp.text[:500], "status_code": resp.status_code}
+
     def book_slot(
         self,
         *,
@@ -57,6 +81,8 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         request_id: Optional[str] = None,
         captcha_token: Optional[str] = None,
         debug_callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
+        customer_id: Optional[str] = None,
+        request_code_callback: Optional[Callable[[str], str]] = None,
     ) -> tuple[dict[str, Any], BookingLatency]:
         req_id = request_id or str(uuid.uuid4())
         flow_started = time.perf_counter()
@@ -139,6 +165,26 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                     f"pending_reservation did not return a reservation_id: {pending_response}"
                 )
 
+            # ---- Step 1.5 (optional): request booking code, wait for user ----
+            confirmation_code: Optional[str] = None
+            if request_code_callback is not None:
+                if not customer_id:
+                    raise ForeUpError("request_code_callback set but customer_id missing")
+                _emit("request_booking_code", {
+                    "course_id": course_id, "customer_id": customer_id,
+                    "ttid": pending_reservation_id,
+                })
+                self.request_booking_code(
+                    course_id=str(course_id or schedule_id),
+                    customer_id=str(customer_id),
+                    pending_reservation_id=pending_reservation_id,
+                    request_id=req_id,
+                )
+                _emit("awaiting_booking_code", {"ttid": pending_reservation_id})
+                confirmation_code = request_code_callback(pending_reservation_id)
+                if not confirmation_code:
+                    raise ForeUpError("Booking code was not provided in time")
+
             # ---- Step 2: build the full reservation payload (JSON) ----
             full_payload = self._build_full_reservation_payload(
                 slot=slot,
@@ -150,6 +196,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                 pending_reservation_id=pending_reservation_id,
                 captcha_token=captcha_token,
                 validate_only=False,
+                confirmation_code=confirmation_code,
             )
             logger.info("reservation_payload", extra={"payload": full_payload, "slot_raw": slot})
             _emit("reservation_payload", {"payload": full_payload})
@@ -232,6 +279,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         pending_reservation_id: str,
         captcha_token: Optional[str],
         validate_only: bool,
+        confirmation_code: Optional[str] = None,
     ) -> dict[str, Any]:
         def _pick(key: str, default: Any = "") -> Any:
             val = raw.get(key, slot.get(key, default))
@@ -271,6 +319,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             "booking_class_id": _pick("booking_class_id"),
             "pending_reservation_id": pending_reservation_id,
             "captchaid": captcha_token or "",
+            "reservation_confirmation_uid": confirmation_code or "",
             "holes": str(holes),
             "players": str(players),
             "carts": False,

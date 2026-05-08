@@ -361,6 +361,37 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
         slot_schedule_id = str(slot_raw.get("schedule_id") or slot_raw.get("teesheet_id") or selected.get("_source_teesheet_id") or default_teesheet)
         slot_course_id = str(slot_raw.get("course_id") or resolved_schedule_id)
 
+        requires_code = discovery.class_requires_code(slot_schedule_id, payload.get("booking_class", "")) if hasattr(discovery, "class_requires_code") else False
+        customer_id = discovery.get_customer_id() if hasattr(discovery, "get_customer_id") else None
+
+        request_code_callback = None
+        if requires_code:
+            if not customer_id:
+                _emit_event(queue, phase="verify", stage="error",
+                            message="Course requires booking code but customer ID was not captured at login. Cannot proceed.",
+                            terminal="failed")
+                queue.put({"type": "status", "status": "failed"})
+                _finalize_worker()
+                return
+
+            def _wait_for_code(ttid: str) -> str:
+                _emit_event(queue, phase="verify", stage="awaiting_code",
+                            message=f"Booking code emailed. Enter the code to confirm reservation (5 min timeout). TTID={ttid}",
+                            terminal="awaiting_code", reservation_id=ttid)
+                queue.put({"type": "status", "status": "awaiting_input"})
+                if cmd_queue is None:
+                    raise ForeUpError("No command queue available to receive booking code")
+                try:
+                    cmd = cmd_queue.get(timeout=300)
+                except Empty:
+                    raise ForeUpError("Booking code timeout — no code received within 5 minutes")
+                code = cmd.get("code", "")
+                _emit_event(queue, phase="verify", stage="submitting_code",
+                            message=f"Submitting booking code: {code}")
+                queue.put({"type": "status", "status": "running"})
+                return code
+            request_code_callback = _wait_for_code
+
         booking_response, booking_latency = booking.book_slot(
             idempotency_key=f"job-{job_id}-{selected.get('tee_time_id', 'unknown')}",
             slot=selected,
@@ -372,6 +403,8 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
             request_id=request_id,
             captcha_token=captcha_token,
             debug_callback=_booking_debug,
+            customer_id=customer_id,
+            request_code_callback=request_code_callback,
         )
         _emit_event(
             queue,
@@ -868,7 +901,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.46"
+APP_VERSION = "0.47"
 
 @app.get("/health")
 def health() -> dict[str, str]:

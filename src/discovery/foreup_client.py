@@ -114,6 +114,7 @@ class ForeUpDiscoveryClient:
         self.config = config or RequestConfig()
         self.client = self._get_or_create_client(self.config.timeout_seconds)
         self._jwt: Optional[str] = None
+        self._customer_id: Optional[str] = None
         self._booking_classes: list[str] = []
         self._booking_class_info: list[dict[str, str]] = []
         self._course_options: list[dict[str, str]] = []
@@ -226,6 +227,28 @@ class ForeUpDiscoveryClient:
     def get_course_options(self) -> list[dict[str, Any]]:
         return self._course_options
 
+    def get_customer_id(self) -> Optional[str]:
+        return self._customer_id
+
+    def class_requires_code(self, teesheet_id: str, class_id_or_name: str) -> bool:
+        """Return True if the resolved booking class for this course is marked
+        online_booking_protected (i.e. requires an emailed booking code)."""
+        m = re.search(r"SCHEDULES\s*=\s*(\[.*?\])\s*;", self._last_page_html or "", re.DOTALL)
+        if not m:
+            return False
+        try:
+            schedules = _json.loads(m.group(1))
+        except (ValueError, _json.JSONDecodeError):
+            return False
+        target_id = self.resolve_booking_class(teesheet_id, class_id_or_name)
+        for sched in schedules:
+            if str(sched.get("teesheet_id", "")) != str(teesheet_id):
+                continue
+            for bc in (sched.get("booking_classes") or []):
+                if str(bc.get("booking_class_id")) == str(target_id):
+                    return bc.get("online_booking_protected") == "1"
+        return False
+
     def resolve_booking_class(self, teesheet_id: str, name_or_id: str) -> str:
         """Look up the booking_class_id for a given course by name or ID.
 
@@ -273,9 +296,14 @@ class ForeUpDiscoveryClient:
         except Exception:
             return {"status": "logged_in", "raw": response.text[:500]}
 
-        if isinstance(result, dict) and result.get("jwt"):
-            self._jwt = result["jwt"]
-            self.client.headers["X-Authorization"] = f"Bearer {self._jwt}"
+        if isinstance(result, dict):
+            if result.get("jwt"):
+                self._jwt = result["jwt"]
+                self.client.headers["X-Authorization"] = f"Bearer {self._jwt}"
+            for cust_key in ("person_id", "id", "customer_id", "user_id"):
+                if result.get(cust_key):
+                    self._customer_id = str(result[cust_key])
+                    break
 
         return result
 
