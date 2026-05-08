@@ -62,6 +62,8 @@ class StartJobRequest(BaseModel):
     release_time: str = ""
     auto_book: bool = False
     anticaptcha_api_key: str = ""
+    course_ids: list[str] = Field(default_factory=list)
+    ranking: str = "earliest"
 
 
 @dataclass
@@ -111,12 +113,44 @@ def _emit_event(
 
 
 def _select_slot(slots: list[dict[str, Any]], payload: dict[str, Any]) -> dict[str, Any] | None:
+    def _slot_time_str(slot: dict[str, Any]) -> str:
+        t = slot.get("time", "")
+        if " " in t:
+            t = t.split(" ", 1)[1]
+        return t[:5]
+
+    def _slot_price(slot: dict[str, Any]) -> float:
+        raw = slot.get("raw") or {}
+        for key in ("green_fee", "green_fee_18", "guest_green_fee"):
+            val = raw.get(key, slot.get(key))
+            if val not in (None, "", 0, "0"):
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    continue
+        return 1e9
+
+    candidates = []
     for slot in slots:
-        slot_time = slot.get("time", "")[:5]
-        spots = int(slot.get("available_spots", slot.get("spots", 0)))
-        if spots >= payload["players"] and payload["time_start"] <= slot_time <= payload["time_end"]:
-            return slot
-    return None
+        slot_time = _slot_time_str(slot)
+        spots = int(slot.get("available_spots", slot.get("spots", 0)) or 0)
+        if spots < payload["players"]:
+            continue
+        if not (payload["time_start"] <= slot_time <= payload["time_end"]):
+            continue
+        candidates.append(slot)
+
+    if not candidates:
+        return None
+
+    ranking = payload.get("ranking", "earliest")
+    if ranking == "cheapest":
+        candidates.sort(key=lambda s: (_slot_price(s), _slot_time_str(s)))
+    elif ranking == "priority":
+        candidates.sort(key=lambda s: (s.get("_course_priority", 999), _slot_time_str(s)))
+    else:  # earliest
+        candidates.sort(key=lambda s: _slot_time_str(s))
+    return candidates[0]
 
 
 def _extract_foreup_target(booking_url: str | None, fallback_base_url: str, fallback_schedule_id: str, fallback_course_id: str) -> tuple[str, str, str]:
@@ -202,21 +236,31 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
             )
 
         fetch_started = time.perf_counter()
-        teesheet_id = resolved_course_id or resolved_schedule_id
-        slots = discovery.lookup_availability(
-            schedule_id=teesheet_id,
-            date=payload["play_date"],
-            players=payload["players"],
-            holes=holes,
-            booking_class=payload.get("booking_class", ""),
-            request_id=request_id,
-        )
+        default_teesheet = resolved_course_id or resolved_schedule_id
+        course_ids: list[str] = [c for c in (payload.get("course_ids") or []) if c] or [default_teesheet]
+
+        slots: list[dict[str, Any]] = []
+        for priority_index, tid in enumerate(course_ids):
+            course_slots = discovery.lookup_availability(
+                schedule_id=tid,
+                date=payload["play_date"],
+                players=payload["players"],
+                holes=holes,
+                booking_class=payload.get("booking_class", ""),
+                request_id=request_id,
+            )
+            for s in course_slots:
+                s["_course_priority"] = priority_index
+                s["_source_teesheet_id"] = tid
+            slots.extend(course_slots)
+
         _emit_event(
             queue,
             phase="discovery",
             stage="course_availability_fetch",
-            message=f"Fetched {len(slots)} available tee times",
+            message=f"Fetched {len(slots)} available tee times across {len(course_ids)} course(s)",
             latency_ms=round((time.perf_counter() - fetch_started) * 1000, 2),
+            courses=len(course_ids),
         )
 
         filter_started = time.perf_counter()
@@ -298,11 +342,15 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
             _emit_event(queue, phase="checkout", stage=f"debug_{event}",
                         message=f"{event}: {data}")
 
+        slot_raw = selected.get("raw") or {}
+        slot_schedule_id = str(slot_raw.get("schedule_id") or slot_raw.get("teesheet_id") or selected.get("_source_teesheet_id") or default_teesheet)
+        slot_course_id = str(slot_raw.get("course_id") or resolved_schedule_id)
+
         booking_response, booking_latency = booking.book_slot(
             idempotency_key=f"job-{job_id}-{selected.get('tee_time_id', 'unknown')}",
             slot=selected,
-            schedule_id=teesheet_id,
-            course_id=resolved_schedule_id,
+            schedule_id=slot_schedule_id,
+            course_id=slot_course_id,
             date=payload["play_date"],
             players=payload["players"],
             holes=holes,
@@ -790,7 +838,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.40"
+APP_VERSION = "0.41"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -832,6 +880,7 @@ def connect(req: ConnectRequest) -> dict[str, Any]:
         "schedule_id": schedule_id,
         "course_id": course_id,
         "booking_classes": client.get_booking_class_options(),
+        "courses": client.get_course_options(),
     }
 
 

@@ -684,3 +684,9 @@ body {
   .step-line { width: 40px; }
   .stat-row { grid-template-columns: 1fr 1fr; }
 }
+
+.checkbox-list { display: flex; flex-direction: column; gap: 6px; padding: 8px; background: var(--bg-tertiary); border-radius: var(--radius-sm); }
+.checkbox-row { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: var(--fs-sm); }
+.checkbox-row input[type=checkbox] { margin: 0; }
+.checkbox-row .muted { color: var(--text-muted); font-size: var(--fs-xs); }
+.form-help { color: var(--text-muted); font-size: var(--fs-xs); margin-top: 4px; }

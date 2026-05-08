@@ -116,6 +116,7 @@ class ForeUpDiscoveryClient:
         self._jwt: Optional[str] = None
         self._booking_classes: list[str] = []
         self._booking_class_info: list[dict[str, str]] = []
+        self._course_options: list[dict[str, str]] = []
         self._recaptcha_sitekey: Optional[str] = None
         self._last_page_html: Optional[str] = None
 
@@ -152,6 +153,17 @@ class ForeUpDiscoveryClient:
         except (ValueError, _json.JSONDecodeError):
             return self._extract_booking_classes_fallback(html)
 
+        self._course_options = [
+            {
+                "teesheet_id": str(sched.get("teesheet_id", "")),
+                "name": sched.get("schedule_name") or sched.get("name") or f"Course {sched.get('teesheet_id', '?')}",
+                "course_id": str(sched.get("course_id", "")),
+                "holes": str(sched.get("holes", "")),
+            }
+            for sched in schedules
+            if sched.get("teesheet_id")
+        ]
+
         for sched in schedules:
             if teesheet_id and sched.get("teesheet_id") != teesheet_id:
                 continue
@@ -187,6 +199,9 @@ class ForeUpDiscoveryClient:
 
     def get_booking_class_options(self) -> list[dict[str, str]]:
         return self._booking_class_info
+
+    def get_course_options(self) -> list[dict[str, str]]:
+        return self._course_options
 
     def extract_recaptcha_sitekey(self, schedule_id: str = "") -> Optional[str]:
         if self._recaptcha_sitekey:

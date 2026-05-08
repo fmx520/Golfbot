@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.40</span>
+        <span class="version-badge">v0.41</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -125,6 +125,19 @@
           <label for="bookingClass">Booking Class</label>
           <select id="bookingClass" required>
             <option value="" disabled selected>Select a booking class</option>
+          </select>
+        </div>
+        <div class="form-group hidden" id="coursesGroup">
+          <label>Courses (multi-course facility — pick one or more)</label>
+          <div id="courseCheckboxes" class="checkbox-list"></div>
+          <div class="form-help">Order matters when ranking = "Priority order". The first checked course is preferred.</div>
+        </div>
+        <div class="form-group hidden" id="rankingGroup">
+          <label for="ranking">Ranking strategy</label>
+          <select id="ranking">
+            <option value="earliest" selected>Earliest available time</option>
+            <option value="cheapest">Cheapest available</option>
+            <option value="priority">Priority order (first checked course first)</option>
           </select>
         </div>
         <div class="checkbox-group">

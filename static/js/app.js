@@ -141,6 +141,26 @@ async function connect() {
       });
     }
 
+    const courses = data.courses || [];
+    const coursesGroup = $('coursesGroup');
+    const rankingGroup = $('rankingGroup');
+    const courseBox = $('courseCheckboxes');
+    courseBox.innerHTML = '';
+    if (courses.length > 1) {
+      courses.forEach((c, i) => {
+        const checked = (c.teesheet_id === S.courseId) || (i === 0 && !S.courseId);
+        const row = document.createElement('label');
+        row.className = 'checkbox-row';
+        row.innerHTML = `<input type="checkbox" value="${c.teesheet_id}" ${checked ? 'checked' : ''}> ${c.name} <span class="muted">(${c.teesheet_id})</span>`;
+        courseBox.appendChild(row);
+      });
+      coursesGroup.classList.remove('hidden');
+      rankingGroup.classList.remove('hidden');
+    } else {
+      coursesGroup.classList.add('hidden');
+      rankingGroup.classList.add('hidden');
+    }
+
     updateDateRange();
     goToStep(2);
   } catch (e) {
@@ -205,6 +225,8 @@ async function searchTeeTimes() {
     time_start: $('timeStart').value,
     time_end: $('timeEnd').value,
     booking_class: $('bookingClass').value,
+    course_ids: Array.from(document.querySelectorAll('#courseCheckboxes input[type=checkbox]:checked')).map(el => el.value),
+    ranking: ($('ranking') && $('ranking').value) || 'earliest',
     dry_run: $('dryRun').checked,
     sniper_mode: isSniper,
     release_time: isSniper ? $('releaseTime').value : '',
