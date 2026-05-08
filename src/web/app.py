@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from multiprocessing import Process, Queue
 from pathlib import Path
 from queue import Empty
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any
 from urllib.parse import urlparse
 
@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from src.booking.foreup_client import ForeUpBookingClient
 from src.config import load_config
-from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError
+from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
 
 STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 
@@ -357,10 +357,6 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
             _emit_event(queue, phase="checkout", stage=f"debug_{event}",
                         message=f"{event}: {data}")
 
-        slot_raw = selected.get("raw") or {}
-        slot_schedule_id = str(slot_raw.get("schedule_id") or slot_raw.get("teesheet_id") or selected.get("_source_teesheet_id") or default_teesheet)
-        slot_course_id = str(slot_raw.get("course_id") or resolved_schedule_id)
-
         customer_id = discovery.get_customer_id() if hasattr(discovery, "get_customer_id") else None
 
         def _wait_for_code(ttid: str) -> str:
@@ -370,10 +366,23 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
             queue.put({"type": "status", "status": "awaiting_input"})
             if cmd_queue is None:
                 raise ForeUpError("No command queue available to receive booking code")
+
+            # Background TTID refresh keeps the slot hold alive while we wait
+            stop_refresh = Event()
+
+            def _refresh_loop() -> None:
+                while not stop_refresh.wait(8.0):
+                    booking.refresh_pending_reservation(pending_reservation_id=ttid, request_id=request_id)
+
+            refresher = Thread(target=_refresh_loop, daemon=True)
+            refresher.start()
             try:
                 cmd = cmd_queue.get(timeout=300)
             except Empty:
+                stop_refresh.set()
                 raise ForeUpError("Booking code timeout — no code received within 5 minutes")
+            stop_refresh.set()
+
             code = cmd.get("code", "")
             _emit_event(queue, phase="verify", stage="submitting_code",
                         message=f"Submitting booking code: {code}")
@@ -382,20 +391,109 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
 
         request_code_callback = _wait_for_code if customer_id else None
 
-        booking_response, booking_latency = booking.book_slot(
-            idempotency_key=f"job-{job_id}-{selected.get('tee_time_id', 'unknown')}",
-            slot=selected,
-            schedule_id=slot_schedule_id,
-            course_id=slot_course_id,
-            date=payload["play_date"],
-            players=payload["players"],
-            holes=holes,
-            request_id=request_id,
-            captcha_token=captcha_token,
-            debug_callback=_booking_debug,
-            customer_id=customer_id,
-            request_code_callback=request_code_callback,
-        )
+        # ---- Stale-slot retry loop: if the chosen slot gets taken between
+        # discovery and booking, fall back to the next-best slot per ranking
+        # rather than terminating. Re-discovers if the initial pool is
+        # exhausted (skipped when a preselected slot was provided). ----
+        def _slot_key(s: dict[str, Any]) -> tuple:
+            raw = s.get("raw") or {}
+            return (str(raw.get("teesheet_id") or s.get("_source_teesheet_id", "")), s.get("time", ""))
+
+        tried_keys: set[tuple] = {_slot_key(selected)}
+        current_pool = list(slots)
+        max_attempts = 5
+        booking_response = None
+        booking_latency = None
+        last_stale_msg = ""
+
+        for attempt in range(1, max_attempts + 1):
+            slot_raw = selected.get("raw") or {}
+            slot_schedule_id = str(slot_raw.get("schedule_id") or slot_raw.get("teesheet_id") or selected.get("_source_teesheet_id") or default_teesheet)
+            slot_course_id = str(slot_raw.get("course_id") or resolved_schedule_id)
+
+            try:
+                booking_response, booking_latency = booking.book_slot(
+                    idempotency_key=f"job-{job_id}-{slot_schedule_id}-{selected.get('time', 'unknown')}-{attempt}",
+                    slot=selected,
+                    schedule_id=slot_schedule_id,
+                    course_id=slot_course_id,
+                    date=payload["play_date"],
+                    players=payload["players"],
+                    holes=holes,
+                    request_id=request_id,
+                    captcha_token=captcha_token,
+                    debug_callback=_booking_debug,
+                    customer_id=customer_id,
+                    request_code_callback=request_code_callback,
+                )
+                break
+            except StaleSlotError as exc:
+                last_stale_msg = str(exc)
+                _emit_event(queue, phase="checkout", stage="slot_taken",
+                            message=f"Slot {selected.get('time')} on teesheet {slot_schedule_id} was taken. Trying next-best (attempt {attempt}/{max_attempts}).",
+                            stale_error=last_stale_msg)
+            except ForeUpError as exc:
+                msg = str(exc).lower()
+                if any(k in msg for k in ("no longer available", "not available", "already booked", "0 spots")):
+                    last_stale_msg = str(exc)
+                    _emit_event(queue, phase="checkout", stage="slot_taken",
+                                message=f"Slot {selected.get('time')} unavailable: {exc}. Trying next-best (attempt {attempt}/{max_attempts}).",
+                                stale_error=last_stale_msg)
+                else:
+                    raise
+
+            # Pick next-best slot, re-discovering if needed (and allowed).
+            candidates = [s for s in current_pool if _slot_key(s) not in tried_keys]
+            if not candidates and not preselected:
+                _emit_event(queue, phase="discovery", stage="rediscover",
+                            message="Initial slot pool exhausted — re-fetching availability.")
+                rediscovered: list[dict[str, Any]] = []
+                for priority_index, tid in enumerate(course_ids):
+                    resolved_class = discovery.resolve_booking_class(tid, payload.get("booking_class", "")) if hasattr(discovery, "resolve_booking_class") else payload.get("booking_class", "")
+                    course_slots = discovery.lookup_availability(
+                        schedule_id=tid,
+                        date=payload["play_date"],
+                        players=payload["players"],
+                        holes=holes,
+                        booking_class=resolved_class,
+                        request_id=request_id,
+                    )
+                    for s in course_slots:
+                        s["_course_priority"] = priority_index
+                        s["_source_teesheet_id"] = tid
+                    rediscovered.extend(course_slots)
+                current_pool = rediscovered
+                candidates = [s for s in current_pool if _slot_key(s) not in tried_keys]
+
+            if not candidates:
+                _emit_event(queue, phase="confirm", stage="terminal",
+                            message=f"No more slots match your window after {attempt} attempt(s). Last error: {last_stale_msg}",
+                            terminal="failed")
+                queue.put({"type": "status", "status": "failed"})
+                _finalize_worker()
+                return
+
+            selected = _select_slot(candidates, payload)
+            if not selected:
+                _emit_event(queue, phase="confirm", stage="terminal",
+                            message=f"No slots match your window after {attempt} attempt(s).",
+                            terminal="failed")
+                queue.put({"type": "status", "status": "failed"})
+                _finalize_worker()
+                return
+            tried_keys.add(_slot_key(selected))
+        else:
+            _emit_event(queue, phase="confirm", stage="terminal",
+                        message=f"Reached max booking attempts ({max_attempts}) — all candidate slots were taken.",
+                        terminal="failed")
+            queue.put({"type": "status", "status": "failed"})
+            _finalize_worker()
+            return
+
+        if booking_response is None:
+            queue.put({"type": "status", "status": "failed"})
+            _finalize_worker()
+            return
         _emit_event(
             queue,
             phase="checkout",
@@ -891,7 +989,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.50"
+APP_VERSION = "0.51"
 
 @app.get("/health")
 def health() -> dict[str, str]:

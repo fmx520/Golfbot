@@ -44,6 +44,27 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         self._inflight_keys: set[str] = set()
         self._completed_keys: set[str] = set()
 
+    def refresh_pending_reservation(
+        self,
+        *,
+        pending_reservation_id: str,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """Keep a pending reservation hold alive. Browser polls this every ~10s."""
+        req_id = request_id or str(uuid.uuid4())
+        path = f"/index.php/api/booking/refresh_pending_reservation/{pending_reservation_id}"
+        try:
+            self._request(
+                "POST", path,
+                stage="refresh_pending",
+                request_id=req_id,
+                retry_safe=False,
+                content=b"",
+            )
+        except ForeUpError:
+            # Refresh is best-effort — don't crash the booking flow
+            pass
+
     def request_booking_code(
         self,
         *,
