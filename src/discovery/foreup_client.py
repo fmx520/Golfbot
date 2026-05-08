@@ -252,7 +252,9 @@ class ForeUpDiscoveryClient:
     def resolve_booking_class(self, teesheet_id: str, name_or_id: str) -> str:
         """Look up the booking_class_id for a given course by name or ID.
 
-        Falls back to the first class for the course, then the literal input.
+        Returns the resolved ID. Raises ForeUpError if the requested name/ID
+        doesn't exist for this course — silently substituting the first class
+        could book at the wrong rate (e.g. non-resident vs resident).
         """
         if not name_or_id:
             return ""
@@ -260,9 +262,15 @@ class ForeUpDiscoveryClient:
         for c in classes:
             if c["id"] == str(name_or_id) or c["name"].lower() == str(name_or_id).lower():
                 return c["id"]
-        if classes:
-            return classes[0]["id"]
-        return str(name_or_id)
+        if not classes:
+            # We never extracted classes for this course; pass through and
+            # let ForeUp validate. (Single-course or fallback-extraction path.)
+            return str(name_or_id)
+        available = ", ".join(f"{c['name']} ({c['id']})" for c in classes)
+        raise ForeUpError(
+            f"Booking class '{name_or_id}' is not available for course {teesheet_id}. "
+            f"Available classes: {available}"
+        )
 
     def extract_recaptcha_sitekey(self, schedule_id: str = "") -> Optional[str]:
         if self._recaptcha_sitekey:
@@ -300,10 +308,29 @@ class ForeUpDiscoveryClient:
             if result.get("jwt"):
                 self._jwt = result["jwt"]
                 self.client.headers["X-Authorization"] = f"Bearer {self._jwt}"
-            for cust_key in ("person_id", "id", "customer_id", "user_id"):
-                if result.get(cust_key):
-                    self._customer_id = str(result[cust_key])
+
+            # Try top-level keys first, then common nested objects.
+            top_keys = ("person_id", "customer_id", "user_id", "id")
+            nested_paths = (
+                ("customer", "id"), ("customer", "person_id"),
+                ("user", "id"), ("user", "person_id"),
+            )
+            for k in top_keys:
+                if result.get(k):
+                    self._customer_id = str(result[k])
                     break
+            if not self._customer_id:
+                for parent, child in nested_paths:
+                    obj = result.get(parent)
+                    if isinstance(obj, dict) and obj.get(child):
+                        self._customer_id = str(obj[child])
+                        break
+            if not self._customer_id:
+                logger.warning(
+                    "customer_id not found in login response; 2FA booking flow "
+                    "will be unavailable. Login response keys: %s",
+                    sorted(list(result.keys())) if isinstance(result, dict) else type(result).__name__,
+                )
 
         return result
 
@@ -454,15 +481,27 @@ class ForeUpDiscoveryClient:
 
     def _request(self, method: str, path: str, *, stage: str, request_id: str, retry_safe: bool, **kwargs: Any) -> httpx.Response:
         url = f"{self.base_url}{path}"
-        self.client.headers["User-Agent"] = random.choice(_USER_AGENTS)
-        if stage not in ("sniper_poll",):
+        # Pass UA per-request rather than mutating the shared client's
+        # headers — the client is a class-level singleton and could otherwise
+        # race when concurrent jobs share it. Rotation is preserved.
+        per_req_headers = dict(kwargs.pop("headers", None) or {})
+        per_req_headers.setdefault("User-Agent", random.choice(_USER_AGENTS))
+        # Light jitter helps anti-bot heuristics on browse-style traffic, but
+        # the booking critical path (pending POST, reservation submit, code
+        # request, refresh, sniper polling) is latency-sensitive — every ms
+        # could cost the slot to a competing bot. Skip the sleep on those.
+        critical_stages = {
+            "sniper_poll", "pending_reservation", "reservation_submit",
+            "request_booking_code", "refresh_pending", "verify_code",
+        }
+        if stage not in critical_stages:
             time.sleep(random.uniform(0.01, 0.08))
         attempts = self.config.max_retries + 1 if retry_safe else 1
         for attempt in range(1, attempts + 1):
             started = time.perf_counter()
             started_at = datetime.now(timezone.utc).isoformat()
             try:
-                response = self.client.request(method, url, **kwargs)
+                response = self.client.request(method, url, headers=per_req_headers, **kwargs)
                 status = response.status_code
 
                 self._check_antibot(response)

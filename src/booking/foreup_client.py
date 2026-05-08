@@ -104,6 +104,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         debug_callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
         customer_id: Optional[str] = None,
         request_code_callback: Optional[Callable[[str], str]] = None,
+        skip_validation: bool = False,
     ) -> tuple[dict[str, Any], BookingLatency]:
         req_id = request_id or str(uuid.uuid4())
         flow_started = time.perf_counter()
@@ -111,15 +112,16 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
 
         self._acquire_idempotency_key(idempotency_key)
         try:
-            stage_latencies["slot_validation"] = self._timed_stage(
-                "slot_validation",
-                lambda: self._validate_slot_still_available(
-                    schedule_id=schedule_id,
-                    date=date,
-                    slot=slot,
-                    request_id=req_id,
-                ),
-            )
+            if not skip_validation:
+                stage_latencies["slot_validation"] = self._timed_stage(
+                    "slot_validation",
+                    lambda: self._validate_slot_still_available(
+                        schedule_id=schedule_id,
+                        date=date,
+                        slot=slot,
+                        request_id=req_id,
+                    ),
+                )
 
             raw = slot.get("raw") if isinstance(slot.get("raw"), dict) else slot
 

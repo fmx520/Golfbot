@@ -14,7 +14,7 @@ if _env_file.exists():
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from multiprocessing import Process, Queue
 from pathlib import Path
 from queue import Empty
@@ -238,6 +238,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
 
         fetch_started = time.perf_counter()
         default_teesheet = resolved_course_id or resolved_schedule_id
+        teesheet_id = default_teesheet  # also referenced in error/verify paths below
         preselected = payload.get("preselected_slot")
 
         if preselected:
@@ -328,20 +329,22 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
 
         captcha_token: str | None = None
         anticaptcha_key = payload.get("anticaptcha_api_key") or os.getenv("ANTICAPTCHA_API_KEY", "")
+        captcha_solver = None
+        captcha_site_key: str | None = None
+        captcha_page_url: str | None = None
         if anticaptcha_key:
             try:
-                site_key = discovery.extract_recaptcha_sitekey(schedule_id=resolved_schedule_id)
-                if site_key:
-                    from src.captcha.anticaptcha import AntiCaptchaSolver, CaptchaSolveError
-                    booking_page_url = (
+                captcha_site_key = discovery.extract_recaptcha_sitekey(schedule_id=resolved_schedule_id)
+                if captcha_site_key:
+                    from src.captcha.anticaptcha import AntiCaptchaSolver  # noqa: F401
+                    captcha_solver = AntiCaptchaSolver(api_key=anticaptcha_key)
+                    captcha_page_url = (
                         payload.get("foreup_booking_url")
                         or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}"
                     )
                     _emit_event(queue, phase="captcha", stage="solving",
-                                message=f"Solving reCAPTCHA (site_key={site_key[:12]}…)")
-                    captcha_token = AntiCaptchaSolver(api_key=anticaptcha_key).solve(
-                        booking_page_url, site_key, timeout=120
-                    )
+                                message=f"Solving reCAPTCHA (site_key={captcha_site_key[:12]}…)")
+                    captcha_token = captcha_solver.solve(captcha_page_url, captcha_site_key, timeout=120)
                     _emit_event(queue, phase="captcha", stage="solved",
                                 message="reCAPTCHA solved — token attached to booking")
                 else:
@@ -350,6 +353,22 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
             except Exception as exc:  # noqa: BLE001
                 _emit_event(queue, phase="captcha", stage="error",
                             message=f"CAPTCHA solve failed: {exc} — proceeding without token")
+
+        def _refresh_captcha_token() -> str | None:
+            """Solve a fresh captcha token for retries (reCAPTCHA tokens are single-use)."""
+            if not captcha_solver or not captcha_site_key or not captcha_page_url:
+                return None
+            try:
+                _emit_event(queue, phase="captcha", stage="resolving",
+                            message="Re-solving reCAPTCHA for retry (previous token consumed)")
+                token = captcha_solver.solve(captcha_page_url, captcha_site_key, timeout=120)
+                _emit_event(queue, phase="captcha", stage="resolved",
+                            message="reCAPTCHA refreshed — retrying booking")
+                return token
+            except Exception as exc:  # noqa: BLE001
+                _emit_event(queue, phase="captcha", stage="error",
+                            message=f"CAPTCHA refresh failed: {exc} — retrying without token")
+                return None
 
         submit_started = time.perf_counter()
 
@@ -413,7 +432,7 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
 
             try:
                 booking_response, booking_latency = booking.book_slot(
-                    idempotency_key=f"job-{job_id}-{slot_schedule_id}-{selected.get('time', 'unknown')}-{attempt}",
+                    idempotency_key=f"job-{job_id}-{slot_schedule_id}-{selected.get('time', 'unknown')}",
                     slot=selected,
                     schedule_id=slot_schedule_id,
                     course_id=slot_course_id,
@@ -421,6 +440,10 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
                     players=payload["players"],
                     holes=holes,
                     request_id=request_id,
+                    # Skip pre-validation when we already discovered this slot
+                    # this run — the retry loop handles stale-slot exceptions
+                    # downstream, so the extra GET only adds latency.
+                    skip_validation=True,
                     captcha_token=captcha_token,
                     debug_callback=_booking_debug,
                     customer_id=customer_id,
@@ -432,13 +455,26 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
                 _emit_event(queue, phase="checkout", stage="slot_taken",
                             message=f"Slot {selected.get('time')} on teesheet {slot_schedule_id} was taken. Trying next-best (attempt {attempt}/{max_attempts}).",
                             stale_error=last_stale_msg)
+                captcha_token = _refresh_captcha_token() or captcha_token
             except ForeUpError as exc:
                 msg = str(exc).lower()
-                if any(k in msg for k in ("no longer available", "not available", "already booked", "0 spots")):
+                stale_keywords = ("no longer available", "not available", "already booked", "0 spots")
+                captcha_keywords = ("captcha", "recaptcha", "g-recaptcha")
+                if any(k in msg for k in stale_keywords):
                     last_stale_msg = str(exc)
                     _emit_event(queue, phase="checkout", stage="slot_taken",
                                 message=f"Slot {selected.get('time')} unavailable: {exc}. Trying next-best (attempt {attempt}/{max_attempts}).",
                                 stale_error=last_stale_msg)
+                    captcha_token = _refresh_captcha_token() or captcha_token
+                elif any(k in msg for k in captcha_keywords):
+                    last_stale_msg = str(exc)
+                    new_token = _refresh_captcha_token()
+                    if not new_token:
+                        raise
+                    captcha_token = new_token
+                    # Retry the same slot with a fresh token; don't drop it.
+                    tried_keys.discard(_slot_key(selected))
+                    continue
                 else:
                     raise
 
@@ -636,7 +672,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
     now = datetime.now()
     release_dt = now.replace(hour=release_hh, minute=release_mm, second=0, microsecond=0)
     if release_dt <= now:
-        release_dt = release_dt.replace(day=release_dt.day + 1)
+        release_dt = release_dt + timedelta(days=1)
 
     request_id = f"sniper-{job_id}"
     discovery = ForeUpDiscoveryClient(base_url=base_url)
@@ -811,6 +847,10 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     request_id=request_id,
                     captcha_token=captcha_token,
                     debug_callback=_sniper_debug,
+                    # Sniper just observed this slot in lookup_availability_fast a
+                    # few hundred ms ago — skip the GET pre-flight and shave a
+                    # full RTT off the time-to-first-POST in the race.
+                    skip_validation=True,
                 )
                 _emit_event(queue, phase="checkout", stage="booking_submit",
                             message=f"Booking submitted{token_msg}",
@@ -989,7 +1029,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.51"
+APP_VERSION = "0.52"
 
 @app.get("/health")
 def health() -> dict[str, str]:
