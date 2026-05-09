@@ -15,6 +15,12 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# All courses we target are East Coast — anchor sniper timing to NY tz so the
+# bot fires at the right wall-clock minute regardless of where the server is
+# deployed (Render runs containers in UTC by default).
+EAST_COAST_TZ = ZoneInfo("America/New_York")
 from multiprocessing import Process, Queue
 from pathlib import Path
 from queue import Empty
@@ -669,10 +675,16 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         parts = release_time_str.split(":")
         release_hh, release_mm = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
 
-    now = datetime.now()
+    now = datetime.now(EAST_COAST_TZ)
     release_dt = now.replace(hour=release_hh, minute=release_mm, second=0, microsecond=0)
     if release_dt <= now:
         release_dt = release_dt + timedelta(days=1)
+    _emit_event(
+        queue,
+        phase="auth",
+        stage="sniper_timer",
+        message=f"Sniper armed for {release_dt.strftime('%I:%M:%S %p %Z')} (release_dt={release_dt.isoformat()})",
+    )
 
     request_id = f"sniper-{job_id}"
     discovery = ForeUpDiscoveryClient(base_url=base_url)
@@ -720,8 +732,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 _emit_event(queue, phase="captcha", stage="skipped",
                             message="No reCAPTCHA detected on booking page — skipping solver")
 
-        seconds_until = (release_dt - datetime.now()).total_seconds()
-        release_display = release_dt.strftime("%I:%M:%S %p")
+        seconds_until = (release_dt - datetime.now(EAST_COAST_TZ)).total_seconds()
+        release_display = release_dt.strftime("%I:%M:%S %p %Z")
         _emit_event(queue, phase="sniper", stage="armed",
                     message=f"Armed — release at {release_display} ({int(seconds_until)}s from now)")
 
@@ -735,7 +747,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 chunk = min(sleep_chunk, wait_seconds - slept)
                 time.sleep(chunk)
                 slept += chunk
-                remaining = max(0, (release_dt - datetime.now()).total_seconds())
+                remaining = max(0, (release_dt - datetime.now(EAST_COAST_TZ)).total_seconds())
                 if remaining <= 10 or (slept - last_update) >= 10:
                     _emit_event(queue, phase="sniper", stage="countdown",
                                 message=f"Countdown: {int(remaining)}s remaining")
@@ -763,7 +775,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                         message="Session re-warmed",
                         latency_ms=round((time.perf_counter() - rewarm_started) * 1000, 2))
 
-        remaining = (release_dt - datetime.now()).total_seconds()
+        remaining = (release_dt - datetime.now(EAST_COAST_TZ)).total_seconds()
         if remaining > 0:
             time.sleep(remaining)
 
@@ -1029,7 +1041,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.52"
+APP_VERSION = "0.53"
 
 @app.get("/health")
 def health() -> dict[str, str]:
