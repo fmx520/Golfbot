@@ -670,21 +670,29 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
 
     from datetime import date as date_cls
 
-    release_hh, release_mm = 19, 0
+    now = datetime.now(EAST_COAST_TZ)
     if release_time_str:
         parts = release_time_str.split(":")
-        release_hh, release_mm = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
-
-    now = datetime.now(EAST_COAST_TZ)
-    release_dt = now.replace(hour=release_hh, minute=release_mm, second=0, microsecond=0)
-    if release_dt <= now:
-        release_dt = release_dt + timedelta(days=1)
-    _emit_event(
-        queue,
-        phase="auth",
-        stage="sniper_timer",
-        message=f"Sniper armed for {release_dt.strftime('%I:%M:%S %p %Z')} (release_dt={release_dt.isoformat()})",
-    )
+        release_hh = int(parts[0])
+        release_mm = int(parts[1]) if len(parts) > 1 else 0
+        release_dt = now.replace(hour=release_hh, minute=release_mm, second=0, microsecond=0)
+        if release_dt <= now:
+            release_dt = release_dt + timedelta(days=1)
+        _emit_event(
+            queue,
+            phase="auth",
+            stage="sniper_timer",
+            message=f"Sniper armed for {release_dt.strftime('%I:%M:%S %p %Z')} (release_dt={release_dt.isoformat()})",
+        )
+    else:
+        # "Snipe now" mode — start polling immediately, no release wait.
+        release_dt = now
+        _emit_event(
+            queue,
+            phase="auth",
+            stage="sniper_timer",
+            message="Snipe-now mode — polling starts immediately, no release wait",
+        )
 
     request_id = f"sniper-{job_id}"
     discovery = ForeUpDiscoveryClient(base_url=base_url)
@@ -1041,7 +1049,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.53"
+APP_VERSION = "0.54"
 
 @app.get("/health")
 def health() -> dict[str, str]:

@@ -245,7 +245,7 @@ async function searchTeeTimes(opts = {}) {
     preselected_slot: preselected,
     dry_run: $('dryRun').checked,
     sniper_mode: isSniper,
-    release_time: isSniper ? $('releaseTime').value : '',
+    release_time: (isSniper && !$('snipeNow').checked) ? $('releaseTime').value : '',
     auto_book: isSniper ? $('autoBook').checked : false,
     anticaptcha_api_key: '',
   };
@@ -553,12 +553,24 @@ function toggleSniperMode() {
   const btn = $('searchBtn');
   if (checked) {
     fields.classList.remove('hidden');
-    btn.textContent = 'Arm Sniper';
+    updateSniperButtonLabel();
   } else {
     fields.classList.add('hidden');
     btn.textContent = 'Search Tee Times';
   }
   toggleCaptchaKey();
+}
+
+function toggleSnipeNow() {
+  const now = $('snipeNow').checked;
+  const row = $('releaseTimeRow');
+  if (row) row.style.display = now ? 'none' : '';
+  updateSniperButtonLabel();
+}
+
+function updateSniperButtonLabel() {
+  if (!$('sniperMode').checked) return;
+  $('searchBtn').textContent = $('snipeNow').checked ? 'Snipe Now' : 'Arm Sniper';
 }
 
 function toggleCaptchaKey() {}
@@ -571,6 +583,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('connectBtn').addEventListener('click', connect);
   $('searchBtn').addEventListener('click', searchTeeTimes);
   $('sniperMode').addEventListener('change', toggleSniperMode);
+  $('snipeNow').addEventListener('change', toggleSnipeNow);
   $('autoBook').addEventListener('change', toggleCaptchaKey);
   $('bookingClass').addEventListener('change', updateDateRange);
 });

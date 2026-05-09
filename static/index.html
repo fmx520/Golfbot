@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.53</span>
+        <span class="version-badge">v0.54</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -154,9 +154,13 @@
           <label for="sniperMode">Enable Sniper Mode</label>
         </div>
         <div id="sniperFields" class="hidden">
-          <div class="form-row">
+          <div class="checkbox-group">
+            <input type="checkbox" id="snipeNow">
+            <label for="snipeNow">Snipe now (don't wait for a release time — start polling immediately)</label>
+          </div>
+          <div class="form-row" id="releaseTimeRow">
             <div class="form-group">
-              <label for="releaseTime">Release Time</label>
+              <label for="releaseTime">Release Time (EST/EDT)</label>
               <input type="time" id="releaseTime" value="19:00">
             </div>
           </div>
