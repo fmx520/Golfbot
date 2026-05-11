@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.55</span>
+        <span class="version-badge">v0.56</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -40,6 +40,15 @@
     <section id="step1" class="step-content active">
       <h2 class="page-title">Connect to ForeUp</h2>
       <p class="page-description">Enter your ForeUp credentials and the booking URL for the course you want to book.</p>
+
+      <div class="card supported-courses">
+        <div class="card-title">Supported Courses</div>
+        <ul class="course-list">
+          <li>Bethpage State Park <span class="course-emoji">⛳</span></li>
+          <li>Sunken Meadow State Park <span class="course-emoji">🌊</span></li>
+          <li>Montauk Downs State Park <span class="course-emoji">🦞</span></li>
+        </ul>
+      </div>
 
       <div class="alert alert-error" id="connectError"></div>
 
