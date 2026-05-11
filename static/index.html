@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.54</span>
+        <span class="version-badge">v0.55</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -140,8 +140,13 @@
             <option value="priority">Priority order (first checked course first)</option>
           </select>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Dry Run</div>
+        <div class="card-subtitle">Preview matching tee times without actually booking. Enable this if you want to confirm filters before committing.</div>
         <div class="checkbox-group">
-          <input type="checkbox" id="dryRun" checked>
+          <input type="checkbox" id="dryRun">
           <label for="dryRun">Dry Run (find times only, don't book)</label>
         </div>
       </div>
