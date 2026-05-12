@@ -406,7 +406,8 @@ function renderResults(jobData) {
         <div class="summary-row"><span class="summary-key">Date</span><span class="summary-value">${esc($('playDate').value)}</span></div>
         <div class="summary-row"><span class="summary-key">Players</span><span class="summary-value">${$('players').value}</span></div>
         <div class="summary-row"><span class="summary-key">Status</span><span class="summary-value">${statusBadge}</span></div>
-        ${sniperStats ? `<div class="summary-row"><span class="summary-key">Sniper Stats</span><span class="summary-value">${sniperStats.polls} polls in ${Math.round(sniperStats.total_ms)}ms</span></div>` : ''}
+        ${sniperStats ? `<div class="summary-row"><span class="summary-key">Sniper Stats</span><span class="summary-value">${sniperStats.polls} polls in ${Math.round(sniperStats.total_ms)}ms${sniperStats.attempts && sniperStats.attempts > 1 ? ` · ${sniperStats.attempts} booking attempts` : ''}</span></div>` : ''}
+        ${sniperStats && sniperStats.tried_slots && sniperStats.tried_slots.length > 0 ? `<div class="summary-row"><span class="summary-key">Slots Taken</span><span class="summary-value">${sniperStats.tried_slots.map(esc).join(', ')}</span></div>` : ''}
       </div>
       ${isDryRun ? '<button class="btn btn-primary btn-block mt-1" id="bookNowBtn">Book this tee time now</button>' : ''}
       ${bookingUrl ? `<a href="${esc(bookingUrl)}" target="_blank" class="btn btn-secondary btn-block mt-1">Open ForeUp Booking Page</a>` : ''}

@@ -796,7 +796,61 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         poll_start = time.perf_counter()
         poll_count = 0
         last_status_emit = 0.0
-        selected = None
+        selected = None  # last slot we attempted (for alert path)
+        booked = False
+        booking_response: dict[str, Any] | None = None
+
+        do_auto_book = bool(auto_book and not payload.get("dry_run", True))
+        booking = ForeUpBookingClient(base_url=base_url) if do_auto_book else None
+        customer_id = discovery.get_customer_id() if hasattr(discovery, "get_customer_id") else None
+
+        # Sniper retry state — tried slots survive across polls so we don't
+        # thrash the same taken slot, and captcha re-solves are capped because
+        # each one costs real time + an Anti-Captcha credit.
+        tried_keys: set[tuple] = set()
+        tried_labels: list[str] = []
+        captcha_resolves = 0
+        CAPTCHA_RESOLVE_CAP = 2
+        retry_same_slot = False  # set when captcha refresh — retry same slot once
+
+        def _slot_key(s: dict[str, Any]) -> tuple:
+            raw = s.get("raw") or {}
+            return (str(raw.get("teesheet_id") or s.get("_source_teesheet_id") or teesheet_id),
+                    s.get("time", ""))
+
+        def _sniper_wait_for_code(ttid: str) -> str:
+            _emit_event(queue, phase="verify", stage="awaiting_code",
+                        message=f"Booking code emailed. Enter the code to confirm reservation (5 min timeout). TTID={ttid}",
+                        terminal="awaiting_code", reservation_id=ttid)
+            queue.put({"type": "status", "status": "awaiting_input"})
+            if cmd_queue is None:
+                raise ForeUpError("No command queue available to receive booking code")
+            stop_refresh = Event()
+
+            def _refresh_loop() -> None:
+                while not stop_refresh.wait(8.0):
+                    if booking is not None:
+                        booking.refresh_pending_reservation(pending_reservation_id=ttid, request_id=request_id)
+
+            refresher = Thread(target=_refresh_loop, daemon=True)
+            refresher.start()
+            try:
+                cmd = cmd_queue.get(timeout=300)
+            except Empty:
+                stop_refresh.set()
+                raise ForeUpError("Booking code timeout — no code received within 5 minutes")
+            stop_refresh.set()
+            code = cmd.get("code", "")
+            _emit_event(queue, phase="verify", stage="submitting_code",
+                        message=f"Submitting booking code: {code}")
+            queue.put({"type": "status", "status": "running"})
+            return code
+
+        request_code_callback = _sniper_wait_for_code if (customer_id and cmd_queue is not None) else None
+
+        def _sniper_debug(event: str, data: dict[str, Any]) -> None:
+            _emit_event(queue, phase="checkout", stage=f"debug_{event}",
+                        message=f"{event}: {data}")
 
         while time.perf_counter() - poll_start < timeout:
             loop_start = time.perf_counter()
@@ -816,19 +870,92 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
 
             loop_ms = round((time.perf_counter() - loop_start) * 1000, 1)
 
-            if slots:
-                selected = _select_slot(slots, payload)
-                if selected:
-                    _emit_event(queue, phase="sniper", stage="found",
-                                message=f"Poll #{poll_count}: {len(slots)} slots — TARGET FOUND: {selected['time']} ({selected['available_spots']} spots, ${selected.get('green_fee', '?')})",
-                                latency_ms=loop_ms, slot=selected)
+            untried = [s for s in slots if _slot_key(s) not in tried_keys] if not retry_same_slot else slots
+            candidate = _select_slot(untried, payload) if untried else None
+
+            if candidate:
+                selected = candidate
+                _emit_event(queue, phase="sniper", stage="found",
+                            message=f"Poll #{poll_count}: {len(slots)} slots — TARGET FOUND: {candidate['time']} ({candidate['available_spots']} spots, ${candidate.get('green_fee', '?')})"
+                                    + (f" | tried {len(tried_keys)}: {', '.join(tried_labels)}" if tried_labels else ""),
+                            latency_ms=loop_ms, slot=candidate, tried_count=len(tried_keys))
+
+                # No auto-book → first match is final; break and emit alert.
+                if not do_auto_book:
                     break
+
+                # Auto-book attempt
+                try:
+                    submit_started = time.perf_counter()
+                    booking_response, _booking_latency = booking.book_slot(
+                        idempotency_key=f"sniper-{job_id}-{_slot_key(candidate)[0]}-{candidate.get('time', 'unknown')}",
+                        slot=candidate, schedule_id=teesheet_id,
+                        course_id=resolved_schedule_id,
+                        date=play_date, players=payload["players"], holes=holes,
+                        request_id=request_id,
+                        captcha_token=captcha_token,
+                        debug_callback=_sniper_debug,
+                        customer_id=customer_id,
+                        request_code_callback=request_code_callback,
+                        skip_validation=True,
+                    )
+                    _emit_event(queue, phase="checkout", stage="booking_submit",
+                                message="Booking confirmed",
+                                latency_ms=round((time.perf_counter() - submit_started) * 1000, 2))
+                    booked = True
+                    retry_same_slot = False
+                    break
+                except ForeUpError as exc:
+                    msg = str(exc).lower()
+                    # 2FA-related failures: stop. The user wasn't able to enter
+                    # the code in time / entered wrong code. Per product spec
+                    # we don't keep racing after a missed 2FA — burned hold.
+                    if "booking code was not provided" in msg or "booking code timeout" in msg:
+                        _emit_event(queue, phase="confirm", stage="terminal",
+                                    message=f"Booking code not entered in time on slot {candidate.get('time')}. Stopping sniper.",
+                                    terminal="failed", tried_slots=tried_labels + [candidate.get('time', '?')])
+                        queue.put({"type": "status", "status": "failed"})
+                        _finalize_worker()
+                        return
+                    # Captcha invalid — re-solve and retry the SAME slot once.
+                    if "captcha" in msg or "recaptcha" in msg:
+                        if captcha_resolves >= CAPTCHA_RESOLVE_CAP or captcha_solver is None or not captcha_site_key:
+                            _emit_event(queue, phase="captcha", stage="cap_reached",
+                                        message=f"Captcha re-solve cap ({CAPTCHA_RESOLVE_CAP}) reached. Marking slot {candidate.get('time')} as tried.")
+                            tried_keys.add(_slot_key(candidate))
+                            tried_labels.append(candidate.get('time', '?'))
+                            retry_same_slot = False
+                        else:
+                            try:
+                                _emit_event(queue, phase="captcha", stage="resolving",
+                                            message="Captcha rejected — re-solving for retry")
+                                booking_page_url = payload.get("foreup_booking_url") or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}"
+                                captcha_token = captcha_solver.solve(booking_page_url, captcha_site_key, timeout=120)
+                                captcha_solved_at = time.monotonic()
+                                captcha_resolves += 1
+                                retry_same_slot = True
+                                _emit_event(queue, phase="captcha", stage="resolved",
+                                            message=f"Captcha refreshed ({captcha_resolves}/{CAPTCHA_RESOLVE_CAP}) — retrying same slot")
+                                continue  # skip the jitter sleep, retry immediately
+                            except Exception as cap_exc:  # noqa: BLE001
+                                _emit_event(queue, phase="captcha", stage="error",
+                                            message=f"Captcha re-solve failed: {cap_exc} — marking slot tried")
+                                tried_keys.add(_slot_key(candidate))
+                                tried_labels.append(candidate.get('time', '?'))
+                                retry_same_slot = False
+                    else:
+                        # Stale slot or unknown error — mark tried, keep polling.
+                        tried_keys.add(_slot_key(candidate))
+                        tried_labels.append(candidate.get('time', '?'))
+                        retry_same_slot = False
+                        _emit_event(queue, phase="checkout", stage="slot_taken",
+                                    message=f"Slot {candidate.get('time')} unavailable ({exc}). Tried {len(tried_keys)} so far — continuing to poll.")
 
             elapsed = time.perf_counter() - poll_start
             if elapsed - last_status_emit >= 2.0:
                 _emit_event(queue, phase="sniper", stage="poll_status",
-                            message=f"Poll #{poll_count}: {len(slots)} slots ({loop_ms}ms)",
-                            latency_ms=loop_ms)
+                            message=f"Poll #{poll_count}: {len(slots)} slots ({loop_ms}ms) | tried {len(tried_keys)}",
+                            latency_ms=loop_ms, tried_count=len(tried_keys))
                 last_status_emit = elapsed
 
             jittered_interval = poll_base + _rand.uniform(0, poll_jitter)
@@ -838,97 +965,35 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
 
         total_ms = round((time.perf_counter() - poll_start) * 1000, 2)
 
+        if booked:
+            _emit_event(queue, phase="confirm", stage="booking_confirmation",
+                        message="Booking confirmed", terminal="success",
+                        confirmation=booking_response, slot=selected,
+                        sniper_stats={"polls": poll_count, "total_ms": total_ms, "attempts": len(tried_keys) + 1})
+            queue.put({"type": "status", "status": "succeeded"})
+            _finalize_worker()
+            return
+
         if not selected:
             _emit_event(queue, phase="confirm", stage="terminal",
-                        message=f"Sniper timed out after {poll_count} polls ({total_ms}ms) — no matching slots found",
-                        terminal="failed")
+                        message=f"Sniper timed out after {poll_count} polls ({total_ms}ms) — no matching slots found"
+                                + (f". Tried {len(tried_keys)}: {', '.join(tried_labels)}" if tried_labels else ""),
+                        terminal="failed", tried_slots=tried_labels)
             queue.put({"type": "status", "status": "failed"})
             _finalize_worker()
             return
 
-        if auto_book and not payload.get("dry_run", True):
-            try:
-                # The class-level shared httpx.Client (and its cookies + JWT
-                # header set during refresh_session at T-5s) is already warm
-                # at this point. Constructing a fresh ForeUpBookingClient
-                # inherits that warm state; calling bootstrap_session again
-                # here added ~1.7s of dead login latency *after* the slot was
-                # found but *before* pending POST fired — pure handicap in the
-                # race vs other bots. Removed.
-                booking = ForeUpBookingClient(base_url=base_url)
-                submit_started = time.perf_counter()
-                token_msg = " (with CAPTCHA token)" if captcha_token else ""
-                def _sniper_debug(event: str, data: dict[str, Any]) -> None:
-                    _emit_event(queue, phase="checkout", stage=f"debug_{event}",
-                                message=f"{event}: {data}")
-
-                booking_response, booking_latency = booking.book_slot(
-                    idempotency_key=f"sniper-{job_id}-{selected.get('tee_time_id', 'unknown')}",
-                    slot=selected, schedule_id=teesheet_id,
-                    course_id=resolved_schedule_id,
-                    date=play_date, players=payload["players"], holes=holes,
-                    request_id=request_id,
-                    captcha_token=captcha_token,
-                    debug_callback=_sniper_debug,
-                    # Sniper just observed this slot in lookup_availability_fast a
-                    # few hundred ms ago — skip the GET pre-flight and shave a
-                    # full RTT off the time-to-first-POST in the race.
-                    skip_validation=True,
-                )
-                _emit_event(queue, phase="checkout", stage="booking_submit",
-                            message=f"Booking submitted{token_msg}",
-                            latency_ms=round((time.perf_counter() - submit_started) * 1000, 2))
-
-                resp_str = str(booking_response).lower()
-                needs_code = (
-                    booking_response.get("requires_code")
-                    or "booking_code" in resp_str
-                    or "verification" in resp_str
-                    or "booking code" in resp_str
-                )
-
-                if needs_code and cmd_queue is not None:
-                    reservation_id = booking_response.get("reservation_id", booking_response.get("id", ""))
-                    _emit_event(queue, phase="verify", stage="awaiting_code",
-                                message=f"Verification code sent to your email — enter it below (5 min timeout). Response: {booking_response}",
-                                terminal="awaiting_code")
-                    queue.put({"type": "status", "status": "awaiting_input"})
-                    try:
-                        cmd = cmd_queue.get(timeout=300)
-                        code = cmd.get("code", "")
-                        _emit_event(queue, phase="verify", stage="submitting_code", message=f"Submitting verification code: {code}")
-                        queue.put({"type": "status", "status": "running"})
-                        verify_response = booking.submit_booking_code(
-                            code=code, reservation_id=str(reservation_id),
-                            schedule_id=teesheet_id, request_id=request_id,
-                        )
-                        _emit_event(queue, phase="confirm", stage="booking_confirmation",
-                                    message=f"Verification submitted — response: {verify_response}",
-                                    terminal="success", confirmation=verify_response, slot=selected)
-                        queue.put({"type": "status", "status": "succeeded"})
-                    except Empty:
-                        _emit_event(queue, phase="confirm", stage="terminal",
-                                    message="Verification code timeout — slot hold expired", terminal="failed")
-                        queue.put({"type": "status", "status": "failed"})
-                    _finalize_worker()
-                    return
-
-                _emit_event(queue, phase="confirm", stage="booking_confirmation",
-                            message="Booking confirmed", terminal="success",
-                            confirmation=booking_response, slot=selected)
-                queue.put({"type": "status", "status": "succeeded"})
-                _finalize_worker()
-                return
-            except ForeUpError as exc:
-                _emit_event(queue, phase="checkout", stage="booking_failed",
-                            message=f"Auto-book failed: {exc} — slot details shown below")
-
         booking_url = payload.get("foreup_booking_url") or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}#teetimes"
         terminal = "dry_run_stopped" if payload.get("dry_run", True) else "sniper_alert"
+        alert_msg = f"Slot found: {selected['time']} | {selected['available_spots']} spots | ${selected.get('green_fee', '?')}"
+        if tried_labels:
+            alert_msg += f" | tried {len(tried_keys)} slots that were taken: {', '.join(tried_labels)}"
         _emit_event(queue, phase="confirm", stage="sniper_result",
-                    message=f"Slot found: {selected['time']} | {selected['available_spots']} spots | ${selected.get('green_fee', '?')}",
+                    message=alert_msg,
                     terminal=terminal, slot=selected, booking_url=booking_url,
-                    sniper_stats={"polls": poll_count, "total_ms": total_ms})
+                    sniper_stats={"polls": poll_count, "total_ms": total_ms,
+                                  "attempts": len(tried_keys) + 1,
+                                  "tried_slots": tried_labels})
         queue.put({"type": "status", "status": "succeeded"})
         _finalize_worker()
 
@@ -1052,7 +1117,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.59"
+APP_VERSION = "0.60"
 
 @app.get("/health")
 def health() -> dict[str, str]:
