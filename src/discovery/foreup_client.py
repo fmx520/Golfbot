@@ -131,6 +131,11 @@ class ForeUpDiscoveryClient:
                     limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
                     follow_redirects=True,
                     headers=BROWSER_HEADERS,
+                    # ForeUp serves HTTP/2; using it lets the booking sequence
+                    # (pending POST + reservation POST + refresh polls)
+                    # multiplex on a single connection and avoids a fresh TLS
+                    # handshake per request. Looks more browser-like too.
+                    http2=True,
                 )
         return cls._shared_client
 

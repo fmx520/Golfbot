@@ -848,11 +848,14 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
 
         if auto_book and not payload.get("dry_run", True):
             try:
+                # The class-level shared httpx.Client (and its cookies + JWT
+                # header set during refresh_session at T-5s) is already warm
+                # at this point. Constructing a fresh ForeUpBookingClient
+                # inherits that warm state; calling bootstrap_session again
+                # here added ~1.7s of dead login latency *after* the slot was
+                # found but *before* pending POST fired — pure handicap in the
+                # race vs other bots. Removed.
                 booking = ForeUpBookingClient(base_url=base_url)
-                if username and password:
-                    booking.bootstrap_session(username=username, password=password,
-                                              schedule_id=resolved_schedule_id, course_id=resolved_course_id,
-                                              request_id=request_id)
                 submit_started = time.perf_counter()
                 token_msg = " (with CAPTCHA token)" if captcha_token else ""
                 def _sniper_debug(event: str, data: dict[str, Any]) -> None:
@@ -1049,7 +1052,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.58"
+APP_VERSION = "0.59"
 
 @app.get("/health")
 def health() -> dict[str, str]:
