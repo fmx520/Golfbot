@@ -657,6 +657,11 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
     password = payload.get("password") or os.getenv("FOREUP_PASSWORD", "")
     holes = payload.get("holes", 18)
     teesheet_id = resolved_course_id or resolved_schedule_id
+    # Sniper round-robins through every selected course at the same total
+    # poll rate (5/sec), so coverage scales with however many the user checked
+    # without burning extra request budget. Falls back to the URL's single
+    # course when no checklist was provided.
+    sniper_course_ids: list[str] = [c for c in (payload.get("course_ids") or []) if c] or [teesheet_id]
     auto_book = payload.get("auto_book", False)
     release_time_str = payload.get("release_time", "")
     play_date = payload["play_date"]
@@ -852,19 +857,44 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             _emit_event(queue, phase="checkout", stage=f"debug_{event}",
                         message=f"{event}: {data}")
 
+        # Pre-resolve booking class per teesheet — each course at a multi-
+        # course facility (Bethpage) has its own booking_class IDs even
+        # though the class names are identical. Resolving once up front
+        # avoids re-doing the lookup on every poll.
+        requested_class = payload.get("booking_class", "")
+        per_course_class: dict[str, str] = {}
+        for tid in sniper_course_ids:
+            if hasattr(discovery, "resolve_booking_class"):
+                per_course_class[tid] = discovery.resolve_booking_class(tid, requested_class)
+            else:
+                per_course_class[tid] = requested_class
+
+        if len(sniper_course_ids) > 1:
+            _emit_event(queue, phase="sniper", stage="multi_course",
+                        message=f"Round-robin polling {len(sniper_course_ids)} courses: {', '.join(sniper_course_ids)}")
+
         while time.perf_counter() - poll_start < timeout:
             loop_start = time.perf_counter()
             poll_count += 1
 
+            # Pick which course to poll this iteration. Rotation keeps the
+            # total request rate identical to the single-course case.
+            current_teesheet = sniper_course_ids[(poll_count - 1) % len(sniper_course_ids)]
+            current_class = per_course_class.get(current_teesheet, requested_class)
+
             try:
                 slots = discovery.lookup_availability_fast(
-                    schedule_id=teesheet_id,
+                    schedule_id=current_teesheet,
                     date=play_date,
                     players=payload["players"],
                     holes=holes,
-                    booking_class=payload.get("booking_class", ""),
+                    booking_class=current_class,
                     request_id=f"{request_id}-p{poll_count}",
                 )
+                # Tag each slot with the teesheet it came from so the
+                # downstream book_slot uses the right course IDs.
+                for s in slots:
+                    s["_source_teesheet_id"] = current_teesheet
             except ForeUpError:
                 slots = []
 
@@ -884,13 +914,23 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 if not do_auto_book:
                     break
 
-                # Auto-book attempt
+                # Auto-book attempt — use the slot's *own* schedule/course IDs
+                # because in round-robin polling the slot can come from any of
+                # the user-selected courses, each with its own IDs.
+                slot_raw_for_book = candidate.get("raw") or {}
+                book_schedule_id = str(
+                    slot_raw_for_book.get("schedule_id")
+                    or slot_raw_for_book.get("teesheet_id")
+                    or candidate.get("_source_teesheet_id")
+                    or teesheet_id
+                )
+                book_course_id = str(slot_raw_for_book.get("course_id") or resolved_schedule_id)
                 try:
                     submit_started = time.perf_counter()
                     booking_response, _booking_latency = booking.book_slot(
                         idempotency_key=f"sniper-{job_id}-{_slot_key(candidate)[0]}-{candidate.get('time', 'unknown')}",
-                        slot=candidate, schedule_id=teesheet_id,
-                        course_id=resolved_schedule_id,
+                        slot=candidate, schedule_id=book_schedule_id,
+                        course_id=book_course_id,
                         date=play_date, players=payload["players"], holes=holes,
                         request_id=request_id,
                         captcha_token=captcha_token,
@@ -1117,7 +1157,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.60"
+APP_VERSION = "0.61"
 
 @app.get("/health")
 def health() -> dict[str, str]:

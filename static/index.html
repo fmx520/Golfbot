@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.60</span>
+        <span class="version-badge">v0.61</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -139,7 +139,11 @@
         <div class="form-group hidden" id="coursesGroup">
           <label>Courses (multi-course facility — pick one or more)</label>
           <div id="courseCheckboxes" class="checkbox-list"></div>
-          <div class="form-help">Order matters when ranking = "Priority order". The first checked course is preferred.</div>
+          <div class="form-help">
+            <strong>One course checked:</strong> bot polls that course every ~200ms — fastest detection on that single course.<br>
+            <strong>Multiple checked:</strong> bot round-robins across them at the same total rate (5&nbsp;req/sec) to avoid anti-bot flags. Detection per course is ~1&nbsp;sec when 5 are checked, but coverage is across all of them. Books the first match in your time window per your ranking choice below.<br>
+            <em>Order matters for "Priority order" ranking — first checked is preferred.</em>
+          </div>
         </div>
         <div class="form-group hidden" id="rankingGroup">
           <label for="ranking">Ranking strategy</label>
