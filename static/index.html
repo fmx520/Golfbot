@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.56</span>
+        <span class="version-badge">v0.57</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -167,11 +167,8 @@
           <input type="checkbox" id="sniperMode">
           <label for="sniperMode">Enable Sniper Mode</label>
         </div>
+        <div class="form-help">Use this when a course releases new tee times at a known time (e.g. 7:00 PM the night before). The bot pre-warms your session and fires the moment slots open — milliseconds matter when racing other bots.</div>
         <div id="sniperFields" class="hidden">
-          <div class="checkbox-group">
-            <input type="checkbox" id="snipeNow">
-            <label for="snipeNow">Snipe now (don't wait for a release time — start polling immediately)</label>
-          </div>
           <div class="form-row" id="releaseTimeRow">
             <div class="form-group">
               <label for="releaseTime">Release Time (EST/EDT)</label>
@@ -179,9 +176,15 @@
             </div>
           </div>
           <div class="checkbox-group">
+            <input type="checkbox" id="snipeNow">
+            <label for="snipeNow">Snipe now (don't wait for a release time — start polling immediately)</label>
+          </div>
+          <div class="form-help">Use this for mid-day cancellations or when a course unexpectedly drops new times. Skips the countdown and starts polling at 5 req/sec right away.</div>
+          <div class="checkbox-group">
             <input type="checkbox" id="autoBook">
             <label for="autoBook">Auto-book when slot found</label>
           </div>
+          <div class="form-help">Off: bot alerts you when a slot opens, you click to book. On: bot submits the reservation instantly. For 2FA courses (Bethpage) the slot is held while you enter the email code.</div>
         </div>
       </div>
 
