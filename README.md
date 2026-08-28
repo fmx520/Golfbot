@@ -141,6 +141,38 @@ python3 scripts/analyze_runs.py
 render logs --tail 1000 | grep GOLFBOT_RACE | python3 scripts/analyze_runs.py -
 ```
 
+### Durable storage (Supabase)
+
+1. Create a project at [supabase.com](https://supabase.com) (free tier is ample —
+   one race record is ~1-2KB).
+2. Run [`supabase/schema.sql`](supabase/schema.sql) in Dashboard → SQL Editor.
+   It creates the `races` table, indexes, and leaves RLS enabled with no
+   policies.
+3. Copy the **`service_role`** key from Project Settings → API. Not the `anon`
+   key — RLS is on, and only `service_role` bypasses it.
+4. Set these wherever the bot runs (Render → Environment, or `.env` locally):
+
+   ```bash
+   RACE_LOG_WEBHOOK_URL=https://<project>.supabase.co/rest/v1/races
+   RACE_LOG_WEBHOOK_HEADERS={"apikey":"SERVICE_KEY","Authorization":"Bearer SERVICE_KEY","Prefer":"return=minimal"}
+   ```
+
+5. Confirm the wiring before trusting it with a real race:
+
+   ```bash
+   python3 scripts/verify_race_sink.py
+   ```
+
+   It sends one synthetic record through the real code path and, on failure,
+   names the likely cause (wrong key, missing table, bad URL).
+
+The `service_role` key bypasses RLS entirely — keep it in environment variables
+and out of the repo. `.env` is gitignored.
+
+`supabase/schema.sql` also carries a commented query cookbook for the questions
+worth asking: where races are being lost, whether first-poll offsets are still
+landing before the release, and whether anti-bot rejections are climbing.
+
 ## Architecture
 
 ```
