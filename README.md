@@ -154,8 +154,12 @@ render logs --tail 1000 | grep GOLFBOT_RACE | python3 scripts/analyze_runs.py -
 
    ```bash
    RACE_LOG_WEBHOOK_URL=https://<project>.supabase.co/rest/v1/races
-   RACE_LOG_WEBHOOK_HEADERS={"apikey":"SERVICE_KEY","Authorization":"Bearer SERVICE_KEY","Prefer":"return=minimal"}
+   RACE_LOG_WEBHOOK_TOKEN=<the secret key>
    ```
+
+   The key is sent as both the `apikey` and bearer headers, so there is no JSON
+   to type. Use `RACE_LOG_WEBHOOK_HEADERS` (a JSON object) only for a backend
+   that needs some other header set.
 
 5. Confirm the wiring before trusting it with a real race:
 

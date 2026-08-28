@@ -105,9 +105,17 @@ def _sink_headers() -> dict[str, str]:
             # request still goes out and will fail loudly at the endpoint.
             pass
 
+    # A single key is enough for Supabase, so the JSON form above is optional.
+    # Supabase wants the key in `apikey`, PostgREST accepts it as a bearer
+    # token, and sending both is harmless — so send both rather than making the
+    # caller know which. Anything set explicitly above still wins.
     token = os.getenv("RACE_LOG_WEBHOOK_TOKEN", "").strip()
-    if token and "Authorization" not in headers:
-        headers["Authorization"] = f"Bearer {token}"
+    if token:
+        headers.setdefault("Authorization", f"Bearer {token}")
+        headers.setdefault("apikey", token)
+        # Tells PostgREST not to echo the inserted row back. Ignored by
+        # endpoints that do not understand it.
+        headers.setdefault("Prefer", "return=minimal")
 
     return headers
 
