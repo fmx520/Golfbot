@@ -85,7 +85,16 @@ class JobState:
 
 JOBS: dict[str, JobState] = {}
 CMD_QUEUES: dict[str, Queue] = {}
+# Kept so a running job can actually be stopped. A cancel is cooperative first
+# — the worker checks for it at a safe point and exits cleanly, flushing its
+# race record — with a hard terminate only as a fallback.
+JOB_PROCS: dict[str, Process] = {}
 JOB_LOCK = Lock()
+
+# How long a worker gets to stop on its own before it is killed. One poll cycle
+# is ~250ms, so this is many cycles of headroom; the only thing that legitimately
+# takes longer is an in-flight booking, which we want to let finish.
+CANCEL_GRACE_SECONDS = 10.0
 APP_CONFIG = load_config()
 
 
@@ -723,6 +732,27 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         except Exception:  # noqa: BLE001 — telemetry must never kill a run
             pass
 
+    def _cancel_requested() -> bool:
+        """Non-blocking check for a user stop request.
+
+        Checked only at safe points — never between the pending_reservation and
+        the reservation submit, where stopping would strand a hold on ForeUp's
+        side or drop a booking that actually succeeded.
+        """
+        if cmd_queue is None:
+            return False
+        try:
+            msg = cmd_queue.get_nowait()
+        except Empty:
+            return False
+        if isinstance(msg, dict) and msg.get("type") == "cancel":
+            return True
+        # Something else (a booking code) — hand it back for the 2FA flow.
+        cmd_queue.put(msg)
+        return False
+
+    cancelled = False
+
     try:
         auth_started = time.perf_counter()
         if username and password:
@@ -786,6 +816,9 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             slept = 0.0
             last_update = 0.0
             while slept < wait_seconds:
+                if _cancel_requested():
+                    cancelled = True
+                    break
                 chunk = min(sleep_chunk, wait_seconds - slept)
                 time.sleep(chunk)
                 slept += chunk
@@ -842,6 +875,16 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 _emit_event(queue, phase="auth", stage="rewarm",
                             message="Session re-warmed",
                             latency_ms=rewarm_ms)
+
+        if cancelled:
+            race.aborted_reason = "cancelled_while_armed"
+            _emit_event(queue, phase="confirm", stage="terminal",
+                        message="Stopped before the release — no requests were sent to ForeUp.",
+                        terminal="cancelled")
+            _flush_race()
+            queue.put({"type": "status", "status": "cancelled"})
+            _finalize_worker()
+            return
 
         remaining = release_monotonic - time.perf_counter()
         if remaining > 0:
@@ -900,6 +943,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 stop_refresh.set()
                 raise ForeUpError("Booking code timeout — no code received within 5 minutes")
             stop_refresh.set()
+            if isinstance(cmd, dict) and cmd.get("type") == "cancel":
+                raise ForeUpError("Stopped by user while awaiting the booking code")
             code = cmd.get("code", "")
             _emit_event(queue, phase="verify", stage="submitting_code",
                         message=f"Submitting booking code: {code}")
@@ -963,6 +1008,12 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             captcha_refresher.start()
 
         while time.perf_counter() - poll_start < timeout:
+            # Top of the loop is the safe point: no hold is open and no booking
+            # is in flight, so stopping here cannot strand anything.
+            if _cancel_requested():
+                cancelled = True
+                break
+
             loop_start = time.perf_counter()
             poll_count += 1
 
@@ -1130,6 +1181,17 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         race.total_race_ms = total_ms
         stop_captcha_refresh.set()
 
+        if cancelled and not booked:
+            race.aborted_reason = "cancelled_by_user"
+            _emit_event(queue, phase="confirm", stage="terminal",
+                        message=f"Stopped by user after {poll_count} polls ({total_ms:.0f}ms). "
+                                f"No booking was submitted.",
+                        terminal="cancelled", tried_slots=tried_labels)
+            _flush_race()
+            queue.put({"type": "status", "status": "cancelled"})
+            _finalize_worker()
+            return
+
         if booked:
             _emit_event(queue, phase="confirm", stage="booking_confirmation",
                         message="Booking confirmed", terminal="success",
@@ -1296,11 +1358,12 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
     process.join(timeout=1)
     CMD_QUEUES.pop(cleanup_id, None)
+    JOB_PROCS.pop(cleanup_id, None)
 
 
 # --- Routes ---
 
-APP_VERSION = "0.63"
+APP_VERSION = "0.64"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -1364,6 +1427,7 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
     worker_fn = _sniper_worker_main if full_payload.get("sniper_mode") else _worker_main
     proc = Process(target=worker_fn, args=(job_id, full_payload, queue, cmd_queue), daemon=True)
     proc.start()
+    JOB_PROCS[job_id] = proc
 
     watcher = Thread(target=_watch_worker, args=(job_id, queue, proc, job_id), daemon=True)
     watcher.start()
@@ -1431,6 +1495,56 @@ def submit_verification_code(job_id: str, req: VerifyCodeRequest) -> dict[str, s
 
     cmd_queue.put({"type": "code", "code": req.code})
     return {"status": "submitted"}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict[str, str]:
+    """Stop a running job.
+
+    Cooperative first: the worker sees the request at a safe point — never
+    between opening a hold and submitting the reservation — exits cleanly, and
+    still writes its race record so the run is not lost from the history. If it
+    has not stopped within the grace period it is terminated.
+    """
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.status in {"succeeded", "failed", "cancelled"}:
+            raise HTTPException(status_code=400, detail=f"Job already finished (status={job.status})")
+        job.status = "cancelling"
+        job.updated_at = datetime.now(timezone.utc).isoformat()
+        _event(JOBS[job_id], "job", "Stop requested — finishing current step, then shutting down.")
+
+    cmd_queue = CMD_QUEUES.get(job_id)
+    if cmd_queue:
+        cmd_queue.put({"type": "cancel"})
+
+    def _hard_stop_if_needed() -> None:
+        deadline = time.monotonic() + CANCEL_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            proc = JOB_PROCS.get(job_id)
+            if proc is None or not proc.is_alive():
+                return
+            time.sleep(0.25)
+
+        proc = JOB_PROCS.get(job_id)
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            with JOB_LOCK:
+                stale = JOBS.get(job_id)
+                if stale and stale.status not in {"succeeded", "failed", "cancelled"}:
+                    stale.status = "cancelled"
+                    stale.updated_at = datetime.now(timezone.utc).isoformat()
+                    _event(
+                        JOBS[job_id], "job",
+                        f"Did not stop within {CANCEL_GRACE_SECONDS:.0f}s — process terminated. "
+                        f"The race record for this run may be missing.",
+                        terminal="cancelled",
+                    )
+
+    Thread(target=_hard_stop_if_needed, daemon=True).start()
+    return {"status": "cancelling"}
 
 
 @app.get("/")

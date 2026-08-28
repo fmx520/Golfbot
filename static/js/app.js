@@ -259,6 +259,10 @@ async function searchTeeTimes(opts = {}) {
 
     S.jobId = job_id;
     addEvent('system', 'job', 'Job started: ' + job_id, null);
+    const stopBtn = $('stopBtn');
+    stopBtn.disabled = false;
+    stopBtn.textContent = 'Stop';
+    show('stopBtn');
     startPolling();
   } catch (e) {
     showAlert('searchError', e.message);
@@ -286,10 +290,11 @@ function startPolling() {
         fireNotification({ events: [{ slot: null }] });
       }
 
-      if (data.status === 'succeeded' || data.status === 'failed') {
+      if (data.status === 'succeeded' || data.status === 'failed' || data.status === 'cancelled') {
         clearInterval(S.pollTimer);
         S.pollTimer = null;
         hideVerificationForm();
+        hide('stopBtn');
 
         const btn = $('searchBtn');
         btn.disabled = false;
@@ -512,6 +517,24 @@ function updateDateRange() {
 }
 
 // Verification code form
+async function stopJob() {
+  if (!S.jobId) return;
+  const btn = $('stopBtn');
+  btn.disabled = true;
+  btn.textContent = 'Stopping...';
+  addEvent('system', 'job', 'Stop requested — waiting for the bot to finish its current step.', null);
+  try {
+    await api('/jobs/' + S.jobId + '/cancel', { method: 'POST' });
+  } catch (e) {
+    // Most likely the job finished on its own between render and click.
+    addEvent('system', 'job', 'Could not stop: ' + e.message, null);
+    btn.disabled = false;
+    btn.textContent = 'Stop';
+  }
+  // The poller handles the rest — it hides the button when the job reports
+  // 'cancelled', so the UI only says stopped once the worker actually has.
+}
+
 function showVerificationForm() {
   show('verificationContainer');
   $('verificationCode').focus();
@@ -583,6 +606,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('bookingUrl').addEventListener('input', (e) => parseBookingUrl(e.target.value));
   $('connectBtn').addEventListener('click', connect);
   $('searchBtn').addEventListener('click', searchTeeTimes);
+  $('stopBtn').addEventListener('click', stopJob);
   $('sniperMode').addEventListener('change', toggleSniperMode);
   $('snipeNow').addEventListener('change', toggleSnipeNow);
   $('autoBook').addEventListener('change', toggleCaptchaKey);
