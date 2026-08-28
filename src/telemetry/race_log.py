@@ -368,15 +368,5 @@ class RaceRecorder:
         except Exception:
             pass
 
-        # Durable sinks. Both are optional and independent, so having one
-        # misconfigured never costs you the other.
-        sinks: dict[str, Any] = {"http": _post_to_sink(record)}
-        try:
-            from .github_sink import post_race
-
-            sinks["github"] = post_race(record)
-        except Exception as exc:  # noqa: BLE001 — telemetry must never kill a run
-            sinks["github"] = {"configured": True, "ok": False, "error": str(exc)}
-
-        record["sink"] = sinks
+        record["sink"] = _post_to_sink(record)
         return record
