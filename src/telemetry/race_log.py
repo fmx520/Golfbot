@@ -317,6 +317,13 @@ class RaceRecorder:
     # output
     # ------------------------------------------------------------------
     def as_dict(self) -> dict[str, Any]:
+        # Both fields below are measured against the release instant, which only
+        # exists in timed sniper mode. Snipe-now sets the release to "now", so
+        # the re-warm always "overruns" it and the offset is really just how long
+        # arming took — recording those verbatim would make every snipe-now run
+        # read as a late start in any later query, burying the timed races that
+        # genuinely were. Absent beats misleading.
+        timed = self.mode == "sniper"
         return {
             "run_id": self.run_id,
             "job_id": self.job_id,
@@ -332,8 +339,8 @@ class RaceRecorder:
             "success": self.booked,
             "timing": {
                 "rewarm_ms": self.rewarm_ms,
-                "rewarm_overran_release": self.rewarm_overran_release,
-                "first_poll_offset_ms": self.first_poll_offset_ms,
+                "rewarm_overran_release": self.rewarm_overran_release if timed else None,
+                "first_poll_offset_ms": self.first_poll_offset_ms if timed else None,
                 "first_slot_seen_offset_ms": self.first_slot_seen_offset_ms,
                 "detect_to_submit_ms": self.detect_to_submit_ms,
                 "submit_to_confirm_ms": self.submit_to_confirm_ms,
