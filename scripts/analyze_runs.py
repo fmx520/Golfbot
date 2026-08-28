@@ -17,6 +17,7 @@ pipe them in:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -58,7 +59,7 @@ def _median(values: list[float]) -> float | None:
 
 
 def _load_records(argv: list[str]) -> list[dict[str, Any]]:
-    """Load from stdin when passed '-', otherwise from logs/*.json."""
+    """Load from stdin when passed '-', otherwise from the local log dir."""
     records: list[dict[str, Any]] = []
 
     if len(argv) > 1 and argv[1] == "-":
@@ -72,11 +73,26 @@ def _load_records(argv: list[str]) -> list[dict[str, Any]]:
                 continue
         return records
 
-    for file in sorted(LOG_DIR.glob("run_*.json")):
+    log_dir = Path(os.getenv("GOLFBOT_LOG_DIR", "logs"))
+
+    races_file = log_dir / "races.jsonl"
+    if races_file.exists():
+        for line in races_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    # Older per-run files from golfbot_cli.py and pre-JSONL races.
+    for file in sorted(log_dir.glob("run_*.json")):
         try:
             records.append(json.loads(file.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             continue
+
     return records
 
 

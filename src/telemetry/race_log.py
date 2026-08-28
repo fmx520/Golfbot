@@ -8,14 +8,22 @@ challenge, the slot never appeared, or we saw it and lost the submit.
 This module accumulates the evidence in memory during the race — no disk I/O on
 the hot path — and flushes one structured record at the end.
 
-That record goes to two places:
+That record goes to three places, cheapest and least durable first:
 
-* **stdout**, as a single ``GOLFBOT_RACE`` JSON line. Render reclaims the
-  container filesystem on every deploy and restart, so files under ``logs/``
-  do not survive; the log stream does. This is the copy that is actually
-  readable after a lost race in production.
-* **``$GOLFBOT_LOG_DIR/run_<id>.json``** (default ``logs/``) for
-  ``scripts/analyze_runs.py`` and local runs.
+* **stdout**, as a single ``GOLFBOT_RACE`` JSON line. Free enough to always do,
+  and it is the fallback when the network sink below fails.
+* **``$GOLFBOT_LOG_DIR/races.jsonl``** (default ``logs/``), appended one record
+  per line. Useful locally; on Render this dies with the container.
+* **an HTTP sink**, when ``RACE_LOG_WEBHOOK_URL`` is set. This is the only copy
+  that survives. Neither of the above is a basis for correlating races across
+  weeks: Render's container filesystem is reclaimed on every deploy, restart,
+  and free-plan spin-down, and the log stream — while held off-container — ages
+  out on a retention window measured in days.
+
+The sink is a plain JSON POST rather than a vendor SDK, so it works against
+Supabase, a Firestore-fronting Cloud Function, or any webhook, and adds no
+dependency or cold-start cost. It is best-effort by design: a telemetry failure
+must never affect a booking.
 """
 
 from __future__ import annotations
@@ -28,6 +36,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+# Hard ceiling on the sink POST. The race is already decided by the time this
+# runs, but the worker should not hang on a slow endpoint during teardown.
+SINK_TIMEOUT_SECONDS = 5.0
 
 # A first poll landing more than this far after the release instant means the
 # arming path — not the poll loop — is what cost us the race.
@@ -71,6 +83,73 @@ _REASONS = {
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _sink_headers() -> dict[str, str]:
+    """Build sink headers from env.
+
+    ``RACE_LOG_WEBHOOK_HEADERS`` takes a JSON object for backends that need
+    several (Supabase wants ``apikey``, ``Authorization`` and ``Prefer``).
+    ``RACE_LOG_WEBHOOK_TOKEN`` is the shorthand for a plain bearer token.
+    """
+    headers = {"Content-Type": "application/json"}
+
+    raw = os.getenv("RACE_LOG_WEBHOOK_HEADERS", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                headers.update({str(k): str(v) for k, v in parsed.items()})
+        except (ValueError, TypeError):
+            # A malformed header env var must not take the sink down; the
+            # request still goes out and will fail loudly at the endpoint.
+            pass
+
+    token = os.getenv("RACE_LOG_WEBHOOK_TOKEN", "").strip()
+    if token and "Authorization" not in headers:
+        headers["Authorization"] = f"Bearer {token}"
+
+    return headers
+
+
+def _post_to_sink(record: dict[str, Any]) -> dict[str, Any]:
+    """POST the record to the durable sink. Best effort, never raises.
+
+    Runs after the stdout and file writes so a hanging endpoint can never cost
+    us the record entirely. A failure writes its own ``GOLFBOT_RACE_SINK_ERROR``
+    line and is returned to the caller for display in the UI — a silently
+    broken sink should surface now, not weeks later when the history you went
+    to read turns out to be empty.
+    """
+    url = os.getenv("RACE_LOG_WEBHOOK_URL", "").strip()
+    if not url:
+        return {"configured": False}
+
+    try:
+        import httpx  # already a dependency; imported late to keep startup lean
+
+        response = httpx.post(
+            url,
+            json=record,
+            headers=_sink_headers(),
+            timeout=SINK_TIMEOUT_SECONDS,
+        )
+        ok = response.status_code < 400
+        status = {"configured": True, "ok": ok, "status_code": response.status_code}
+        if not ok:
+            status["body"] = response.text[:200]
+            sys.stdout.write(
+                f"GOLFBOT_RACE_SINK_ERROR {response.status_code}: {response.text[:200]}\n"
+            )
+            sys.stdout.flush()
+        return status
+    except Exception as exc:  # noqa: BLE001 — telemetry must never kill a run
+        try:
+            sys.stdout.write(f"GOLFBOT_RACE_SINK_ERROR {type(exc).__name__}: {exc}\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        return {"configured": True, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _percentile_ms(values: list[float], pct: float) -> Optional[float]:
@@ -269,20 +348,25 @@ class RaceRecorder:
             self.total_race_ms = round((time.perf_counter() - self._started) * 1000, 2)
         record = self.as_dict()
 
-        # stdout first: this is the copy that survives an ephemeral container.
+        line = json.dumps(record, default=str)
+
+        # stdout first, and unconditionally: it costs nothing and it is the
+        # fallback record if the durable sink below is unreachable.
         try:
-            sys.stdout.write("GOLFBOT_RACE " + json.dumps(record, default=str) + "\n")
+            sys.stdout.write("GOLFBOT_RACE " + line + "\n")
             sys.stdout.flush()
         except Exception:
             pass
 
+        # Append rather than one-file-per-run: a single JSONL file is what you
+        # actually want when correlating many races.
         try:
             log_dir = Path(os.getenv("GOLFBOT_LOG_DIR", "logs"))
             log_dir.mkdir(parents=True, exist_ok=True)
-            (log_dir / f"run_{self.run_id}.json").write_text(
-                json.dumps(record, indent=2, default=str), encoding="utf-8"
-            )
+            with (log_dir / "races.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
         except Exception:
             pass
 
+        record["sink"] = _post_to_sink(record)
         return record

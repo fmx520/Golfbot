@@ -109,6 +109,38 @@ Every CLI run writes structured JSON to `logs/run_<id>.json` including decision 
 python3 scripts/analyze_runs.py
 ```
 
+### Sniper race telemetry
+
+Sniper races additionally write one classified record each, answering *why* a
+race was lost rather than just that it was:
+
+| Outcome | Meaning |
+|---------|---------|
+| `won` | Booked. |
+| `late_start` | First poll fired after the release. The arming path overran it — poll speed is irrelevant until this is fixed. |
+| `blocked` | ForeUp served anti-bot responses. Polls were rejected, not empty. |
+| `lost_at_submit` | We saw the slot and lost it between detection and confirmation. |
+| `never_saw_slot` | Polling worked and was not blocked, but nothing matching appeared. |
+| `found_not_booked` | Slot found with auto-book off. |
+| `aborted` / `error` | Stopped deliberately, or an unhandled failure. |
+
+The headline metric is `first_poll_offset_ms` — negative means we were already
+polling when the release landed, which is what you want.
+
+Records go to stdout as a `GOLFBOT_RACE` line, to `logs/races.jsonl`, and to
+`RACE_LOG_WEBHOOK_URL` if set. **Only the webhook is durable** — Render reclaims
+the container filesystem on every deploy, restart, and free-plan spin-down, and
+its log stream ages out, so correlating races across weeks needs a real sink.
+See `.env.example`.
+
+```bash
+# local
+python3 scripts/analyze_runs.py
+
+# from Render's log stream
+render logs --tail 1000 | grep GOLFBOT_RACE | python3 scripts/analyze_runs.py -
+```
+
 ## Architecture
 
 ```
