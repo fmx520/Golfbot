@@ -29,7 +29,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -1363,7 +1363,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.65"
+APP_VERSION = "0.66"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -1548,5 +1548,19 @@ def cancel_job(job_id: str) -> dict[str, str]:
 
 
 @app.get("/")
-def index():
-    return FileResponse(str(STATIC_DIR / "index.html"))
+def index() -> HTMLResponse:
+    """Serve the UI with its asset URLs stamped with the running version.
+
+    Without this, a browser can hold a cached app.js while loading fresh HTML —
+    and because the version badge lives in the HTML, the page cheerfully reports
+    the new version while running the old JavaScript. That is how the stop
+    button shipped in v0.64 stayed invisible: the element was there, but the
+    cached script never un-hid it. Stamping ?v=<version> means every deploy
+    forces a re-fetch, and no-cache keeps this page itself honest.
+    """
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = html.replace("{{VERSION}}", APP_VERSION)
+    return HTMLResponse(
+        html,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )

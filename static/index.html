@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Golfbot</title>
-  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/static/css/style.css?v={{VERSION}}">
 </head>
 <body>
   <div class="app-container">
@@ -13,7 +13,7 @@
     <header class="app-header">
       <h1><span>&#9971;</span> Golfbot</h1>
       <div class="header-right">
-        <span class="version-badge">v0.65</span>
+        <span class="version-badge">v{{VERSION}}</span>
         <div class="connection-badge" id="connectionBadge">Not Connected</div>
       </div>
     </header>
@@ -306,6 +306,6 @@
 
   </div>
 
-  <script src="/static/js/app.js"></script>
+  <script src="/static/js/app.js?v={{VERSION}}"></script>
 </body>
 </html>
