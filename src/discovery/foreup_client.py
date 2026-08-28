@@ -441,12 +441,20 @@ class ForeUpDiscoveryClient:
         return self._fetch_times_for_class(base_params, req_id, schedule_id)
 
     def refresh_session(self, schedule_id: str = "", course_id: str = "", username: str = "", password: str = "", request_id: Optional[str] = None) -> None:
-        """Re-warm cookies and JWT before a sniper release window."""
+        """Re-warm cookies and JWT before a sniper release window.
+
+        This runs inside the pre-release budget, so it must stay cheap.
+        ``bootstrap_session`` already opens with its own ``_init_session``, so
+        calling it here too fetched and regex-parsed the full booking page
+        twice back to back — three round trips where two will do, at the exact
+        moment ForeUp is slowest.
+        """
         req_id = request_id or str(uuid.uuid4())
         sid = schedule_id or "19765"
-        self._init_session(sid, teesheet_id=course_id)
         if username and password:
             self.bootstrap_session(username=username, password=password, schedule_id=sid, course_id=course_id, request_id=req_id)
+        else:
+            self._init_session(sid, teesheet_id=course_id)
 
     def lookup_availability_fast(
         self,

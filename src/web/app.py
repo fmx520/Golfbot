@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from src.booking.foreup_client import ForeUpBookingClient
 from src.config import load_config
 from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
+from src.telemetry.race_log import RaceRecorder
 
 STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 
@@ -703,6 +704,25 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
     discovery = ForeUpDiscoveryClient(base_url=base_url)
     captcha_solver = None
 
+    race = RaceRecorder(
+        run_id=uuid.uuid4().hex[:12],
+        job_id=job_id,
+        mode="sniper" if release_time_str else "snipe_now",
+        course_ids=list(sniper_course_ids),
+        play_date=play_date,
+        release_at=release_dt.isoformat(),
+        auto_book=bool(auto_book and not payload.get("dry_run", True)),
+    )
+
+    def _flush_race() -> None:
+        """Emit the race record and surface the one-line verdict in the UI."""
+        try:
+            record = race.flush()
+            _emit_event(queue, phase="confirm", stage="race_summary",
+                        message=record["summary"], race=record)
+        except Exception:  # noqa: BLE001 — telemetry must never kill a run
+            pass
+
     try:
         auth_started = time.perf_counter()
         if username and password:
@@ -721,20 +741,24 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         captcha_token: str | None = None
         captcha_solved_at: float = 0
         captcha_solver = None
+        captcha_site_key: str | None = None
+        captcha_page_url: str = payload.get("foreup_booking_url") or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}"
         CAPTCHA_TOKEN_TTL = 110.0
 
         if auto_book and anticaptcha_key:
             site_key = discovery.extract_recaptcha_sitekey(schedule_id=resolved_schedule_id)
+            captcha_site_key = site_key
             if site_key:
                 from src.captcha.anticaptcha import AntiCaptchaSolver, CaptchaSolveError
                 captcha_solver = AntiCaptchaSolver(api_key=anticaptcha_key)
-                booking_page_url = payload.get("foreup_booking_url") or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}"
+                booking_page_url = captcha_page_url
                 _emit_event(queue, phase="captcha", stage="solving",
                             message=f"reCAPTCHA detected (site key: {site_key[:12]}...) — solving via Anti-Captcha")
                 try:
                     captcha_started = time.perf_counter()
                     captcha_token = captcha_solver.solve(booking_page_url, site_key, timeout=120)
                     captcha_solved_at = time.monotonic()
+                    race.captcha_solves += 1
                     _emit_event(queue, phase="captcha", stage="solved",
                                 message="CAPTCHA solved — token cached",
                                 latency_ms=round((time.perf_counter() - captcha_started) * 1000, 2))
@@ -750,7 +774,12 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         _emit_event(queue, phase="sniper", stage="armed",
                     message=f"Armed — release at {release_display} ({int(seconds_until)}s from now)")
 
-        prewarm_lead = 5.0
+        # The re-warm below is a login round trip against ForeUp at its busiest
+        # moment. A 5s lead was not enough headroom for it: when it overran, the
+        # sleep-until-release below was skipped and we began polling *after* the
+        # release, silently. Give it real room — waiting longer costs nothing
+        # because we sleep off the remainder anyway.
+        prewarm_lead = float(os.getenv("SNIPER_PREWARM_LEAD_SECONDS", "12"))
         wait_seconds = max(0, seconds_until - prewarm_lead)
         if wait_seconds > 0:
             sleep_chunk = 2.0
@@ -770,13 +799,21 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     if captcha_solver:
                         _emit_event(queue, phase="captcha", stage="refreshing", message="CAPTCHA token expired — requesting fresh solve")
                         try:
-                            booking_page_url = payload.get("foreup_booking_url") or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}"
-                            site_key = discovery.extract_recaptcha_sitekey(schedule_id=resolved_schedule_id)
-                            captcha_token = captcha_solver.solve(booking_page_url, site_key, timeout=120)
+                            site_key = captcha_site_key or discovery.extract_recaptcha_sitekey(schedule_id=resolved_schedule_id)
+                            captcha_token = captcha_solver.solve(captcha_page_url, site_key, timeout=120)
                             captcha_solved_at = time.monotonic()
+                            race.captcha_refreshes += 1
                             _emit_event(queue, phase="captcha", stage="solved", message="Fresh CAPTCHA token cached")
                         except Exception:
                             _emit_event(queue, phase="captcha", stage="failed", message="CAPTCHA refresh failed — will use expired token")
+
+        # Anchor the release on the monotonic clock before the re-warm so every
+        # offset below is measured against a fixed point that cannot be moved by
+        # a wall-clock adjustment mid-race.
+        release_monotonic = time.perf_counter() + (
+            release_dt - datetime.now(EAST_COAST_TZ)
+        ).total_seconds()
+        race.mark_release_instant(release_monotonic)
 
         rewarm_started = time.perf_counter()
         if username and password:
@@ -784,11 +821,29 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 schedule_id=resolved_schedule_id, course_id=resolved_course_id,
                 username=username, password=password, request_id=request_id,
             )
-            _emit_event(queue, phase="auth", stage="rewarm",
-                        message="Session re-warmed",
-                        latency_ms=round((time.perf_counter() - rewarm_started) * 1000, 2))
+            rewarm_ms = round((time.perf_counter() - rewarm_started) * 1000, 2)
+            overran = time.perf_counter() > release_monotonic
+            race.record_rewarm(rewarm_ms, overran)
+            if overran:
+                # This is the difference between racing and arriving after the
+                # race. Say so loudly rather than letting it look like a normal
+                # loss 90 seconds later.
+                _emit_event(
+                    queue, phase="auth", stage="rewarm_overran",
+                    message=(
+                        f"Session re-warm took {rewarm_ms:.0f}ms and overran the release "
+                        f"by {(time.perf_counter() - release_monotonic) * 1000:.0f}ms — "
+                        f"polling is starting LATE. Raise SNIPER_PREWARM_LEAD_SECONDS "
+                        f"(currently {prewarm_lead:.0f}s)."
+                    ),
+                    latency_ms=rewarm_ms,
+                )
+            else:
+                _emit_event(queue, phase="auth", stage="rewarm",
+                            message="Session re-warmed",
+                            latency_ms=rewarm_ms)
 
-        remaining = (release_dt - datetime.now(EAST_COAST_TZ)).total_seconds()
+        remaining = release_monotonic - time.perf_counter()
         if remaining > 0:
             time.sleep(remaining)
 
@@ -873,6 +928,40 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             _emit_event(queue, phase="sniper", stage="multi_course",
                         message=f"Round-robin polling {len(sniper_course_ids)} courses: {', '.join(sniper_course_ids)}")
 
+        # Keep a fresh captcha token in hand *during* the race. A solve takes
+        # seconds, so it runs on a background thread: stalling the poll loop to
+        # re-solve costs far more than the stale token does. Previously the only
+        # refresh lived in the countdown loop, which does not run at all in
+        # snipe-now mode and stops at T-prewarm otherwise — so a 90s race could
+        # reach submit with an expired token and eat a re-solve at the worst
+        # possible moment.
+        captcha_state: dict[str, Any] = {"token": captcha_token, "solved_at": captcha_solved_at}
+        stop_captcha_refresh = Event()
+
+        def _captcha_refresh_loop() -> None:
+            while not stop_captcha_refresh.wait(3.0):
+                solved_at = captcha_state.get("solved_at") or 0
+                if not captcha_solver or not solved_at:
+                    continue
+                # Refresh with headroom so the token is never near expiry at submit.
+                if (time.monotonic() - solved_at) < (CAPTCHA_TOKEN_TTL - 25):
+                    continue
+                try:
+                    site_key = captcha_site_key or discovery.extract_recaptcha_sitekey(schedule_id=resolved_schedule_id)
+                    if not site_key:
+                        continue
+                    fresh = captcha_solver.solve(captcha_page_url, site_key, timeout=120)
+                    captcha_state["token"] = fresh
+                    captcha_state["solved_at"] = time.monotonic()
+                    race.captcha_refreshes += 1
+                except Exception:  # noqa: BLE001 — best effort; reactive path still covers us
+                    pass
+
+        captcha_refresher: Thread | None = None
+        if captcha_solver and captcha_state.get("token"):
+            captcha_refresher = Thread(target=_captcha_refresh_loop, daemon=True)
+            captcha_refresher.start()
+
         while time.perf_counter() - poll_start < timeout:
             loop_start = time.perf_counter()
             poll_count += 1
@@ -882,6 +971,9 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             current_teesheet = sniper_course_ids[(poll_count - 1) % len(sniper_course_ids)]
             current_class = per_course_class.get(current_teesheet, requested_class)
 
+            race.record_first_poll(loop_start)
+
+            poll_result = "ok"
             try:
                 slots = discovery.lookup_availability_fast(
                     schedule_id=current_teesheet,
@@ -895,16 +987,32 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 # downstream book_slot uses the right course IDs.
                 for s in slots:
                     s["_source_teesheet_id"] = current_teesheet
+            except AntiBotDetectedError as exc:
+                # AntiBotDetectedError subclasses ForeUpError, so this used to be
+                # swallowed by the generic handler below and recorded as "0 slots"
+                # — a block and an empty teesheet looked identical in the logs and
+                # in the UI. They are completely different problems.
+                slots = []
+                poll_result = "antibot"
+                if race.polls.antibot == 0:
+                    _emit_event(queue, phase="sniper", stage="antibot",
+                                message=f"Anti-bot response on poll #{poll_count}: {exc}. "
+                                        f"Polls are being rejected, not coming back empty — "
+                                        f"continuing to poll but treat results as unreliable.")
             except ForeUpError:
                 slots = []
+                poll_result = "error"
 
             loop_ms = round((time.perf_counter() - loop_start) * 1000, 1)
+            race.record_poll(loop_ms, len(slots), poll_result)
 
             untried = [s for s in slots if _slot_key(s) not in tried_keys] if not retry_same_slot else slots
             candidate = _select_slot(untried, payload) if untried else None
 
             if candidate:
                 selected = candidate
+                detect_time = time.perf_counter()
+                race.record_slot_seen(detect_time)
                 _emit_event(queue, phase="sniper", stage="found",
                             message=f"Poll #{poll_count}: {len(slots)} slots — TARGET FOUND: {candidate['time']} ({candidate['available_spots']} spots, ${candidate.get('green_fee', '?')})"
                                     + (f" | tried {len(tried_keys)}: {', '.join(tried_labels)}" if tried_labels else ""),
@@ -927,33 +1035,48 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 book_course_id = str(slot_raw_for_book.get("course_id") or resolved_schedule_id)
                 try:
                     submit_started = time.perf_counter()
+                    race.detect_to_submit_ms = round((submit_started - detect_time) * 1000, 2)
+                    solved_at = captcha_state.get("solved_at") or 0
+                    if solved_at and (time.monotonic() - solved_at) > CAPTCHA_TOKEN_TTL:
+                        race.captcha_stale_at_submit = True
                     booking_response, _booking_latency = booking.book_slot(
                         idempotency_key=f"sniper-{job_id}-{_slot_key(candidate)[0]}-{candidate.get('time', 'unknown')}",
                         slot=candidate, schedule_id=book_schedule_id,
                         course_id=book_course_id,
                         date=play_date, players=payload["players"], holes=holes,
                         request_id=request_id,
-                        captcha_token=captcha_token,
+                        captcha_token=captcha_state.get("token"),
                         debug_callback=_sniper_debug,
                         customer_id=customer_id,
                         request_code_callback=request_code_callback,
                         skip_validation=True,
                     )
+                    submit_ms = round((time.perf_counter() - submit_started) * 1000, 2)
+                    race.submit_to_confirm_ms = submit_ms
+                    race.record_attempt(candidate.get("time", "?"), "confirmed", latency_ms=submit_ms)
+                    race.booked = True
                     _emit_event(queue, phase="checkout", stage="booking_submit",
                                 message="Booking confirmed",
-                                latency_ms=round((time.perf_counter() - submit_started) * 1000, 2))
+                                latency_ms=submit_ms)
                     booked = True
                     retry_same_slot = False
                     break
                 except ForeUpError as exc:
+                    race.record_attempt(
+                        candidate.get("time", "?"), "failed", error=str(exc),
+                        latency_ms=round((time.perf_counter() - submit_started) * 1000, 2),
+                    )
                     msg = str(exc).lower()
                     # 2FA-related failures: stop. The user wasn't able to enter
                     # the code in time / entered wrong code. Per product spec
                     # we don't keep racing after a missed 2FA — burned hold.
                     if "booking code was not provided" in msg or "booking code timeout" in msg:
+                        race.aborted_reason = "booking_code_not_entered"
+                        stop_captcha_refresh.set()
                         _emit_event(queue, phase="confirm", stage="terminal",
                                     message=f"Booking code not entered in time on slot {candidate.get('time')}. Stopping sniper.",
                                     terminal="failed", tried_slots=tried_labels + [candidate.get('time', '?')])
+                        _flush_race()
                         queue.put({"type": "status", "status": "failed"})
                         _finalize_worker()
                         return
@@ -969,10 +1092,10 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                             try:
                                 _emit_event(queue, phase="captcha", stage="resolving",
                                             message="Captcha rejected — re-solving for retry")
-                                booking_page_url = payload.get("foreup_booking_url") or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}"
-                                captcha_token = captcha_solver.solve(booking_page_url, captcha_site_key, timeout=120)
-                                captcha_solved_at = time.monotonic()
+                                captcha_state["token"] = captcha_solver.solve(captcha_page_url, captcha_site_key, timeout=120)
+                                captcha_state["solved_at"] = time.monotonic()
                                 captcha_resolves += 1
+                                race.captcha_refreshes += 1
                                 retry_same_slot = True
                                 _emit_event(queue, phase="captcha", stage="resolved",
                                             message=f"Captcha refreshed ({captcha_resolves}/{CAPTCHA_RESOLVE_CAP}) — retrying same slot")
@@ -1004,21 +1127,28 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 time.sleep(sleep_remaining)
 
         total_ms = round((time.perf_counter() - poll_start) * 1000, 2)
+        race.total_race_ms = total_ms
+        stop_captcha_refresh.set()
 
         if booked:
             _emit_event(queue, phase="confirm", stage="booking_confirmation",
                         message="Booking confirmed", terminal="success",
                         confirmation=booking_response, slot=selected,
                         sniper_stats={"polls": poll_count, "total_ms": total_ms, "attempts": len(tried_keys) + 1})
+            _flush_race()
             queue.put({"type": "status", "status": "succeeded"})
             _finalize_worker()
             return
 
         if not selected:
+            # Distinguish "nothing was there" from "we were blocked" and from
+            # "we arrived late" — these read identically without the verdict.
             _emit_event(queue, phase="confirm", stage="terminal",
                         message=f"Sniper timed out after {poll_count} polls ({total_ms}ms) — no matching slots found"
-                                + (f". Tried {len(tried_keys)}: {', '.join(tried_labels)}" if tried_labels else ""),
+                                + (f". Tried {len(tried_keys)}: {', '.join(tried_labels)}" if tried_labels else "")
+                                + f" | {race.summary_line()}",
                         terminal="failed", tried_slots=tried_labels)
+            _flush_race()
             queue.put({"type": "status", "status": "failed"})
             _finalize_worker()
             return
@@ -1034,22 +1164,35 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     sniper_stats={"polls": poll_count, "total_ms": total_ms,
                                   "attempts": len(tried_keys) + 1,
                                   "tried_slots": tried_labels})
+        _flush_race()
         queue.put({"type": "status", "status": "succeeded"})
         _finalize_worker()
 
     except AntiBotDetectedError as exc:
+        race.error = f"antibot: {exc}"
+        race.polls.antibot += 1
         _emit_event(queue, phase="auth", stage="antibot", message=f"Anti-bot detected: {exc}", terminal="failed")
+        _flush_race()
         queue.put({"type": "status", "status": "failed"})
         _finalize_worker()
     except ForeUpError as exc:
+        race.error = str(exc)
         _emit_event(queue, phase="confirm", stage="terminal", message=f"Sniper failed: {exc}", terminal="failed")
+        _flush_race()
         queue.put({"type": "status", "status": "failed"})
         _finalize_worker()
     except Exception as exc:  # noqa: BLE001
+        race.error = f"{type(exc).__name__}: {exc}"
         _emit_event(queue, phase="confirm", stage="terminal", message=f"Sniper error: {exc}", terminal="failed")
+        _flush_race()
         queue.put({"type": "status", "status": "failed"})
         _finalize_worker()
     finally:
+        try:
+            stop_captcha_refresh.set()
+        except NameError:
+            # Race failed before the poll loop set the refresher up.
+            pass
         if captcha_solver:
             try:
                 captcha_solver.close()
@@ -1157,7 +1300,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.61"
+APP_VERSION = "0.62"
 
 @app.get("/health")
 def health() -> dict[str, str]:
