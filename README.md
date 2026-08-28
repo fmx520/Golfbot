@@ -141,7 +141,46 @@ python3 scripts/analyze_runs.py
 render logs --tail 1000 | grep GOLFBOT_RACE | python3 scripts/analyze_runs.py -
 ```
 
-### Durable storage (Supabase)
+### Durable storage (GitHub — no extra service)
+
+Race records are written straight to this repo, one file per race under
+`race-logs/YYYY/MM/` on a side branch.
+
+1. Create a **fine-grained personal access token** (GitHub → Settings →
+   Developer settings → Fine-grained tokens) scoped to this repo only, with
+   **Contents: Read and write**.
+2. Set these wherever the bot runs (Render → Environment, or `.env` locally):
+
+   ```bash
+   RACE_LOG_GITHUB_REPO=fmx520/Golfbot
+   RACE_LOG_GITHUB_TOKEN=<the token>
+   RACE_LOG_GITHUB_BRANCH=race-logs   # optional; this is the default
+   ```
+
+3. Verify before trusting it with a real race:
+
+   ```bash
+   python3 scripts/verify_race_sink.py
+   ```
+
+Then read your history any time:
+
+```bash
+git fetch origin race-logs
+git checkout origin/race-logs -- race-logs/
+python3 scripts/analyze_runs.py race-logs/
+```
+
+**The log branch must not be the branch Render deploys from.** Records are
+committed after every race, so pointing this at the deploy branch would restart
+the service each time — including, potentially, during a release window. The
+`race-logs` default is created automatically on first write and Render ignores
+it.
+
+### Durable storage (Supabase — alternative)
+
+Use this instead if you want SQL for correlation queries. Both sinks can run at
+once; each is enabled independently by its env vars.
 
 1. Create a project at [supabase.com](https://supabase.com) (free tier is ample —
    one race record is ~1-2KB).

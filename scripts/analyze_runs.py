@@ -73,11 +73,16 @@ def _load_records(argv: list[str]) -> list[dict[str, Any]]:
                 continue
         return records
 
-    log_dir = Path(os.getenv("GOLFBOT_LOG_DIR", "logs"))
+    # An explicit directory wins — this is how you read logs pulled down from
+    # the race-logs branch, which stores one file per race.
+    log_dir = Path(argv[1]) if len(argv) > 1 else Path(os.getenv("GOLFBOT_LOG_DIR", "logs"))
 
-    races_file = log_dir / "races.jsonl"
-    if races_file.exists():
-        for line in races_file.read_text(encoding="utf-8").splitlines():
+    for jsonl in sorted(log_dir.rglob("*.jsonl")):
+        try:
+            lines = jsonl.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
@@ -86,8 +91,8 @@ def _load_records(argv: list[str]) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
 
-    # Older per-run files from golfbot_cli.py and pre-JSONL races.
-    for file in sorted(log_dir.glob("run_*.json")):
+    # One-file-per-race from the GitHub sink, plus older per-run CLI files.
+    for file in sorted(log_dir.rglob("*.json")):
         try:
             records.append(json.loads(file.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
