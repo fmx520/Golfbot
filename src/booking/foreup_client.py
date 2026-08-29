@@ -37,6 +37,48 @@ class BookingLatency:
     stages: dict[str, float]
 
 
+# Keys ForeUp uses to acknowledge a reservation it actually created. Any one of
+# these carrying a truthy value is our positive signal.
+_CONFIRMATION_KEYS = (
+    "reservation_id", "TTID", "ttid", "confirmation_number",
+    "reservation_number", "confirmation", "id",
+)
+
+
+def classify_reservation_response(response: dict[str, Any]) -> tuple[Optional[bool], str]:
+    """Decide whether a 200 response actually created a reservation.
+
+    ForeUp answers a rejected booking with HTTP 200 and a failure body, so
+    `raise_for_status` alone is not evidence of a booking. Returns
+    (confirmed, reason): True on a positive signal, False on an explicit
+    failure, and None when the body is ambiguous.
+
+    None is deliberately not treated as failure. We do not know every shape a
+    successful response can take, and wrongly rejecting a real booking is worse
+    than reporting one we cannot verify — so the caller flags it for a manual
+    check rather than claiming either outcome.
+    """
+    if not isinstance(response, dict) or not response:
+        return None, "empty response body"
+
+    if response.get("success") is False:
+        return False, f"ForeUp returned success=false: {str(response)[:200]}"
+
+    for key in ("error", "errors"):
+        val = response.get(key)
+        if val:
+            return False, f"ForeUp returned {key}: {str(val)[:200]}"
+
+    for key in _CONFIRMATION_KEYS:
+        if response.get(key):
+            return True, f"{key}={response[key]}"
+
+    if "raw_body" in response:
+        return None, f"non-JSON response (HTTP {response.get('status_code')}): {str(response.get('raw_body'))[:200]}"
+
+    return None, f"no reservation identifier in response: {str(response)[:200]}"
+
+
 class ForeUpBookingClient(ForeUpDiscoveryClient):
     def __init__(self, base_url: str) -> None:
         super().__init__(base_url)

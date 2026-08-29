@@ -33,7 +33,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from src.booking.foreup_client import ForeUpBookingClient
+from src.booking.foreup_client import ForeUpBookingClient, classify_reservation_response
 from src.config import load_config
 from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
 from src.telemetry.race_log import RaceRecorder
@@ -1104,11 +1104,32 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     )
                     submit_ms = round((time.perf_counter() - submit_started) * 1000, 2)
                     race.submit_to_confirm_ms = submit_ms
-                    race.record_attempt(candidate.get("time", "?"), "confirmed", latency_ms=submit_ms)
+
+                    # A 200 from ForeUp is not proof of a booking — it answers a
+                    # rejected reservation the same way. Check the body before
+                    # telling the user they have a tee time.
+                    confirmed, reason = classify_reservation_response(booking_response)
+                    race.booking_confirmed = confirmed
+                    race.record_attempt(
+                        candidate.get("time", "?"),
+                        "confirmed" if confirmed else ("failed" if confirmed is False else "unconfirmed"),
+                        error="" if confirmed else reason,
+                        latency_ms=submit_ms,
+                        response=booking_response,
+                    )
                     race.booked = True
-                    _emit_event(queue, phase="checkout", stage="booking_submit",
-                                message="Booking confirmed",
-                                latency_ms=submit_ms)
+                    if confirmed:
+                        _emit_event(queue, phase="checkout", stage="booking_submit",
+                                    message="Booking confirmed", latency_ms=submit_ms)
+                    else:
+                        _emit_event(
+                            queue, phase="checkout", stage="booking_unconfirmed",
+                            message=(
+                                f"Submitted, but ForeUp's reply does not confirm a reservation "
+                                f"({reason}). VERIFY IN YOUR COURSE ACCOUNT before relying on this."
+                            ),
+                            latency_ms=submit_ms,
+                        )
                     booked = True
                     retry_same_slot = False
                     break
@@ -1194,7 +1215,12 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
 
         if booked:
             _emit_event(queue, phase="confirm", stage="booking_confirmation",
-                        message="Booking confirmed", terminal="success",
+                        message=(
+                            "Booking confirmed"
+                            if race.booking_confirmed
+                            else "Submitted, but NOT confirmed by ForeUp — verify in your course account."
+                        ),
+                        terminal="success" if race.booking_confirmed else "unconfirmed",
                         confirmation=booking_response, slot=selected,
                         sniper_stats={"polls": poll_count, "total_ms": total_ms, "attempts": len(tried_keys) + 1})
             _flush_race()
@@ -1363,7 +1389,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.66"
+APP_VERSION = "0.67"
 
 @app.get("/health")
 def health() -> dict[str, str]:

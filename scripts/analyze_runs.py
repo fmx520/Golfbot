@@ -27,6 +27,7 @@ LOG_DIR = Path("logs")
 
 # Ordered worst-first: the top non-zero bucket is where to spend effort.
 OUTCOME_ORDER = [
+    "unconfirmed",
     "late_start",
     "blocked",
     "lost_at_submit",
@@ -38,6 +39,8 @@ OUTCOME_ORDER = [
 ]
 
 NEXT_STEP = {
+    "unconfirmed": "Submitted but ForeUp did not confirm a reservation. Check the "
+                   "attempts[].response field on those rows and verify the account.",
     "late_start": "Arming path is overrunning the release. Raise SNIPER_PREWARM_LEAD_SECONDS.",
     "blocked": "ForeUp is rejecting polls. Back off the poll rate before tuning anything else.",
     "lost_at_submit": "Detection is fine; time is being lost between detect and confirm.",

@@ -48,6 +48,7 @@ LATE_START_THRESHOLD_MS = 250.0
 # Outcome taxonomy. Ordered loosely from best to worst so a human scanning a
 # pile of runs can sort by it.
 OUTCOME_WON = "won"
+OUTCOME_UNCONFIRMED = "unconfirmed"
 OUTCOME_FOUND_NOT_BOOKED = "found_not_booked"
 OUTCOME_LOST_AT_SUBMIT = "lost_at_submit"
 OUTCOME_NEVER_SAW_SLOT = "never_saw_slot"
@@ -58,6 +59,11 @@ OUTCOME_ERROR = "error"
 
 _REASONS = {
     OUTCOME_WON: "Booked.",
+    OUTCOME_UNCONFIRMED: (
+        "The booking was submitted and ForeUp answered 200, but the response "
+        "carried no reservation we could identify. Check the course account "
+        "before assuming you have the tee time."
+    ),
     OUTCOME_FOUND_NOT_BOOKED: "Slot found but auto-book was off — nothing was submitted.",
     OUTCOME_LOST_AT_SUBMIT: (
         "We saw the slot and lost it during submit. The race is being lost "
@@ -222,6 +228,9 @@ class RaceRecorder:
     captcha_stale_at_submit: bool = False
 
     booked: bool = False
+    # None until a booking is attempted; False when ForeUp answered 200 without
+    # anything identifying a reservation.
+    booking_confirmed: Optional[bool] = None
     auto_book: bool = False
     aborted_reason: str = ""
     error: str = ""
@@ -260,23 +269,39 @@ class RaceRecorder:
             return
         self.first_slot_seen_offset_ms = round((at_monotonic - self._release_monotonic) * 1000, 2)
 
-    def record_attempt(self, slot_time: str, result: str, error: str = "", latency_ms: Optional[float] = None) -> None:
-        self.attempts.append(
-            {
-                "slot_time": slot_time,
-                "result": result,
-                "error": error[:300],
-                "latency_ms": round(latency_ms, 2) if latency_ms is not None else None,
-                "at": _now_iso(),
-            }
-        )
+    def record_attempt(
+        self,
+        slot_time: str,
+        result: str,
+        error: str = "",
+        latency_ms: Optional[float] = None,
+        response: Any = None,
+    ) -> None:
+        """Record one booking attempt.
+
+        `response` is what ForeUp actually sent back. It previously lived only
+        in an in-memory event log that died with the container, so a booking
+        that reported success but never appeared in the account left no evidence
+        at all. It rides inside `attempts` (already jsonb) so no schema change
+        is needed.
+        """
+        entry: dict[str, Any] = {
+            "slot_time": slot_time,
+            "result": result,
+            "error": error[:300],
+            "latency_ms": round(latency_ms, 2) if latency_ms is not None else None,
+            "at": _now_iso(),
+        }
+        if response is not None:
+            entry["response"] = str(response)[:2000]
+        self.attempts.append(entry)
 
     # ------------------------------------------------------------------
     # classification
     # ------------------------------------------------------------------
     def classify(self) -> str:
         if self.booked:
-            return OUTCOME_WON
+            return OUTCOME_WON if self.booking_confirmed else OUTCOME_UNCONFIRMED
         if self.error:
             return OUTCOME_ERROR
         if self.aborted_reason:
@@ -335,8 +360,9 @@ class RaceRecorder:
             "release_at": self.release_at,
             "outcome": self.classify(),
             "summary": self.summary_line(),
-            # analyze_runs.py compatibility
-            "success": self.booked,
+            # Submitted-but-unverified must not count as a win, or any
+            # success-rate query silently inflates.
+            "success": bool(self.booked and self.booking_confirmed),
             "timing": {
                 "rewarm_ms": self.rewarm_ms,
                 "rewarm_overran_release": self.rewarm_overran_release if timed else None,
