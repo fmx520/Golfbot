@@ -39,8 +39,10 @@ class BookingLatency:
 
 # Keys ForeUp uses to acknowledge a reservation it actually created. Any one of
 # these carrying a truthy value is our positive signal.
+# Confirmed against a real Montauk booking, whose response carried both
+# "TTID" and "teetime_id".
 _CONFIRMATION_KEYS = (
-    "reservation_id", "TTID", "ttid", "confirmation_number",
+    "reservation_id", "TTID", "ttid", "teetime_id", "confirmation_number",
     "reservation_number", "confirmation", "id",
 )
 
@@ -91,8 +93,17 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         *,
         pending_reservation_id: str,
         request_id: Optional[str] = None,
-    ) -> None:
-        """Keep a pending reservation hold alive. Browser polls this every ~10s."""
+    ) -> Optional[str]:
+        """Keep a pending reservation hold alive. Browser polls this every ~10s.
+
+        Returns None on success, or the error string on failure. Still best
+        effort — the caller must not raise — but the outcome is no longer
+        thrown away. A hold that dies mid-2FA looks exactly like a hold that
+        survived, and that ambiguity cost us a diagnosis.
+
+        Runs on a background thread during the code wait, never on the booking
+        path, so returning a value costs nothing.
+        """
         req_id = request_id or str(uuid.uuid4())
         path = f"/index.php/api/booking/refresh_pending_reservation/{pending_reservation_id}"
         try:
@@ -103,9 +114,9 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                 retry_safe=False,
                 content=b"",
             )
-        except ForeUpError:
-            # Refresh is best-effort — don't crash the booking flow
-            pass
+            return None
+        except ForeUpError as exc:
+            return str(exc)[:300]
 
     def request_booking_code(
         self,

@@ -929,11 +929,31 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             if cmd_queue is None:
                 raise ForeUpError("No command queue available to receive booking code")
             stop_refresh = Event()
+            race.two_factor_triggered = True
+            code_wait_started = time.perf_counter()
 
             def _refresh_loop() -> None:
+                # Background thread for the duration of the code wait — never on
+                # the booking path, so recording outcomes here costs no latency.
                 while not stop_refresh.wait(8.0):
-                    if booking is not None:
-                        booking.refresh_pending_reservation(pending_reservation_id=ttid, request_id=request_id)
+                    if booking is None:
+                        continue
+                    err = booking.refresh_pending_reservation(
+                        pending_reservation_id=ttid, request_id=request_id
+                    )
+                    if err:
+                        race.hold_refresh_failed += 1
+                        if not race.hold_refresh_first_error:
+                            race.hold_refresh_first_error = err
+                            _emit_event(
+                                queue, phase="verify", stage="hold_refresh_failed",
+                                message=(
+                                    f"Hold keepalive is FAILING while waiting for the code "
+                                    f"({err}). The reservation may already be gone."
+                                ),
+                            )
+                    else:
+                        race.hold_refresh_ok += 1
 
             refresher = Thread(target=_refresh_loop, daemon=True)
             refresher.start()
@@ -941,8 +961,10 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 cmd = cmd_queue.get(timeout=300)
             except Empty:
                 stop_refresh.set()
+                race.code_wait_ms = round((time.perf_counter() - code_wait_started) * 1000, 2)
                 raise ForeUpError("Booking code timeout — no code received within 5 minutes")
             stop_refresh.set()
+            race.code_wait_ms = round((time.perf_counter() - code_wait_started) * 1000, 2)
             if isinstance(cmd, dict) and cmd.get("type") == "cancel":
                 raise ForeUpError("Stopped by user while awaiting the booking code")
             code = cmd.get("code", "")
@@ -1389,7 +1411,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.67"
+APP_VERSION = "0.68"
 
 @app.get("/health")
 def health() -> dict[str, str]:

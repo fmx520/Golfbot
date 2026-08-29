@@ -223,6 +223,16 @@ class RaceRecorder:
     polls: PollStats = field(default_factory=PollStats)
     attempts: list[dict[str, Any]] = field(default_factory=list)
 
+    # 2FA / hold-keepalive evidence. Populated only when the booking-code path
+    # fires. hold_refresh_failed distinguishes "the hold died while the user
+    # fetched the code" from "the hold was fine and something else rejected us"
+    # — two different bugs that look identical without it.
+    two_factor_triggered: bool = False
+    code_wait_ms: Optional[float] = None
+    hold_refresh_ok: int = 0
+    hold_refresh_failed: int = 0
+    hold_refresh_first_error: str = ""
+
     captcha_solves: int = 0
     captcha_refreshes: int = 0
     captcha_stale_at_submit: bool = False
@@ -335,6 +345,13 @@ class RaceRecorder:
             bits.append(f"{self.polls.antibot} anti-bot")
         if self.attempts:
             bits.append(f"{len(self.attempts)} submit attempts")
+        if self.two_factor_triggered:
+            bits.append(f"2FA code entered in {(self.code_wait_ms or 0) / 1000:.0f}s")
+        if self.hold_refresh_failed:
+            bits.append(
+                f"HOLD REFRESH FAILED {self.hold_refresh_failed}/"
+                f"{self.hold_refresh_failed + self.hold_refresh_ok}"
+            )
         detail = " | ".join(bits)
         return f"{outcome.upper()}: {reason}" + (f" [{detail}]" if detail else "")
 
@@ -374,6 +391,13 @@ class RaceRecorder:
             },
             "polls": self.polls.as_dict(),
             "attempts": self.attempts,
+            "two_factor": {
+                "triggered": self.two_factor_triggered,
+                "code_wait_ms": self.code_wait_ms,
+                "hold_refresh_ok": self.hold_refresh_ok,
+                "hold_refresh_failed": self.hold_refresh_failed,
+                "hold_refresh_first_error": self.hold_refresh_first_error,
+            },
             "captcha": {
                 "solves": self.captcha_solves,
                 "refreshes": self.captcha_refreshes,
