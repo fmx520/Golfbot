@@ -192,6 +192,57 @@ def _claim_peer_ordinal(job_id: str, key: tuple) -> tuple[int, int]:
     return ordinal, len(peers) + 1
 
 
+def _hhmm_to_min(value: str) -> int | None:
+    """'07:06' -> 426. Tolerates a leading date and returns None on junk."""
+    text = (value or "").strip()
+    if " " in text:
+        text = text.split(" ", 1)[1]
+    parts = text.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]) * 60 + int(parts[1])
+    except ValueError:
+        return None
+
+
+def _sample_covers(first: str, last: str, start: str, end: str) -> bool:
+    """Did an observed sample actually span the hours we intend to fire into?
+
+    A tee sheet is not guaranteed to run one interval all day. Bethpage Red
+    runs 9 minutes at twilight and 10 in the morning, so a reference day whose
+    only open times were 17:00-18:21 yields a perfectly self-consistent
+    9-minute grid that is simply wrong about 7am. Extrapolating across that
+    boundary is how we came to fire at 07:06 and 07:15 into a 10-minute sheet,
+    where those times do not exist at all and ForeUp answers 400.
+    """
+    lo, hi = _hhmm_to_min(first), _hhmm_to_min(last)
+    ws, we = _hhmm_to_min(start), _hhmm_to_min(end)
+    if None in (lo, hi, ws, we):
+        return False
+    return lo <= we and ws <= hi
+
+
+def _template_near(slots: list[dict[str, Any]], when: str) -> dict[str, Any]:
+    """Payload template from the observed slot closest in time to `when`.
+
+    green_fee and the side/class ids ride on the individual slot and are not
+    constant across a day -- a twilight slot carries a twilight price. Taking
+    the sheet's first slot meant a morning hold could go out describing itself
+    as a 5pm twilight round, which is its own way to be rejected.
+    """
+    target = _hhmm_to_min(when)
+    best, best_gap = {}, None
+    for slot in slots:
+        minutes = _hhmm_to_min(slot.get("time", ""))
+        if minutes is None:
+            continue
+        gap = abs(minutes - target) if target is not None else 0
+        if best_gap is None or gap < best_gap:
+            best, best_gap = (slot.get("raw") or {}), gap
+    return best
+
+
 def _rotate(items: list[Any], ordinal: int) -> list[Any]:
     """Rotate a preference list so concurrent jobs open on different slots.
 
@@ -1025,6 +1076,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
 
             ref_slots: list[dict[str, Any]] = []
             ref_date = ""
+            template: dict[str, Any] = {}
             for cand in ref_candidates:
                 try:
                     found = discovery.lookup_availability(
@@ -1039,31 +1091,82 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     ref_slots, ref_date = found, cand
                     break
 
-            template = (ref_slots[0].get("raw") or {}) if ref_slots else {}
+            template_seed = (ref_slots[0].get("raw") or {}) if ref_slots else {}
             ref_grid = analyze_teesheet_grid(sl.get("time", "") for sl in ref_slots)
             play_dow = play_dt.weekday()
+            win_start, win_end = payload["time_start"], payload["time_end"]
 
+            # Bank a good live read whether or not we end up aiming with it.
             if ref_grid.interval_minutes and ref_grid.consistent:
-                # Live read worked — validate, and bank what we learned so the
-                # next arm can survive a booked-out reference day.
                 grid_store.upsert_grid(course_id=str(ps_course), day_of_week=play_dow,
-                                       grid=ref_grid.as_dict(), template=template,
+                                       grid=ref_grid.as_dict(), template=template_seed,
                                        source_date=ref_date)
+
+            stored = grid_store.fetch_grid(course_id=str(ps_course), day_of_week=play_dow)
+
+            # ---- Pick which grid to aim with. ----
+            # The live read used to win unconditionally, so an 8-slot twilight
+            # sample beat a 40-observation grid learned from the real released
+            # sheet. Choose on evidence instead: a sample that covers the hours
+            # we are firing into beats one that does not, and more observations
+            # break the tie.
+            cands: list[dict[str, Any]] = []
+            if ref_grid.interval_minutes and ref_grid.consistent:
+                cands.append({
+                    "interval": int(ref_grid.interval_minutes),
+                    "phase": (_hhmm_to_min(ref_grid.first_time) or 0) % int(ref_grid.interval_minutes),
+                    "first": ref_grid.first_time, "last": ref_grid.last_time,
+                    "seen": ref_grid.observed_count, "template": template_seed,
+                    "label": f"the {ref_grid.interval_minutes}-minute grid read live from {ref_date}",
+                })
+            if stored and stored.get("interval_minutes") and stored.get("anchor_phase") is not None:
+                cands.append({
+                    "interval": int(stored["interval_minutes"]),
+                    "phase": int(stored["anchor_phase"]),
+                    "first": stored.get("first_time", ""), "last": stored.get("last_time", ""),
+                    "seen": int(stored.get("observed_count") or 0),
+                    "template": stored.get("template") or {},
+                    "label": f"the remembered {stored['interval_minutes']}-minute grid "
+                             f"({grid_store.parse_hhmm_row(stored)})",
+                })
+
+            for c in cands:
+                c["covers"] = _sample_covers(c["first"], c["last"], win_start, win_end)
+            cands.sort(key=lambda c: (c["covers"], c["seen"]), reverse=True)
+            chosen = cands[0] if cands else None
+
+            if chosen and not chosen["covers"]:
+                # Every sample we have is from a different part of the day. The
+                # interval may well be the same, but tonight proved it need not
+                # be, and a wrong grid does not lose gracefully: all six holds
+                # come back 400 and the burst delays the polling that would
+                # have worked.
+                _emit_event(queue, phase="sniper", stage="prestage_grid",
+                            message=f"Future Sight: the only tee times we could see run "
+                                    f"{chosen['first']}–{chosen['last']}, which does not cover your "
+                                    f"{win_start}–{win_end} window. Courses can change interval "
+                                    f"between morning and twilight, so aiming there would be a guess — "
+                                    f"and a wrong guess is rejected outright, not narrowly lost. "
+                                    f"Running as Sniper (polling) instead. Once a release in this "
+                                    f"window is polled, the real grid is banked and this works.")
+                chosen = None
+                fs_enabled = False
+                raw_targets = []
+
+            if chosen:
+                template = chosen["template"]
                 if fs_enabled and not raw_targets:
-                    hh, mm = ref_grid.first_time.split(":")[:2]
-                    phase = (int(hh) * 60 + int(mm)) % ref_grid.interval_minutes
-                    raw_targets = _gen_targets(ref_grid.interval_minutes, phase)
+                    raw_targets = _gen_targets(chosen["interval"], chosen["phase"])
                     if not raw_targets:
                         _emit_event(queue, phase="sniper", stage="prestage_window",
-                                    message=f"Future Sight: no tee times on the {ref_grid.interval_minutes}-minute "
-                                            f"grid fall inside your {payload['time_start']}–{payload['time_end']} "
-                                            f"window — widen it. Falling back to pure polling.")
-                off = [t for t in raw_targets if not ref_grid.matches_interval(t)]
+                                    message=f"Future Sight: no tee times on {chosen['label']} fall inside "
+                                            f"your {win_start}–{win_end} window — widen it. Falling back "
+                                            f"to pure polling.")
+                off = [t for t in raw_targets
+                       if (_hhmm_to_min(t) or 0) % chosen["interval"] != chosen["phase"] % chosen["interval"]]
                 if off:
-                    near = ", ".join(ref_grid.grid_times[:4])
                     _emit_event(queue, phase="confirm", stage="terminal",
-                                message=f"Future Sight: {', '.join(off)} not on this course's "
-                                        f"{ref_grid.interval_minutes}-minute grid (e.g. {near}...). "
+                                message=f"Future Sight: {', '.join(off)} are not on {chosen['label']}. "
                                         f"These times do not exist on the sheet — fix the targets and re-arm.",
                                 terminal="failed")
                     _flush_race()
@@ -1071,58 +1174,27 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     _finalize_worker()
                     return
                 if raw_targets:
-                    same_dow = ref_date and datetime.strptime(ref_date, "%Y-%m-%d").date().weekday() == play_dow
+                    # Price and side ids vary across the day; take them from the
+                    # observed slot nearest what we are actually going to fire at.
+                    if ref_slots:
+                        near = _template_near(ref_slots, raw_targets[0])
+                        if near:
+                            template = near
                     _emit_event(queue, phase="sniper", stage="prestage_armed",
                                 message=f"Future Sight armed: {', '.join(raw_targets)} on course {ps_course} — "
-                                        f"validated against the {ref_grid.interval_minutes}-minute grid from "
-                                        f"{ref_date}{' (same weekday as the target)' if same_dow else ''}. "
+                                        f"validated against {chosen['label']}, which covers "
+                                        f"{chosen['first']}–{chosen['last']} ({chosen['seen']} times seen). "
                                         f"Holds fire at the release instant, before polling.")
-            else:
-                # No usable live read — fall back to the registry.
-                stored = grid_store.fetch_grid(course_id=str(ps_course), day_of_week=play_dow)
-                if stored and stored.get("interval_minutes"):
-                    if fs_enabled and not raw_targets and stored.get("anchor_phase") is not None:
-                        raw_targets = _gen_targets(int(stored["interval_minutes"]), int(stored["anchor_phase"]))
-                        if not raw_targets:
-                            _emit_event(queue, phase="sniper", stage="prestage_window",
-                                        message=f"Future Sight: no tee times on the stored grid fall inside "
-                                                f"your {payload['time_start']}–{payload['time_end']} window — "
-                                                f"widen it. Falling back to pure polling.")
-                    off = [t for t in raw_targets if grid_store.matches_stored_grid(t, stored) is False]
-                    if off:
-                        _emit_event(queue, phase="confirm", stage="terminal",
-                                    message=f"Future Sight: {', '.join(off)} not on the stored grid for this "
-                                            f"course/day ({grid_store.parse_hhmm_row(stored)}). Fix the targets "
-                                            f"and re-arm.",
-                                    terminal="failed")
-                        _flush_race()
-                        queue.put({"type": "status", "status": "failed"})
-                        _finalize_worker()
-                        return
-                    if not template:
-                        template = stored.get("template") or {}
-                    if raw_targets:
-                        _emit_event(queue, phase="sniper", stage="prestage_armed",
-                                    message=f"Future Sight armed: {', '.join(raw_targets)} — from the stored "
-                                            f"registry ({grid_store.parse_hhmm_row(stored)}). No live reference "
-                                            f"sheet was readable, so remembered data was used.")
-                else:
-                    if fs_enabled and not raw_targets:
-                        _emit_event(queue, phase="sniper", stage="prestage_grid",
-                                    message=f"Future Sight: no live reference sheet and nothing stored for "
-                                            f"this course/day yet, so targets cannot be derived. Falling "
-                                            f"back to pure polling. To teach it this course, press "
-                                            f"\u201cShow this course\u2019s tee grid\u201d for a date whose sheet is "
-                                            f"already published and has plenty of open times — the booking "
-                                            f"API only returns OPEN slots, so a nearly full day hides the "
-                                            f"real interval. Any release this bot polls also gets banked "
-                                            f"automatically.")
-                    else:
-                        _emit_event(queue, phase="sniper", stage="prestage_grid",
-                                    message=f"Future Sight: no live reference sheet "
-                                            f"({'; '.join(ref_grid.notes) or 'no data'}) and nothing stored for "
-                                            f"this course/day yet. Proceeding with unvalidated targets — "
-                                            f"polling remains the fallback.")
+            elif fs_enabled and not raw_targets:
+                _emit_event(queue, phase="sniper", stage="prestage_grid",
+                            message=f"Future Sight: no live reference sheet and nothing stored for "
+                                    f"this course/day yet, so targets cannot be derived. Falling "
+                                    f"back to pure polling. To teach it this course, press "
+                                    f"\u201cShow this course\u2019s tee grid\u201d for a date whose sheet is "
+                                    f"already published and has plenty of open times — the booking "
+                                    f"API only returns OPEN slots, so a nearly full day hides the "
+                                    f"real interval. Any release this bot polls also gets banked "
+                                    f"automatically.")
 
             if raw_targets:
                 ordinal = int(payload.get("peer_ordinal") or 0)
@@ -1945,7 +2017,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.85"
+APP_VERSION = "0.86"
 
 @app.get("/health")
 def health() -> dict[str, str]:
