@@ -517,6 +517,96 @@ function updateDateRange() {
 }
 
 // Verification code form
+// --- Pre-stage probe (experimental) -------------------------------------
+// Shared inputs for both probe steps, read from the main form.
+function probeBase() {
+  return {
+    username: $('username').value.trim(),
+    password: $('password').value.trim(),
+    foreup_booking_url: $('bookingUrl').value.trim(),
+    schedule_id: S.scheduleId || $('scheduleId').value.trim(),
+    course_id: S.courseId || $('courseId').value.trim(),
+    play_date: $('playDate').value,
+    players: parseInt($('players').value),
+    holes: parseInt($('holes').value),
+    booking_class: $('bookingClass').value,
+  };
+}
+
+function probeLog(html) {
+  const out = $('probeOut');
+  out.classList.remove('hidden');
+  out.innerHTML = html;
+}
+
+async function showTeeGrid() {
+  const btn = $('gridBtn');
+  btn.disabled = true;
+  btn.textContent = 'Reading teesheet...';
+  try {
+    const g = await api('/teesheet-grid', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(probeBase()),
+    });
+
+    // Offer every real tee time, not just the currently-open ones: at a
+    // release everything is open, so booked-now times are valid targets.
+    const sel = $('probeTime');
+    const open = new Set(g.open_times.map(t => (t.includes(' ') ? t.split(' ')[1] : t).slice(0, 5)));
+    sel.innerHTML = g.grid_times.map(t =>
+      `<option value="${esc(t)}">${esc(t)}${open.has(t) ? ' (open now)' : ' (booked now)'}</option>`
+    ).join('') || '<option value="">no grid found</option>';
+    $('probeBtn').disabled = g.grid_times.length === 0;
+
+    let html = `<strong>Interval:</strong> ${g.interval_minutes}min &nbsp; `
+             + `<strong>Range:</strong> ${esc(g.first_time)}–${esc(g.last_time)}<br>`
+             + `<strong>Confidence:</strong> ${esc(g.confidence)} `
+             + `(${g.observed_count} open now, ${g.grid_count} real tee times)<br>`
+             + `<strong>Usable for pre-staging:</strong> ${g.usable_for_prestage ? 'yes' : 'NO'}`;
+    if (g.notes && g.notes.length) {
+      html += '<br><br>' + g.notes.map(n => '&bull; ' + esc(n)).join('<br>');
+    }
+    probeLog(html);
+  } catch (e) {
+    probeLog('<strong>Failed:</strong> ' + esc(e.message));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "1. Show this course's tee grid";
+  }
+}
+
+async function fireColdHoldProbe() {
+  const target = $('probeTime').value;
+  if (!target) return;
+  if (!confirm(
+    `Fire a real hold on ${target}?\n\n`
+    + 'Nothing gets booked, but if ForeUp accepts, that tee time is locked to '
+    + 'your account for about 2 minutes before it releases itself.'
+  )) return;
+
+  const btn = $('probeBtn');
+  btn.disabled = true;
+  btn.textContent = 'Firing...';
+  try {
+    const r = await api('/probe/cold-hold', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...probeBase(), target_time: target }),
+    });
+    let html = r.steps.map(x => '&bull; ' + esc(x)).join('<br>')
+             + `<br><br><strong>${r.accepted ? 'ACCEPTED' : 'REJECTED'}</strong> `
+             + `in ${r.latency_ms}ms<br>${esc(r.verdict)}`;
+    if (r.error) html += '<br><br><strong>ForeUp said:</strong><br>' + esc(r.error);
+    probeLog(html);
+  } catch (e) {
+    probeLog('<strong>Refused:</strong> ' + esc(e.message));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '2. Fire cold-hold probe';
+  }
+}
+
 async function stopJob() {
   if (!S.jobId) return;
   const btn = $('stopBtn');
@@ -607,6 +697,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('connectBtn').addEventListener('click', connect);
   $('searchBtn').addEventListener('click', searchTeeTimes);
   $('stopBtn').addEventListener('click', stopJob);
+  $('gridBtn').addEventListener('click', showTeeGrid);
+  $('probeBtn').addEventListener('click', fireColdHoldProbe);
   $('sniperMode').addEventListener('change', toggleSniperMode);
   $('snipeNow').addEventListener('change', toggleSnipeNow);
   $('autoBook').addEventListener('change', toggleCaptchaKey);

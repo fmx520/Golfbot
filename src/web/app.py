@@ -1450,7 +1450,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.69"
+APP_VERSION = "0.70"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -1592,6 +1592,118 @@ def teesheet_grid(req: GridRequest) -> dict[str, Any]:
     result["usable_for_prestage"] = bool(
         grid.consistent and grid.confidence in ("medium", "high")
     )
+    return result
+
+
+class ColdHoldProbeRequest(GridRequest):
+    """A cold-hold probe. target_time must be a real time on the course grid."""
+    target_time: str
+    skip_grid_check: bool = False
+
+
+@app.post("/api/probe/cold-hold")
+def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
+    """Test whether ForeUp will hold a tee time with no preceding poll.
+
+    This is the pre-staging experiment. It creates a hold and stops — it never
+    touches the reservations endpoint, so it cannot book. A successful hold is
+    real though: that time is locked to this account until it expires (~2 min).
+    Probe a slot you do not mind briefly holding.
+
+    The target is validated against the inferred grid first, because a hold at a
+    time the course does not offer would fail for that reason alone and tell us
+    nothing about whether pre-staging works.
+    """
+    default_base_url = os.getenv("FOREUP_BASE_URL", "https://foreupsoftware.com")
+    base_url, schedule_id, course_id = _extract_foreup_target(
+        req.foreup_booking_url,
+        fallback_base_url=default_base_url,
+        fallback_schedule_id=req.schedule_id or os.getenv("FOREUP_SCHEDULE_ID", ""),
+        fallback_course_id=req.course_id or os.getenv("FOREUP_COURSE_ID", ""),
+    )
+    if not schedule_id:
+        raise HTTPException(status_code=400, detail="No schedule_id — pass a ForeUp booking URL.")
+
+    username = req.username or os.getenv("FOREUP_USERNAME", "")
+    password = req.password or os.getenv("FOREUP_PASSWORD", "")
+    if not (username and password):
+        raise HTTPException(status_code=400, detail="Credentials required to hold a tee time.")
+
+    discovery = ForeUpDiscoveryClient(base_url=base_url)
+    booking = ForeUpBookingClient(base_url=base_url)
+    steps: list[str] = []
+
+    try:
+        discovery.bootstrap_session(
+            username=username, password=password,
+            schedule_id=schedule_id, course_id=course_id,
+        )
+        steps.append("logged in")
+
+        booking_class = req.booking_class
+        if hasattr(discovery, "resolve_booking_class") and course_id:
+            booking_class = discovery.resolve_booking_class(course_id, req.booking_class)
+        steps.append(f"booking class resolved ({booking_class or 'default'})")
+
+        # Learn the grid, and borrow the per-course payload fields from any open
+        # slot. These (side id, fee shape) are stable for a course, so at a real
+        # release they would come from cache rather than a live poll.
+        slots = discovery.lookup_availability(
+            schedule_id=course_id or schedule_id, date=req.play_date,
+            players=req.players, holes=req.holes, booking_class=booking_class,
+        )
+        grid = analyze_teesheet_grid(sl.get("time", "") for sl in slots)
+        steps.append(
+            f"grid inferred: {grid.interval_minutes}min, "
+            f"{len(grid.grid_times)} times, confidence={grid.confidence}"
+        )
+
+        if not req.skip_grid_check:
+            if not grid.consistent:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Refusing to probe: the sheet is not on a uniform grid "
+                        f"({'; '.join(grid.notes)}). Pass skip_grid_check to override."
+                    ),
+                )
+            if not grid.is_valid_target(req.target_time):
+                nearby = [t for t in grid.grid_times if t >= req.target_time][:3]
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{req.target_time} is not on this course's "
+                        f"{grid.interval_minutes}min grid. Nearest real times: "
+                        f"{', '.join(nearby) or 'none after that time'}."
+                    ),
+                )
+        steps.append(f"{req.target_time} confirmed on the grid")
+
+        # Carry the shared per-course fields; deliberately NOT the target slot's
+        # own polled data, since at a release that would not exist yet.
+        template = (slots[0].get("raw") or {}) if slots else {}
+        result = booking.probe_cold_hold(
+            target_time=f"{req.play_date} {req.target_time}",
+            schedule_id=str(course_id or schedule_id),
+            course_id=str(schedule_id),
+            players=req.players,
+            holes=req.holes,
+            booking_class_id=str(template.get("booking_class_id", booking_class or "")),
+            teesheet_side_id=str(template.get("teesheet_side_id", "")),
+            green_fee=template.get("green_fee", 0),
+        )
+    except HTTPException:
+        raise
+    except AntiBotDetectedError as exc:
+        raise HTTPException(status_code=502, detail=f"Anti-bot response: {exc}")
+    except ForeUpError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    result["steps"] = steps
+    result["target_time"] = req.target_time
+    result["play_date"] = req.play_date
+    result["grid"] = grid.as_dict()
+    result["booked_anything"] = False
     return result
 
 

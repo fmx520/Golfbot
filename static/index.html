@@ -195,6 +195,25 @@
       <button class="btn btn-primary btn-block" id="searchBtn">Search Tee Times</button>
       <button class="btn btn-danger btn-block mt-1 hidden" id="stopBtn">Stop</button>
 
+      <div class="card mt-2">
+        <div class="card-title">Pre-stage probe (experimental)</div>
+        <div class="form-help">
+          Tests whether ForeUp will hold a tee time <em>without</em> polling for it first.
+          If it works, a release can be raced by firing the hold directly at T+0 instead of
+          waiting on a 100&ndash;500ms discovery round trip. Uses the date, players, holes and
+          booking class above. <strong>Never books anything</strong> &mdash; but a successful hold
+          is real and releases itself after ~2 minutes, so pick a time you don't mind briefly
+          holding.
+        </div>
+        <button class="btn btn-secondary btn-block mt-1" id="gridBtn">1. Show this course's tee grid</button>
+        <div class="form-group mt-1">
+          <label for="probeTime">Target time (must be on the grid)</label>
+          <select id="probeTime"><option value="">&mdash; run step 1 first &mdash;</option></select>
+        </div>
+        <button class="btn btn-secondary btn-block" id="probeBtn" disabled>2. Fire cold-hold probe</button>
+        <div class="event-log mt-1 hidden" id="probeOut"></div>
+      </div>
+
       <div class="mt-2" id="eventLogContainer" class="hidden">
         <div class="card">
           <div class="card-title">Job Progress</div>

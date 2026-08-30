@@ -314,6 +314,95 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             self._log_flow(req_id, flow_started, None, stage_latencies, "error")
             raise
 
+    def probe_cold_hold(
+        self,
+        *,
+        target_time: str,
+        schedule_id: str,
+        course_id: str,
+        players: int,
+        holes: int = 18,
+        booking_class_id: str = "",
+        teesheet_side_id: str = "",
+        green_fee: Any = 0,
+        request_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Try to hold a tee time WITHOUT a preceding availability poll.
+
+        This is the experiment behind pre-staging. Today the bot must poll, see
+        a slot, then hold it — and that poll round trip (104-514ms observed) is
+        the entire margin we lose by: ForeUp has told us a slot was gone 154ms
+        after we saw it. If a hold can be fired from configuration alone, that
+        round trip leaves the critical path.
+
+        This ONLY creates the hold. It never calls the reservations endpoint, so
+        it cannot book anything. A successful hold is real, though — the time is
+        locked to this account until it expires (~2 min), so probe a slot you do
+        not mind briefly holding.
+
+        Returns a verdict dict rather than raising: a rejection is the useful
+        result here, because ForeUp's 400s name the field they wanted.
+        """
+        req_id = request_id or str(uuid.uuid4())
+        payload = {
+            "time": target_time,
+            "holes": holes,
+            "players": players,
+            "carts": "false",
+            "schedule_id": int(schedule_id),
+            "teesheet_side_id": teesheet_side_id,
+            "course_id": int(course_id or schedule_id),
+            "booking_class_id": booking_class_id,
+            "duration": 1,
+            "foreup_discount": "false",
+            "foreup_trade_discount_rate": 0,
+            "trade_min_players": 0,
+            "cart_fee": 0,
+            "cart_fee_tax": 0,
+            "green_fee": green_fee,
+            "green_fee_tax": 0,
+        }
+
+        started = time.perf_counter()
+        try:
+            resp = self._request(
+                "POST",
+                FOREUP_PENDING_RESERVATION_PATH,
+                stage="probe_cold_hold",
+                request_id=req_id,
+                retry_safe=False,
+                data=payload,
+            )
+        except ForeUpError as exc:
+            return {
+                "accepted": False,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                "error": str(exc)[:1000],
+                "payload_sent": payload,
+                "verdict": "REJECTED — see error for the field ForeUp wanted.",
+            }
+
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw_body": resp.text[:1000], "status_code": resp.status_code}
+
+        held_id = body.get("reservation_id", "") if isinstance(body, dict) else ""
+        return {
+            "accepted": bool(held_id),
+            "latency_ms": latency_ms,
+            "reservation_id": held_id,
+            "response": body,
+            "payload_sent": payload,
+            "verdict": (
+                f"ACCEPTED in {latency_ms:.0f}ms — pre-staging works. This hold is "
+                f"REAL and expires on its own in ~2 min; nothing was booked."
+                if held_id else
+                "Returned 200 but no reservation_id — inconclusive, read the response."
+            ),
+        }
+
     def submit_booking_code(
         self,
         *,
