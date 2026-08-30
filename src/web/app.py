@@ -811,6 +811,21 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         # because we sleep off the remainder anyway.
         prewarm_lead = float(os.getenv("SNIPER_PREWARM_LEAD_SECONDS", "12"))
         wait_seconds = max(0, seconds_until - prewarm_lead)
+
+        # If there is no waiting to do, the session was bootstrapped moments ago
+        # and re-logging in buys nothing — but it costs 2-5s against ForeUp,
+        # which last night pushed one race 5.2s past the release. On time with a
+        # seconds-old session beats freshly logged in and late.
+        skip_rewarm = wait_seconds <= 0
+        if skip_rewarm and release_time_str and seconds_until > 0:
+            _emit_event(queue, phase="sniper", stage="armed_late_warning",
+                        message=(
+                            f"Armed only {int(seconds_until)}s before the release — inside the "
+                            f"{prewarm_lead:.0f}s pre-warm window. Skipping the session re-warm "
+                            f"(login is still fresh from job start) so polling begins on time. "
+                            f"Arm at least {prewarm_lead:.0f}s early next time."
+                        ))
+
         if wait_seconds > 0:
             sleep_chunk = 2.0
             slept = 0.0
@@ -849,7 +864,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         race.mark_release_instant(release_monotonic)
 
         rewarm_started = time.perf_counter()
-        if username and password:
+        if username and password and not skip_rewarm:
             discovery.refresh_session(
                 schedule_id=resolved_schedule_id, course_id=resolved_course_id,
                 username=username, password=password, request_id=request_id,
@@ -1263,6 +1278,29 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             _finalize_worker()
             return
 
+        # Reaching here un-booked with auto-book ON means every attempt failed —
+        # usually ForeUp answering "time not available" faster than we can hold
+        # it. Telling the user "SLOT FOUND — book it now!" at that point sends
+        # them chasing a tee time that is already gone. Alert mode (auto-book
+        # off / dry run) is the only case where the alert is the product.
+        if do_auto_book:
+            loss_msg = f"Lost the race — tried {len(tried_keys) or 1} slot(s)"
+            if tried_labels:
+                loss_msg += f" ({', '.join(tried_labels)})"
+            loss_msg += (
+                ", each taken before our hold landed. "
+                f"{poll_count} polls in {total_ms:.0f}ms. | {race.summary_line()}"
+            )
+            _emit_event(queue, phase="confirm", stage="terminal",
+                        message=loss_msg, terminal="failed", tried_slots=tried_labels,
+                        sniper_stats={"polls": poll_count, "total_ms": total_ms,
+                                      "attempts": len(tried_keys) + 1,
+                                      "tried_slots": tried_labels})
+            _flush_race()
+            queue.put({"type": "status", "status": "failed"})
+            _finalize_worker()
+            return
+
         booking_url = payload.get("foreup_booking_url") or f"{base_url}/index.php/booking/{resolved_schedule_id}/{resolved_course_id}#teetimes"
         terminal = "dry_run_stopped" if payload.get("dry_run", True) else "sniper_alert"
         alert_msg = f"Slot found: {selected['time']} | {selected['available_spots']} spots | ${selected.get('green_fee', '?')}"
@@ -1411,7 +1449,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.68"
+APP_VERSION = "0.69"
 
 @app.get("/health")
 def health() -> dict[str, str]:
