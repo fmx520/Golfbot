@@ -16,6 +16,10 @@ const S = {
 
 function $(id) { return document.getElementById(id); }
 
+function raceStrategy() {
+  return document.querySelector('input[name="raceStrategy"]:checked')?.value || 'off';
+}
+
 function show(id) { $(id)?.classList.remove('hidden'); }
 function hide(id) { $(id)?.classList.add('hidden'); }
 
@@ -188,7 +192,8 @@ async function searchTeeTimes(opts = {}) {
   const preselected = opts.preselected || null;
   hideAlert('searchError');
   const btn = $('searchBtn');
-  const isSniper = !preselected && $('sniperMode').checked;
+  const strategy = preselected ? 'off' : raceStrategy();
+  const isSniper = strategy !== 'off';
   btn.disabled = true;
   btn.innerHTML = preselected
     ? '<span class="spinner-inline"></span> Booking...'
@@ -216,14 +221,14 @@ async function searchTeeTimes(opts = {}) {
   if (!scheduleId && !bookingUrl) {
     showAlert('searchError', 'No schedule ID or booking URL. Go back to Step 1 and connect first.');
     btn.disabled = false;
-    btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
+    btn.innerHTML = isSniper ? (raceStrategy() === 'future_sight' ? 'Arm Future Sight' : 'Arm Sniper') : 'Search Tee Times';
     return;
   }
 
   if (!$('bookingClass').value) {
     showAlert('searchError', 'Please select a booking class before searching.');
     btn.disabled = false;
-    btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
+    btn.innerHTML = isSniper ? (raceStrategy() === 'future_sight' ? 'Arm Future Sight' : 'Arm Sniper') : 'Search Tee Times';
     $('eventLogContainer')?.classList.remove('sniper-armed');
     return;
   }
@@ -247,7 +252,7 @@ async function searchTeeTimes(opts = {}) {
     sniper_mode: isSniper,
     release_time: (isSniper && !$('snipeNow').checked) ? $('releaseTime').value : '',
     auto_book: isSniper ? $('autoBook').checked : false,
-    future_sight: isSniper ? !!$('futureSight')?.checked : false,
+    future_sight: strategy === 'future_sight',
     anticaptcha_api_key: '',
   };
 
@@ -268,7 +273,7 @@ async function searchTeeTimes(opts = {}) {
   } catch (e) {
     showAlert('searchError', e.message);
     btn.disabled = false;
-    btn.innerHTML = isSniper ? 'Arm Sniper' : 'Search Tee Times';
+    btn.innerHTML = isSniper ? (raceStrategy() === 'future_sight' ? 'Arm Future Sight' : 'Arm Sniper') : 'Search Tee Times';
     $('eventLogContainer')?.classList.remove('sniper-armed');
   }
 }
@@ -299,7 +304,7 @@ function startPolling() {
 
         const btn = $('searchBtn');
         btn.disabled = false;
-        btn.innerHTML = S.sniperMode ? 'Arm Sniper' : 'Search Tee Times';
+        btn.innerHTML = S.sniperMode ? (raceStrategy() === 'future_sight' ? 'Arm Future Sight' : 'Arm Sniper') : 'Search Tee Times';
         $('eventLogContainer')?.classList.remove('sniper-armed');
 
         if (data.status === 'succeeded') {
@@ -688,17 +693,27 @@ async function submitVerificationCode() {
   }
 }
 
-// Sniper toggle
-function toggleSniperMode() {
-  const checked = $('sniperMode').checked;
+// Release-racing strategy
+function onStrategyChange() {
+  const strategy = raceStrategy();
   const fields = $('sniperFields');
   const btn = $('searchBtn');
-  if (checked) {
-    fields.classList.remove('hidden');
-    updateSniperButtonLabel();
-  } else {
+  const autoBook = $('autoBook');
+  if (strategy === 'off') {
     fields.classList.add('hidden');
     btn.textContent = 'Search Tee Times';
+  } else {
+    fields.classList.remove('hidden');
+    updateSniperButtonLabel();
+  }
+  // Future Sight fires real holds and completes them itself — auto-book is
+  // not a choice there, so show it as locked on rather than trusting the
+  // user to know the dependency.
+  if (strategy === 'future_sight') {
+    autoBook.checked = true;
+    autoBook.disabled = true;
+  } else {
+    autoBook.disabled = false;
   }
   toggleCaptchaKey();
 }
@@ -711,8 +726,10 @@ function toggleSnipeNow() {
 }
 
 function updateSniperButtonLabel() {
-  if (!$('sniperMode').checked) return;
-  $('searchBtn').textContent = $('snipeNow').checked ? 'Snipe Now' : 'Arm Sniper';
+  const strategy = raceStrategy();
+  if (strategy === 'off') return;
+  const arm = strategy === 'future_sight' ? 'Arm Future Sight' : 'Arm Sniper';
+  $('searchBtn').textContent = $('snipeNow').checked ? 'Start Now' : arm;
 }
 
 function toggleCaptchaKey() {}
@@ -727,7 +744,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('stopBtn').addEventListener('click', stopJob);
   $('gridBtn').addEventListener('click', showTeeGrid);
   $('probeBtn').addEventListener('click', fireColdHoldProbe);
-  $('sniperMode').addEventListener('change', toggleSniperMode);
+  document.querySelectorAll('input[name="raceStrategy"]').forEach(el =>
+    el.addEventListener('change', onStrategyChange));
   $('snipeNow').addEventListener('change', toggleSnipeNow);
   $('autoBook').addEventListener('change', toggleCaptchaKey);
   $('bookingClass').addEventListener('change', updateDateRange);

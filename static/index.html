@@ -165,13 +165,34 @@
       </div>
 
       <div class="card" id="sniperCard">
-        <div class="card-title">Sniper Mode</div>
-        <div class="card-subtitle">Pre-authenticate and poll aggressively at release time to grab slots before anyone else.</div>
+        <div class="card-title">Release Racing</div>
+        <div class="card-subtitle">How should the bot race when a course releases new tee times?</div>
+
         <div class="checkbox-group">
-          <input type="checkbox" id="sniperMode">
-          <label for="sniperMode">Enable Sniper Mode</label>
+          <input type="radio" name="raceStrategy" id="strategyOff" value="off" checked>
+          <label for="strategyOff">Off &mdash; normal search</label>
         </div>
-        <div class="form-help">Use this when a course releases new tee times at a known time (e.g. 7:00 PM the night before). The bot pre-warms your session and fires the moment slots open — milliseconds matter when racing other bots.</div>
+        <div class="form-help">One pass over the teesheet right now. No racing.</div>
+
+        <div class="checkbox-group">
+          <input type="radio" name="raceStrategy" id="strategySniper" value="sniper">
+          <label for="strategySniper">Sniper &mdash; poll at the release</label>
+        </div>
+        <div class="form-help">Pre-warms your session, then polls aggressively the moment slots open and grabs the first match in your window.</div>
+
+        <div class="checkbox-group">
+          <input type="radio" name="raceStrategy" id="strategyFutureSight" value="future_sight">
+          <label for="strategyFutureSight">Future Sight &mdash; pre-staged holds, then polling</label>
+        </div>
+        <div class="form-help">
+          The bot learns the course's real tee grid when you arm (same weekday last week, or its
+          stored memory) and fires <em>direct holds</em> at the tee times inside your window the
+          instant the release opens &mdash; no discovery round trip, ~300ms ahead of a polling bot,
+          earliest time first, re-firing for ~5s in case the sheet publishes late. If every hold
+          misses, it automatically drops into Sniper polling, so it can never do worse. Books
+          instantly (auto-book is implied). Uses the first selected course for the holds.
+        </div>
+
         <div id="sniperFields" class="hidden">
           <div class="form-row" id="releaseTimeRow">
             <div class="form-group">
@@ -181,34 +202,14 @@
           </div>
           <div class="checkbox-group">
             <input type="checkbox" id="snipeNow">
-            <label for="snipeNow">Snipe now (don't wait for a release time — start polling immediately)</label>
+            <label for="snipeNow">Start now (don't wait for a release time)</label>
           </div>
-          <div class="form-help">Use this for mid-day cancellations or when a course unexpectedly drops new times. Skips the countdown and starts polling at 5 req/sec right away.</div>
-          <div class="checkbox-group">
+          <div class="form-help">For mid-day cancellations or when a course unexpectedly drops new times. Skips the countdown.</div>
+          <div class="checkbox-group" id="autoBookGroup">
             <input type="checkbox" id="autoBook">
             <label for="autoBook">Auto-book when slot found</label>
           </div>
-          <div class="form-help">Off: bot alerts you when a slot opens, you click to book. On: bot submits the reservation instantly. For 2FA courses (Bethpage) the slot is held while you enter the email code.</div>
-        </div>
-
-
-      </div>
-
-      <div class="card" id="futureSightCard">
-        <div class="card-title">Future Sight</div>
-        <div class="card-subtitle">First strike at the release instant &mdash; fires direct holds at the real tee times inside your window, before any polling.</div>
-        <div class="checkbox-group">
-          <input type="checkbox" id="futureSight">
-          <label for="futureSight">Enable Future Sight</label>
-        </div>
-        <div class="form-help">
-          The bot learns the course's actual tee grid when you arm (from the same weekday last
-          week, or its stored memory of this course) and targets every real tee time inside your
-          Earliest&ndash;Latest window, earliest first &mdash; you never type times. At the release
-          instant the holds fire directly, ~300ms ahead of a polling bot; the first accept gets
-          booked and the list re-fires for ~5s in case the sheet publishes late. Normal sniper
-          polling still runs as the fallback. Requires Sniper Mode + Auto-book; ignored on dry
-          runs. Uses the first selected course.
+          <div class="form-help" id="autoBookHelp">Off: bot alerts you when a slot opens, you click to book. On: bot submits the reservation instantly. For 2FA courses (Bethpage) the slot is held while you enter the email code.</div>
         </div>
       </div>
 
