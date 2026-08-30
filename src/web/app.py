@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from src.booking.foreup_client import ForeUpBookingClient, classify_reservation_response
 from src.config import load_config
 from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
+from src.discovery.grid import analyze_teesheet_grid
 from src.telemetry.race_log import RaceRecorder
 
 STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
@@ -1522,6 +1523,76 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
         _event(JOBS[job_id], "job", "Job started", request=safe_payload)
 
     return {"job_id": job_id}
+
+
+class GridRequest(BaseModel):
+    """Inputs for inferring a course's tee-time grid."""
+    play_date: str
+    foreup_booking_url: str | None = None
+    schedule_id: str = ""
+    course_id: str = ""
+    players: int = Field(default=1, ge=1, le=4)
+    holes: int = Field(default=18, ge=9, le=18)
+    booking_class: str = ""
+    username: str = ""
+    password: str = ""
+
+
+@app.post("/api/teesheet-grid")
+def teesheet_grid(req: GridRequest) -> dict[str, Any]:
+    """Infer which tee times a course actually offers on a given date.
+
+    A pre-staged hold has to name an exact time, so we need the course's grid
+    before we can target anything: firing at 08:05 on a 10-minute sheet fails no
+    matter how fast we are. Use a date with plenty of availability — the booking
+    API only returns open slots, so a busy sheet hides the true interval.
+    """
+    default_base_url = os.getenv("FOREUP_BASE_URL", "https://foreupsoftware.com")
+    base_url, schedule_id, course_id = _extract_foreup_target(
+        req.foreup_booking_url,
+        fallback_base_url=default_base_url,
+        fallback_schedule_id=req.schedule_id or os.getenv("FOREUP_SCHEDULE_ID", ""),
+        fallback_course_id=req.course_id or os.getenv("FOREUP_COURSE_ID", ""),
+    )
+    if not schedule_id:
+        raise HTTPException(status_code=400, detail="No schedule_id — pass a ForeUp booking URL.")
+
+    username = req.username or os.getenv("FOREUP_USERNAME", "")
+    password = req.password or os.getenv("FOREUP_PASSWORD", "")
+
+    discovery = ForeUpDiscoveryClient(base_url=base_url)
+    try:
+        if username and password:
+            discovery.bootstrap_session(
+                username=username, password=password,
+                schedule_id=schedule_id, course_id=course_id,
+            )
+        booking_class = req.booking_class
+        if hasattr(discovery, "resolve_booking_class") and course_id:
+            booking_class = discovery.resolve_booking_class(course_id, req.booking_class)
+
+        slots = discovery.lookup_availability(
+            schedule_id=course_id or schedule_id,
+            date=req.play_date,
+            players=req.players,
+            holes=req.holes,
+            booking_class=booking_class,
+        )
+    except AntiBotDetectedError as exc:
+        raise HTTPException(status_code=502, detail=f"Anti-bot response: {exc}")
+    except ForeUpError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    grid = analyze_teesheet_grid(s.get("time", "") for s in slots)
+    result = grid.as_dict()
+    result["play_date"] = req.play_date
+    result["schedule_id"] = schedule_id
+    result["course_id"] = course_id
+    result["open_times"] = [s.get("time", "") for s in slots]
+    result["usable_for_prestage"] = bool(
+        grid.consistent and grid.confidence in ("medium", "high")
+    )
+    return result
 
 
 @app.get("/api/courses")
