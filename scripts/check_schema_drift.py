@@ -25,13 +25,22 @@ from src.telemetry.race_log import RaceRecorder  # noqa: E402
 
 SCHEMA = ROOT / "supabase" / "schema.sql"
 
+# What grid_store.upsert_grid POSTs. Kept here rather than imported because the
+# real call builds the row inside a function; this is the contract it must meet.
+GRID_ROW_KEYS = {
+    "course_id", "day_of_week", "interval_minutes", "anchor_phase", "first_time",
+    "last_time", "observed_count", "confidence", "template", "source_date",
+}
 
-def schema_columns() -> set[str]:
-    """Column names from the races CREATE TABLE, ignoring the comment cookbook."""
+
+def schema_columns(table: str) -> set[str]:
+    """Column names from a CREATE TABLE, ignoring the comment cookbook."""
     sql = SCHEMA.read_text(encoding="utf-8")
-    match = re.search(r"create table[^(]*\(\s*(.*?)\n\);", sql, re.S | re.I)
+    match = re.search(
+        rf"create table (?:if not exists )?{table}\s*\(\s*(.*?)\n\);", sql, re.S | re.I
+    )
     if not match:
-        raise SystemExit(f"Could not find the races CREATE TABLE in {SCHEMA}")
+        raise SystemExit(f"Could not find the {table} CREATE TABLE in {SCHEMA}")
 
     columns: set[str] = set()
     for line in match.group(1).splitlines():
@@ -51,28 +60,36 @@ def record_keys() -> set[str]:
     return set(RaceRecorder(run_id="drift-check").as_dict())
 
 
-def main() -> int:
-    columns, keys = schema_columns(), record_keys()
+def check(table: str, keys: set[str], ignore: set[str], kind: str) -> int:
+    columns = schema_columns(table)
 
     missing = sorted(keys - columns)
     if missing:
-        print("SCHEMA DRIFT — these record fields have no column, so PostgREST")
-        print("will reject every race record, not only the ones using them:\n")
+        print(f"SCHEMA DRIFT in {table} — these {kind} fields have no column, so")
+        print("PostgREST will reject every write, not only the ones using them:\n")
         for name in missing:
             print(f"  - {name}")
-        print("\nAdd them to supabase/schema.sql and run this against the live table:\n")
+        print(f"\nAdd them to supabase/schema.sql and run against the live table:\n")
         for name in missing:
-            print(f"  alter table races add column if not exists {name} jsonb;")
+            print(f"  alter table {table} add column if not exists {name} jsonb;")
         return 1
 
-    unused = sorted(columns - keys - {"created_at"})
+    unused = sorted(columns - keys - ignore)
     if unused:
-        # Not fatal: a column the record stopped sending is harmless, but it is
-        # usually a rename that lost data, so say so.
-        print(f"note: columns with no matching record field: {', '.join(unused)}")
+        # Not fatal: a column nothing writes is harmless, but it is usually a
+        # rename that lost data, so say so.
+        print(f"note: {table} columns with no matching field: {', '.join(unused)}")
 
-    print(f"OK — all {len(keys)} record fields have columns.")
+    print(f"OK — all {len(keys)} {kind} fields have columns in {table}.")
     return 0
+
+
+def main() -> int:
+    failures = check("races", record_keys(), {"created_at"}, "race record")
+    # course_grids existed only in grid_store.py for its whole life: the table
+    # was never in schema.sql, so Future Sight's fallback could never fire.
+    failures += check("course_grids", GRID_ROW_KEYS, {"updated_at"}, "grid row")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

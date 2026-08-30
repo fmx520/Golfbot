@@ -852,8 +852,40 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         peer_count=int(payload.get("peer_count") or 1),
     )
 
+    # Best teesheet sample this race saw. A freshly released sheet is the most
+    # complete view of a course's grid we ever get -- far better than a
+    # reference day that is half booked -- so it is worth banking. Collected in
+    # memory during the race (a length compare, nothing more) and written only
+    # once the race is decided, never on the hot path.
+    grid_sample: dict[str, Any] = {"times": [], "template": {}, "course": ""}
+
+    def _learn_grid_from_race() -> None:
+        """Bank what this race saw about the course's grid. Never raises."""
+        try:
+            if len(grid_sample["times"]) < 3:
+                return
+            observed = analyze_teesheet_grid(grid_sample["times"])
+            if not (observed.interval_minutes and observed.consistent):
+                return
+            play_dow = datetime.strptime(play_date, "%Y-%m-%d").date().weekday()
+            if grid_store.upsert_grid(course_id=str(grid_sample["course"]),
+                                      day_of_week=play_dow, grid=observed.as_dict(),
+                                      template=grid_sample["template"],
+                                      source_date=play_date):
+                _emit_event(queue, phase="sniper", stage="grid_learned",
+                            message=f"Learned this course's {observed.interval_minutes}-minute grid "
+                                    f"from the released sheet ({observed.observed_count} times seen). "
+                                    f"Future Sight can derive targets here from now on, even if the "
+                                    f"reference day is booked solid.")
+        except Exception:  # noqa: BLE001 — the registry must never affect a race
+            pass
+
     def _flush_race() -> None:
         """Emit the race record and surface the one-line verdict in the UI."""
+        # Every terminal path funnels through here, so this is the one place
+        # that guarantees a race's grid observation is banked exactly once. It
+        # no-ops on the arming-failure paths, where nothing was polled yet.
+        _learn_grid_from_race()
         try:
             record = race.flush()
             _emit_event(queue, phase="confirm", stage="race_summary",
@@ -1079,8 +1111,12 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                         _emit_event(queue, phase="sniper", stage="prestage_grid",
                                     message=f"Future Sight: no live reference sheet and nothing stored for "
                                             f"this course/day yet, so targets cannot be derived. Falling "
-                                            f"back to pure polling — run once more after any teesheet read "
-                                            f"and the registry will know this course.")
+                                            f"back to pure polling. To teach it this course, press "
+                                            f"\u201cShow this course\u2019s tee grid\u201d for a date whose sheet is "
+                                            f"already published and has plenty of open times — the booking "
+                                            f"API only returns OPEN slots, so a nearly full day hides the "
+                                            f"real interval. Any release this bot polls also gets banked "
+                                            f"automatically.")
                     else:
                         _emit_event(queue, phase="sniper", stage="prestage_grid",
                                     message=f"Future Sight: no live reference sheet "
@@ -1531,6 +1567,10 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 # downstream book_slot uses the right course IDs.
                 for s in slots:
                     s["_source_teesheet_id"] = current_teesheet
+                if len(slots) > len(grid_sample["times"]):
+                    grid_sample["times"] = [s.get("time", "") for s in slots]
+                    grid_sample["template"] = slots[0].get("raw") or {}
+                    grid_sample["course"] = current_teesheet
             except AntiBotDetectedError as exc:
                 # AntiBotDetectedError subclasses ForeUpError, so this used to be
                 # swallowed by the generic handler below and recorded as "0 slots"
@@ -1905,7 +1945,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.80"
+APP_VERSION = "0.81"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -2130,8 +2170,31 @@ def teesheet_grid(req: GridRequest) -> dict[str, Any]:
     except ForeUpError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
+    # Teach the registry from every course that produced a trustworthy grid --
+    # not just the best one, and not only when Future Sight happens to be
+    # arming. This button is the bootstrap: until it ran, upsert_grid was only
+    # reachable from the Future Sight path that had ALREADY read a live sheet,
+    # so the registry could only be written when it was not needed and was
+    # guaranteed empty on the day it was.
+    learned: list[str] = []
+    try:
+        play_dow = datetime.strptime(req.play_date, "%Y-%m-%d").date().weekday()
+    except ValueError:
+        play_dow = None
+    if play_dow is not None:
+        for entry in per_course:
+            eg = entry["grid"]
+            if not (eg.interval_minutes and eg.consistent):
+                continue
+            tmpl = (entry["slots"][0].get("raw") or {}) if entry["slots"] else {}
+            if grid_store.upsert_grid(course_id=str(entry["course_id"]), day_of_week=play_dow,
+                                      grid=eg.as_dict(), template=tmpl,
+                                      source_date=req.play_date):
+                learned.append(str(entry["course_id"]))
+
     grid = best["grid"]
     result = grid.as_dict()
+    result["learned_courses"] = learned
     result["play_date"] = req.play_date
     result["schedule_id"] = schedule_id
     result["course_id"] = course_id

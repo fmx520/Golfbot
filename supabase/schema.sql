@@ -64,6 +64,45 @@ alter table races add column if not exists peers      jsonb;
 -- Guard against this recurring: scripts/check_schema_drift.py compares the
 -- record's top-level keys against the columns above and fails on any gap.
 
+
+-- ---------------------------------------------------------------------------
+-- Course tee-time grid registry
+-- ---------------------------------------------------------------------------
+--
+-- Future Sight has to name an exact time before the sheet opens, so it needs to
+-- know the course's interval and anchor in advance. The live reference read is
+-- the primary source; this table is what makes the fallback work on a day when
+-- the reference sheet is booked solid or unreadable.
+--
+-- This table was referenced by src/telemetry/grid_store.py from the start but
+-- never actually created, so the fallback could never fire -- Future Sight
+-- reported "nothing stored for this course/day yet" no matter how many times
+-- you ran it.
+
+create table if not exists course_grids (
+    course_id        text not null,
+    day_of_week      int  not null,   -- 0=Monday .. 6=Sunday, matching date.weekday()
+
+    interval_minutes int  not null,   -- e.g. 10 for a 10-minute sheet
+    anchor_phase     int,             -- first_time mod interval; a sheet on :03 has phase 3
+    first_time       text,
+    last_time        text,
+    observed_count   int,
+    confidence       text,            -- none | low | medium | high
+
+    -- The per-course payload fields a pre-staged hold needs (booking_class_id,
+    -- teesheet_side_id, green_fee). jsonb so new fields need no migration.
+    template         jsonb,
+    source_date      text,            -- which date this observation came from
+    updated_at       timestamptz not null default now(),
+
+    -- upsert_grid posts with on_conflict=course_id,day_of_week, which REQUIRES
+    -- this constraint to exist -- without it PostgREST rejects the merge.
+    primary key (course_id, day_of_week)
+);
+
+alter table course_grids enable row level security;
+
 -- The two axes you actually slice on: what happened, and when.
 create index if not exists races_outcome_idx    on races (outcome);
 create index if not exists races_recorded_idx   on races (recorded_at desc);
