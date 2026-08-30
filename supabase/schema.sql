@@ -38,10 +38,31 @@ create table if not exists races (
     polls            jsonb,
     attempts         jsonb,
     captcha          jsonb,
+    prestage         jsonb,         -- Future Sight: one entry per hold fired
+    two_factor       jsonb,         -- booking-code path + hold keepalive
+    peers            jsonb,         -- our own concurrent jobs on this race
 
     aborted_reason   text,
     error            text
 );
+
+
+-- ---------------------------------------------------------------------------
+-- Migration for a table created before v0.78
+-- ---------------------------------------------------------------------------
+--
+-- prestage (v0.73), two_factor (v0.68) and peers (v0.78) were added to the
+-- record without columns. PostgREST rejects the WHOLE insert on any unmapped
+-- key, so a table missing these accepts NO races at all -- the symptom is a
+-- GOLFBOT_RACE_SINK_ERROR 400 line per run and an empty history. Safe to run
+-- more than once.
+
+alter table races add column if not exists prestage   jsonb;
+alter table races add column if not exists two_factor jsonb;
+alter table races add column if not exists peers      jsonb;
+
+-- Guard against this recurring: scripts/check_schema_drift.py compares the
+-- record's top-level keys against the columns above and fails on any gap.
 
 -- The two axes you actually slice on: what happened, and when.
 create index if not exists races_outcome_idx    on races (outcome);

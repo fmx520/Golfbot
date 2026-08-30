@@ -237,6 +237,13 @@ class RaceRecorder:
     hold_refresh_failed: int = 0
     hold_refresh_first_error: str = ""
 
+    # Self-collision: how many of our own jobs were racing these exact criteria
+    # when this one armed, and which pick-order rotation it was given. Without
+    # this, losing to one of our own users is indistinguishable in the history
+    # from losing to a stranger's bot.
+    peer_ordinal: int = 0
+    peer_count: int = 1
+
     captcha_solves: int = 0
     captcha_refreshes: int = 0
     captcha_stale_at_submit: bool = False
@@ -416,6 +423,10 @@ class RaceRecorder:
                 "hold_refresh_ok": self.hold_refresh_ok,
                 "hold_refresh_failed": self.hold_refresh_failed,
                 "hold_refresh_first_error": self.hold_refresh_first_error,
+            },
+            "peers": {
+                "ordinal": self.peer_ordinal,
+                "count": self.peer_count,
             },
             "captcha": {
                 "solves": self.captcha_solves,

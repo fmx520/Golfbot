@@ -175,6 +175,28 @@ def _report_races(races: list[dict[str, Any]]) -> None:
         for reason, count in reasons.most_common(3):
             print(f"  {count:>3}x rejected: {reason or '(no body)'}")
 
+    # Self-collision: a loss with peers armed on identical criteria may have
+    # been to one of our own users, which is a completely different problem
+    # from losing to a stranger's bot and has a completely different fix.
+    contested = [r for r in races if (r.get("peers") or {}).get("count", 1) > 1]
+    if contested:
+        lost = [r for r in contested if r.get("outcome") not in ("won", "found_not_booked")]
+        print(f"\nSelf-collision: {len(contested)}/{len(races)} races ran with other "
+              f"jobs of ours on identical criteria")
+        biggest = max((r.get("peers") or {}).get("count", 1) for r in contested)
+        print(f"  most concurrent jobs on one race: {biggest}")
+        if lost:
+            print(f"  {len(lost)} of those did not win — check whether the winning time "
+                  f"went to another of our own runs before blaming an outside bot")
+        # If rotation is working, the opening picks should be spread across
+        # ordinals rather than every job sitting on 0.
+        ordinals = Counter((r.get("peers") or {}).get("ordinal", 0) for r in contested)
+        spread = ", ".join(f"#{o}:{n}" for o, n in sorted(ordinals.items()))
+        print(f"  rotation ordinals seen: {spread}")
+        if len(ordinals) == 1 and biggest > 1:
+            print("  WARNING: every contested race used the same ordinal — rotation is "
+                  "not taking effect, so our users are still dogpiling one slot.")
+
     blocked_polls = sum((r.get("polls") or {}).get("antibot", 0) for r in races)
     if blocked_polls:
         print(f"\nAnti-bot rejected polls across all races: {blocked_polls}")

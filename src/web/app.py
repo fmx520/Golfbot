@@ -144,6 +144,65 @@ class JobState:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     events: list[dict[str, Any]] = field(default_factory=list)
+    # Which race this job entered, and its slot in the queue of our own users
+    # who entered the same one. Derived from JOBS rather than a second registry
+    # so a finished job stops being a peer the moment its status changes.
+    racing_key: tuple | None = None
+    peer_ordinal: int = 0
+
+
+# A job stops competing once it reaches one of these.
+FINISHED_STATUSES = {"succeeded", "failed", "cancelled"}
+
+
+def _racing_key(payload: dict[str, Any]) -> tuple:
+    """Identity of the race a job is entering.
+
+    Strict equality on every field that changes what ForeUp returns. Two jobs
+    coordinate only when they are asking the identical question — a resident
+    and a non-resident booking class are looking at different inventory, so
+    steering one off a slot could push it toward a time that does not exist in
+    its class. Anything that does not match exactly simply does not coordinate,
+    which is the current behavior.
+    """
+    courses = tuple(sorted(str(c) for c in (payload.get("course_ids") or []) if c))
+    return (
+        courses or (str(payload.get("schedule_id") or ""),),
+        str(payload.get("play_date") or ""),
+        str(payload.get("booking_class") or ""),
+        int(payload.get("players") or 0),
+        int(payload.get("holes") or 0),
+    )
+
+
+def _claim_peer_ordinal(job_id: str, key: tuple) -> tuple[int, int]:
+    """Assign this job its place among our own jobs racing the same slots.
+
+    Caller must hold JOB_LOCK. Returns (ordinal, peer_count). Ordinal is the
+    lowest free position, not the peer count -- when an earlier job finishes,
+    reusing its number keeps the set contiguous, where counting live peers
+    would hand out a duplicate and put two of our users back on one slot.
+    """
+    peers = [
+        j for j in JOBS.values()
+        if j.job_id != job_id and j.racing_key == key and j.status not in FINISHED_STATUSES
+    ]
+    taken = {j.peer_ordinal for j in peers}
+    ordinal = next(i for i in range(len(peers) + 1) if i not in taken)
+    return ordinal, len(peers) + 1
+
+
+def _rotate(items: list[Any], ordinal: int) -> list[Any]:
+    """Rotate a preference list so concurrent jobs open on different slots.
+
+    Nothing is removed -- every job still tries the whole list and still falls
+    through to what is left. Only the opening pick moves, which is the one that
+    decides who dogpiles whom.
+    """
+    if ordinal <= 0 or len(items) < 2:
+        return items
+    shift = ordinal % len(items)
+    return items[shift:] + items[:shift]
 
 
 JOBS: dict[str, JobState] = {}
@@ -230,7 +289,12 @@ def _select_slot(slots: list[dict[str, Any]], payload: dict[str, Any]) -> dict[s
         candidates.sort(key=lambda s: (s.get("_course_priority", 999), _slot_time_str(s)))
     else:  # earliest
         candidates.sort(key=lambda s: _slot_time_str(s))
-    return candidates[0]
+
+    # Every ranking is deterministic, so our own concurrent users sort the
+    # identical list and pick the identical slot -- six jobs get one chance
+    # tried six times, with five guaranteed "Time not available". Rotating by
+    # the arm-time ordinal spreads the opening pick across the window.
+    return _rotate(candidates, int(payload.get("peer_ordinal") or 0))[0]
 
 
 def _extract_foreup_target(booking_url: str | None, fallback_base_url: str, fallback_schedule_id: str, fallback_course_id: str) -> tuple[str, str, str]:
@@ -784,6 +848,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         play_date=play_date,
         release_at=release_dt.isoformat(),
         auto_book=bool(auto_book and not payload.get("dry_run", True)),
+        peer_ordinal=int(payload.get("peer_ordinal") or 0),
+        peer_count=int(payload.get("peer_count") or 1),
     )
 
     def _flush_race() -> None:
@@ -1023,6 +1089,16 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                                             f"polling remains the fallback.")
 
             if raw_targets:
+                ordinal = int(payload.get("peer_ordinal") or 0)
+                rotated = _rotate(raw_targets, ordinal)
+                if rotated != raw_targets:
+                    _emit_event(queue, phase="sniper", stage="prestage_rotated",
+                                message=f"Rotated to {', '.join(rotated)} — {payload.get('peer_count', 1)} "
+                                        f"of our own jobs are pre-staging these exact criteria, and "
+                                        f"targets are generated earliest-first, so unrotated we would all "
+                                        f"fire at the same time in the same order. Same targets, "
+                                        f"different opening shot.")
+                raw_targets = rotated
                 prestage_plan = {"times": raw_targets, "course": ps_course,
                                  "booking_class": ps_class, "template": template}
 
@@ -1829,7 +1905,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.79"
+APP_VERSION = "0.80"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -1927,14 +2003,19 @@ def connect(req: ConnectRequest) -> dict[str, Any]:
 def start_job(req: StartJobRequest) -> dict[str, str]:
     job_id = uuid.uuid4().hex[:12]
     state = JobState(job_id=job_id)
+    full_payload = req.model_dump()
+
+    key = _racing_key(full_payload)
     with JOB_LOCK:
         JOBS[job_id] = state
+        state.racing_key = key
+        state.peer_ordinal, peer_count = _claim_peer_ordinal(job_id, key)
+    full_payload["peer_ordinal"] = state.peer_ordinal
+    full_payload["peer_count"] = peer_count
 
     payload = req.model_dump()
     payload.pop("password", None)
     safe_payload = {k: v for k, v in payload.items() if k != "password"}
-
-    full_payload = req.model_dump()
     queue: Queue = Queue()
     cmd_queue: Queue = Queue()
     CMD_QUEUES[job_id] = cmd_queue
@@ -1948,6 +2029,14 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
 
     with JOB_LOCK:
         _event(JOBS[job_id], "job", "Job started", request=safe_payload)
+        if peer_count > 1:
+            _event(
+                JOBS[job_id], "job",
+                f"{peer_count} of our own jobs are racing these exact criteria. You are "
+                f"#{state.peer_ordinal + 1} — your pick order is rotated so we open on "
+                f"different slots instead of all fighting for the same one. Every time in "
+                f"your window is still tried.",
+            )
 
     return {"job_id": job_id}
 
