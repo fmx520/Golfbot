@@ -32,6 +32,25 @@ ANTIBOT_MARKERS = (
 )
 
 
+SCHEDULES_PATTERN = re.compile(r"SCHEDULES\s*=\s*(\[.*?\])\s*;", re.DOTALL)
+
+
+def extract_schedules(html: str) -> list[dict[str, Any]]:
+    """Pull the SCHEDULES array ForeUp inlines into every booking page.
+
+    Returns [] when the array is missing or unparseable — which is also how a
+    caller tells an anti-bot interstitial apart from a real booking page.
+    """
+    match = SCHEDULES_PATTERN.search(html or "")
+    if not match:
+        return []
+    try:
+        data = _json.loads(match.group(1))
+    except (ValueError, _json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
 class ForeUpError(Exception):
     pass
 
@@ -152,12 +171,8 @@ class ForeUpDiscoveryClient:
         })
 
     def _extract_booking_classes(self, html: str, teesheet_id: str) -> list[str]:
-        m = re.search(r"SCHEDULES\s*=\s*(\[.*?\])\s*;", html, re.DOTALL)
-        if not m:
-            return self._extract_booking_classes_fallback(html)
-        try:
-            schedules = _json.loads(m.group(1))
-        except (ValueError, _json.JSONDecodeError):
+        schedules = extract_schedules(html)
+        if not schedules:
             return self._extract_booking_classes_fallback(html)
 
         self._course_options = []
@@ -238,12 +253,8 @@ class ForeUpDiscoveryClient:
     def class_requires_code(self, teesheet_id: str, class_id_or_name: str) -> bool:
         """Return True if the resolved booking class for this course is marked
         online_booking_protected (i.e. requires an emailed booking code)."""
-        m = re.search(r"SCHEDULES\s*=\s*(\[.*?\])\s*;", self._last_page_html or "", re.DOTALL)
-        if not m:
-            return False
-        try:
-            schedules = _json.loads(m.group(1))
-        except (ValueError, _json.JSONDecodeError):
+        schedules = extract_schedules(self._last_page_html or "")
+        if not schedules:
             return False
         target_id = self.resolve_booking_class(teesheet_id, class_id_or_name)
         for sched in schedules:

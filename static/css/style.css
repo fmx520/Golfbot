@@ -694,3 +694,83 @@ body {
 .supported-courses .course-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
 .supported-courses .course-list li { display: flex; align-items: center; gap: 8px; font-size: var(--fs-sm); color: var(--text-primary); }
 .supported-courses .course-emoji { font-size: 1.1rem; }
+
+/* Course link preflight: the banner is the one place the user is told whether
+   the built-in ForeUp links were actually confirmed, so each verdict gets its
+   own colour rather than a generic info style. */
+.preflight {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-tertiary);
+  font-size: var(--fs-sm);
+}
+.preflight-text { flex: 1; color: var(--text-secondary); }
+.preflight-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.preflight-pending .preflight-dot { animation: preflight-pulse 1.2s ease-in-out infinite; }
+.preflight-ok { border-color: rgba(63, 185, 80, 0.4); background: var(--success-bg); }
+.preflight-ok .preflight-dot { background: var(--success); }
+.preflight-ok .preflight-text { color: var(--success); }
+.preflight-warn { border-color: rgba(210, 153, 34, 0.4); background: var(--warning-bg); }
+.preflight-warn .preflight-dot { background: var(--warning); }
+.preflight-warn .preflight-text { color: var(--warning); }
+.preflight-bad { border-color: rgba(248, 81, 73, 0.4); background: var(--error-bg); }
+.preflight-bad .preflight-dot { background: var(--error); }
+.preflight-bad .preflight-text { color: var(--error); }
+
+@keyframes preflight-pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: var(--fs-xs);
+  font-family: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  white-space: nowrap;
+}
+.link-btn:hover { color: var(--accent-hover); }
+.link-btn:disabled { color: var(--text-muted); cursor: default; }
+
+.course-detail {
+  margin-top: 0.5rem;
+  padding: 10px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: var(--fs-sm);
+}
+.course-detail-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+.course-detail-label {
+  flex: 0 0 88px;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.course-detail-row a { color: var(--accent); word-break: break-all; }
+.course-detail-row code {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+}
+.course-detail-note { color: var(--text-secondary); font-size: var(--fs-xs); flex: 1 1 100%; }
+@media (min-width: 560px) {
+  .course-detail-note { flex: 1 1 auto; }
+}

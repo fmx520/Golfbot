@@ -39,25 +39,36 @@
     <!-- Step 1: Connect -->
     <section id="step1" class="step-content active">
       <h2 class="page-title">Connect to ForeUp</h2>
-      <p class="page-description">Enter your ForeUp credentials and the booking URL for the course you want to book.</p>
-
-      <div class="card supported-courses">
-        <div class="card-title">Supported Courses</div>
-        <ul class="course-list">
-          <li>Bethpage State Park <span class="course-emoji">⛳</span></li>
-          <li>Sunken Meadow State Park <span class="course-emoji">🌊</span></li>
-          <li>Montauk Downs State Park <span class="course-emoji">🦞</span></li>
-        </ul>
-      </div>
+      <p class="page-description">Pick your course and enter your ForeUp credentials. Golfbot keeps the booking link for each course and checks it against ForeUp before you go any further.</p>
 
       <div class="alert alert-error" id="connectError"></div>
 
       <div class="card">
+        <div class="card-title">Course</div>
+        <div class="card-subtitle">Booking links are built in &mdash; no need to copy one from your browser.</div>
+
+        <div class="preflight" id="preflightBanner">
+          <span class="preflight-dot"></span>
+          <span class="preflight-text" id="preflightText">Checking ForeUp booking links&hellip;</span>
+          <button type="button" class="link-btn" id="preflightRecheck">Re-check</button>
+        </div>
+
+        <div class="form-group mt-1">
+          <label for="courseSelect">Which course?</label>
+          <select id="courseSelect">
+            <option value="" disabled selected>Loading courses&hellip;</option>
+          </select>
+        </div>
+
+        <div class="course-detail hidden" id="courseDetail"></div>
+      </div>
+
+      <div class="card hidden" id="customUrlCard">
         <div class="card-title">ForeUp Booking URL</div>
         <div class="card-subtitle">Paste the booking page URL from your course's website. The schedule and course IDs will be extracted automatically.</div>
         <div class="form-group">
           <label for="bookingUrl">Booking URL</label>
-          <input type="url" id="bookingUrl" placeholder="https://foreupsoftware.com/index.php/booking/19765/2431#teetimes">
+          <input type="url" id="bookingUrl" placeholder="https://foreupsoftware.com/index.php/booking/19765/2431#/teetimes">
         </div>
         <div class="form-row">
           <div class="form-group">
@@ -303,8 +314,14 @@
       <h2 class="page-title">How It Works</h2>
 
       <details class="faq-item">
-        <summary>How do I get the Booking URL?</summary>
-        <p>Go to your golf course's website and find their online tee time booking page (powered by ForeUp). The URL will look something like:<br><code>https://foreupsoftware.com/index.php/booking/19765/2431#teetimes</code><br>Copy the full URL from your browser's address bar and paste it into the Booking URL field. Golfbot will automatically extract the Schedule ID and Course ID from the link — you don't need to fill those in manually.</p>
+        <summary>How does Golfbot know my course's booking link?</summary>
+        <p>The links for the supported courses are built into Golfbot, so you just pick your course from the dropdown. If you need a course that isn't listed, choose <strong>Other &mdash; paste a ForeUp URL</strong> and paste the booking page URL from your browser's address bar (it looks like <code>https://foreupsoftware.com/index.php/booking/19765/2431#/teetimes</code>). Golfbot pulls the Schedule ID and Course ID out of it automatically.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>What is the link check on the Connect page?</summary>
+        <p>Before you book, Golfbot loads each built-in course's booking page straight from ForeUp and confirms that ForeUp still recognises the schedule and course IDs in the link — and it shows you the course name ForeUp reports back, so you can see you're pointed at the right place. A stale link would otherwise look completely normal until the bot searched an empty tee sheet, or raced a release on the wrong course.</p>
+        <p>Results are cached for 15 minutes; <strong>Re-check</strong> forces a fresh check. If ForeUp doesn't answer or serves a bot check, Golfbot says it couldn't confirm the link rather than claiming it's broken — you can still connect. Only a link ForeUp actively rejects blocks the Connect button.</p>
       </details>
 
       <details class="faq-item">

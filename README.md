@@ -17,11 +17,64 @@ Copy `.env.example` to `.env` and fill in your ForeUp credentials:
 cp .env.example .env
 ```
 
-## Finding your course's booking URL
+## Supported courses
 
-Go to the course's online booking page — it'll look like:
+The booking links for these ship with the app, so the web UI just asks you to
+pick one — there is nothing to copy and paste:
+
+| Course | Booking URL |
+|--------|-------------|
+| Bethpage State Park | `https://foreupsoftware.com/index.php/booking/19765/2431#/teetimes` |
+| Montauk Downs State Park | `https://foreupsoftware.com/index.php/booking/19756/2436#/teetimes` |
+| Sunken Meadow State Park | `https://foreupsoftware.com/index.php/booking/19766/2437#/teetimes` |
+| Crab Meadow Golf Course | `https://foreupsoftware.com/index.php/booking/21593/8314#/teetimes` |
+
+They live in [`src/courses.py`](src/courses.py), which is the single source of
+truth: every schedule and course ID the app uses is parsed out of these URLs, so
+fixing a link there fixes it in the picker, in jobs, in the sniper, and in the
+grid probe at once. (`config/courses.yaml` is a separate, CLI-oriented file for
+per-course polling and retry defaults — it does not feed the picker.)
+
+### The link precheck
+
+A stale booking link looks exactly like a good one right up until the bot
+searches an empty tee sheet, or races a release on the wrong course. So before
+you connect, Golfbot loads each course's booking page straight from ForeUp,
+unauthenticated, and confirms ForeUp still recognises the schedule and course
+IDs in the link — then shows you the course name ForeUp reports back.
+
+The Connect page shows one banner with the verdict, and a per-course detail
+block with the link, the IDs, and what the check found. The check runs once at
+app startup, and results are cached for 15 minutes; **Re-check** forces a fresh
+round.
+
+Three outcomes, deliberately distinguished:
+
+| Verdict | Meaning | Effect |
+|---------|---------|--------|
+| **Verified** | ForeUp resolved the link and named the course. | Connect normally. |
+| **Wrong link** | The page loaded, but ForeUp has no such course on that schedule. | Connect is blocked (with a "use it anyway" escape hatch) — this is real evidence the link is wrong. |
+| **Unconfirmed** | ForeUp did not answer, or served a bot check. | A warning only. Nothing says the link is bad, so you can still connect. |
+
+Run the same check from a terminal — useful as a deploy gate or a cron job:
+
+```bash
+python3 scripts/verify_course_urls.py          # table
+python3 scripts/verify_course_urls.py --json   # raw report
+# exit 0 = all verified, 1 = a link is wrong, 2 = could not confirm
 ```
-https://foreupsoftware.com/index.php/booking/19765/2431#teetimes
+
+Tune it with `COURSE_PREFLIGHT_TTL_SECONDS` (cache lifetime, default 900),
+`COURSE_PREFLIGHT_TIMEOUT_SECONDS` (per-request timeout, default 10), and
+`GOLFBOT_PREFLIGHT_ON_STARTUP=0` to skip the boot-time warm.
+
+## Using a course that isn't listed
+
+Pick **Other — paste a ForeUp URL** in the picker (or use the CLI). Booking URLs
+look like:
+
+```
+https://foreupsoftware.com/index.php/booking/19765/2431#/teetimes
 ```
 
 The two numbers are:
@@ -87,8 +140,9 @@ uvicorn src.web.app:app --host 0.0.0.0 --port 8000
 ```
 
 Open `http://localhost:8000`. The web UI lets you:
+- Pick a supported course, with its ForeUp link prechecked (see above)
 - Enter ForeUp credentials
-- Paste a booking URL (auto-populates schedule/course IDs)
+- Paste a booking URL for any other ForeUp course
 - Set date, time window, player count
 - Run dry-run or real booking jobs
 - Watch job progress in real-time
@@ -188,6 +242,7 @@ src/
   telemetry/     — Latency measurement and metrics
   web/           — FastAPI web server with inline UI
   config.py      — YAML config loading, secret redaction
+  courses.py     — Supported-course catalog + the ForeUp link precheck
 config/
   courses.yaml   — Per-course settings (schedule IDs, time windows, retry profiles)
 ```

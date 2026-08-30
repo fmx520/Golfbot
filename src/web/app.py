@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 
 from src.booking.foreup_client import ForeUpBookingClient, classify_reservation_response
 from src.config import load_config
+from src.courses import COURSE_CATALOG, cached_preflight, run_preflight
 from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
 from src.discovery.grid import analyze_teesheet_grid
 from src.telemetry import grid_store
@@ -1828,11 +1829,59 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.77"
+APP_VERSION = "0.78"
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "version": APP_VERSION}
+
+
+def _warm_course_preflight() -> None:
+    """Check the course links once at boot so the first visitor sees a verdict.
+
+    Best-effort: a failure here is a logged line, not a broken app, and the UI
+    re-runs the check itself if nothing is cached yet.
+    """
+    try:
+        run_preflight(force=True)
+    except Exception:  # noqa: BLE001
+        _logging.getLogger(__name__).warning("course_preflight_warm_failed", exc_info=True)
+
+
+@app.on_event("startup")
+def _startup_preflight() -> None:
+    if os.getenv("GOLFBOT_PREFLIGHT_ON_STARTUP", "1") != "1":
+        return
+    Thread(target=_warm_course_preflight, daemon=True).start()
+
+
+@app.get("/api/course-catalog")
+def course_catalog() -> dict[str, Any]:
+    """The courses the UI offers, and the last verification verdict if we have one.
+
+    Served without touching the network so the picker can render immediately;
+    the verdict arrives separately from /api/course-catalog/preflight.
+    """
+    cached = cached_preflight()
+    return {
+        "courses": [c.as_dict() for c in COURSE_CATALOG],
+        "preflight": cached.as_dict() if cached else None,
+    }
+
+
+@app.get("/api/course-catalog/preflight")
+def course_preflight(refresh: bool = False) -> dict[str, Any]:
+    """Confirm with ForeUp that every catalog URL still resolves.
+
+    Runs before anyone books so a stale link is caught here rather than by an
+    empty teesheet at 7pm. Cached for COURSE_PREFLIGHT_TTL_SECONDS; ``refresh=1``
+    forces a fresh round of checks.
+    """
+    try:
+        report = run_preflight(force=refresh)
+    except Exception as exc:  # noqa: BLE001 - the picker must still render
+        raise HTTPException(status_code=503, detail=f"Course preflight failed: {exc}")
+    return report.as_dict()
 
 
 @app.post("/api/connect")

@@ -12,7 +12,13 @@ const S = {
   jobStatus: null,
   jobEvents: [],
   sniperMode: false,
+  catalog: [],
+  preflight: null,
+  courseKey: '',
+  overrideBadLink: false,
 };
+
+const CUSTOM_COURSE = '__custom__';
 
 function $(id) { return document.getElementById(id); }
 
@@ -96,9 +102,243 @@ function parseBookingUrl(url) {
   } catch {}
 }
 
+// Step 1: Course catalog + link preflight
+//
+// The booking URL used to be typed by hand, which meant a stale or mistyped
+// link was indistinguishable from a good one until the bot searched the wrong
+// tee sheet. Now the links ship with the app and are checked against ForeUp
+// before anyone connects.
+
+const PREFLIGHT_STATE = {
+  ok:          { cls: 'ok',      icon: '✓' },
+  mismatch:    { cls: 'bad',     icon: '✕' },
+  malformed:   { cls: 'bad',     icon: '✕' },
+  unverified:  { cls: 'warn',    icon: '!' },
+  unreachable: { cls: 'warn',    icon: '!' },
+};
+
+function checkFor(key) {
+  return (S.preflight?.courses || []).find(c => c.key === key) || null;
+}
+
+function relativeTime(iso) {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return '';
+  const secs = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (secs < 60) return 'just now';
+  if (secs < 3600) return `${Math.round(secs / 60)} min ago`;
+  return `${Math.round(secs / 3600)} hr ago`;
+}
+
+async function loadCourseCatalog() {
+  try {
+    const data = await api('/course-catalog');
+    S.catalog = data.courses || [];
+    if (data.preflight) S.preflight = data.preflight;
+  } catch (e) {
+    S.catalog = [];
+  }
+  renderCourseOptions();
+  renderPreflight();
+}
+
+function renderCourseOptions() {
+  const sel = $('courseSelect');
+  const previous = S.courseKey;
+  sel.innerHTML = '';
+
+  if (!S.catalog.length) {
+    // Catalog unavailable — fall back to the manual URL flow rather than
+    // stranding the user with an empty dropdown.
+    const opt = document.createElement('option');
+    opt.value = CUSTOM_COURSE;
+    opt.textContent = 'Paste a ForeUp URL';
+    sel.appendChild(opt);
+    sel.value = CUSTOM_COURSE;
+    onCourseChange();
+    return;
+  }
+
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.disabled = true;
+  placeholder.textContent = 'Select a course';
+  sel.appendChild(placeholder);
+
+  S.catalog.forEach(c => {
+    const chk = checkFor(c.key);
+    const mark = chk ? (PREFLIGHT_STATE[chk.status]?.icon || '') : '';
+    const opt = document.createElement('option');
+    opt.value = c.key;
+    opt.textContent = `${c.emoji ? c.emoji + '  ' : ''}${c.name}${mark ? '  ' + mark : ''}`;
+    sel.appendChild(opt);
+  });
+
+  const custom = document.createElement('option');
+  custom.value = CUSTOM_COURSE;
+  custom.textContent = 'Other — paste a ForeUp URL';
+  sel.appendChild(custom);
+
+  sel.value = previous || '';
+  if (!sel.value) sel.selectedIndex = 0;
+  onCourseChange();
+}
+
+function onCourseChange() {
+  const key = $('courseSelect').value;
+  S.courseKey = key;
+  S.overrideBadLink = false;
+
+  if (key === CUSTOM_COURSE) {
+    show('customUrlCard');
+    hide('courseDetail');
+    $('connectBtn').disabled = false;
+    $('connectBtn').textContent = 'Connect';
+    return;
+  }
+
+  hide('customUrlCard');
+  const course = S.catalog.find(c => c.key === key);
+  if (!course) {
+    hide('courseDetail');
+    $('connectBtn').disabled = false;
+    return;
+  }
+
+  // The rest of the app reads these three fields, so the picker writes to them
+  // exactly as a paste would. Nothing downstream needs to know about courses.
+  $('bookingUrl').value = course.booking_url;
+  $('scheduleId').value = course.schedule_id;
+  $('courseId').value = course.course_id;
+
+  renderCourseDetail(course);
+  applyLinkGate(course);
+}
+
+function renderCourseDetail(course) {
+  const chk = checkFor(course.key);
+  const state = chk ? (PREFLIGHT_STATE[chk.status] || PREFLIGHT_STATE.unverified) : null;
+  const rows = [];
+
+  rows.push(`<div class="course-detail-row"><span class="course-detail-label">Booking link</span>
+    <a href="${esc(course.booking_url)}" target="_blank" rel="noopener">${esc(course.booking_url)}</a></div>`);
+  rows.push(`<div class="course-detail-row"><span class="course-detail-label">IDs</span>
+    <code>schedule ${esc(course.schedule_id)}</code> <code>course ${esc(course.course_id)}</code></div>`);
+
+  if (chk) {
+    const label = chk.status === 'ok' ? 'Verified' : (state.cls === 'bad' ? 'Wrong link' : 'Unconfirmed');
+    rows.push(`<div class="course-detail-row"><span class="course-detail-label">Link check</span>
+      <span class="badge badge-${chk.status === 'ok' ? 'success' : (state.cls === 'bad' ? 'error' : 'warning')}">${state.icon} ${esc(label)}</span>
+      <span class="course-detail-note">${esc(chk.detail)}</span></div>`);
+  } else {
+    rows.push(`<div class="course-detail-row"><span class="course-detail-label">Link check</span>
+      <span class="course-detail-note">Not checked yet.</span></div>`);
+  }
+
+  if (course.note) {
+    rows.push(`<div class="course-detail-row"><span class="course-detail-label">Note</span>
+      <span class="course-detail-note">${esc(course.note)}</span></div>`);
+  }
+
+  const rejected = chk && (chk.status === 'mismatch' || chk.status === 'malformed');
+  if (rejected && !S.overrideBadLink) {
+    rows.push(`<div class="course-detail-row"><span class="course-detail-label"></span>
+      <button type="button" class="link-btn" id="overrideLinkBtn">Use this link anyway</button></div>`);
+  }
+
+  $('courseDetail').innerHTML = rows.join('');
+  show('courseDetail');
+
+  $('overrideLinkBtn')?.addEventListener('click', () => {
+    S.overrideBadLink = true;
+    hideAlert('connectError');
+    renderCourseDetail(course);
+    applyLinkGate(course);
+  });
+}
+
+// A link ForeUp actively rejects is the only case worth blocking on. "Could not
+// reach ForeUp" and "a bot check got in the way" are not evidence the link is
+// wrong, so those warn and let the user through.
+function applyLinkGate(course) {
+  const chk = checkFor(course.key);
+  const btn = $('connectBtn');
+  const blocked = chk && (chk.status === 'mismatch' || chk.status === 'malformed') && !S.overrideBadLink;
+  btn.disabled = !!blocked;
+  btn.textContent = 'Connect';
+  if (blocked) {
+    showAlert('connectError',
+      `${course.name}: ${chk.detail} Fix the link, or choose "Other — paste a ForeUp URL".`);
+  }
+}
+
+function renderPreflight() {
+  const banner = $('preflightBanner');
+  const text = $('preflightText');
+  banner.classList.remove('preflight-ok', 'preflight-warn', 'preflight-bad', 'preflight-pending');
+
+  if (!S.preflight) {
+    banner.classList.add('preflight-pending');
+    text.textContent = 'Checking ForeUp booking links…';
+    return;
+  }
+
+  const p = S.preflight;
+  const when = relativeTime(p.checked_at);
+  const cls = p.all_ok ? 'preflight-ok' : (p.any_bad ? 'preflight-bad' : 'preflight-warn');
+  banner.classList.add(cls);
+  const icon = p.all_ok ? '✓' : (p.any_bad ? '✕' : '!');
+  text.textContent = `${icon} ${p.summary}${when ? ' Checked ' + when + '.' : ''}`;
+}
+
+async function runPreflight(refresh) {
+  const btn = $('preflightRecheck');
+  if (btn) btn.disabled = true;
+  if (refresh || !S.preflight) {
+    S.preflight = null;
+    renderPreflight();
+  }
+  try {
+    S.preflight = await api('/course-catalog/preflight' + (refresh ? '?refresh=true' : ''));
+  } catch (e) {
+    // Report the failure as "could not confirm" rather than leaving the banner
+    // spinning forever — the links may well be fine.
+    S.preflight = {
+      checked_at: new Date().toISOString(),
+      ok_count: 0,
+      total: S.catalog.length,
+      all_ok: false,
+      any_bad: false,
+      summary: `Could not run the link check (${e.message}). The built-in links are unchanged — you can still connect.`,
+      courses: [],
+    };
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+  renderPreflight();
+  renderCourseOptions();
+}
+
 // Step 1: Connect
 async function connect() {
   hideAlert('connectError');
+
+  const key = $('courseSelect').value;
+  if (!key) {
+    showAlert('connectError', 'Pick a course first.');
+    return;
+  }
+  if (key !== CUSTOM_COURSE) {
+    const chk = checkFor(key);
+    if (chk && (chk.status === 'mismatch' || chk.status === 'malformed') && !S.overrideBadLink) {
+      showAlert('connectError', `ForeUp rejected this course's link: ${chk.detail}`);
+      return;
+    }
+  } else if (!$('bookingUrl').value.trim() && !$('scheduleId').value.trim()) {
+    showAlert('connectError', 'Paste a ForeUp booking URL, or pick a built-in course.');
+    return;
+  }
+
   const btn = $('connectBtn');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner-inline"></span> Connecting...';
@@ -768,6 +1008,8 @@ document.addEventListener('DOMContentLoaded', () => {
   goToStep(1);
 
   $('bookingUrl').addEventListener('input', (e) => parseBookingUrl(e.target.value));
+  $('courseSelect').addEventListener('change', onCourseChange);
+  $('preflightRecheck').addEventListener('click', () => runPreflight(true));
   $('connectBtn').addEventListener('click', connect);
   $('searchBtn').addEventListener('click', searchTeeTimes);
   $('stopBtn').addEventListener('click', stopJob);
@@ -778,4 +1020,6 @@ document.addEventListener('DOMContentLoaded', () => {
   $('snipeNow').addEventListener('change', toggleSnipeNow);
   $('autoBook').addEventListener('change', toggleCaptchaKey);
   $('bookingClass').addEventListener('change', updateDateRange);
+
+  loadCourseCatalog().then(() => runPreflight(false));
 });
