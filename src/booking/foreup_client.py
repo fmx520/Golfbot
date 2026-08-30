@@ -247,62 +247,21 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             # emailed code, and retrying the same submission with the code. ----
             response: dict[str, Any] = {}
 
-            def _submit(confirmation_code: Optional[str]) -> None:
-                full_payload = self._build_full_reservation_payload(
-                    slot=slot,
-                    raw=raw,
-                    schedule_id=schedule_id,
-                    course_id=course_id or schedule_id,
-                    players=players,
-                    holes=holes,
+            def _do_submit() -> None:
+                response.update(self._submit_with_2fa_recovery(
+                    slot=slot, raw=raw,
+                    schedule_id=schedule_id, course_id=course_id or schedule_id,
+                    players=players, holes=holes,
                     pending_reservation_id=pending_reservation_id,
                     captcha_token=captcha_token,
-                    validate_only=False,
-                    confirmation_code=confirmation_code,
-                )
-                logger.info("reservation_payload", extra={"payload": full_payload, "slot_raw": slot})
-                _emit("reservation_payload", {"payload": full_payload, "with_code": bool(confirmation_code)})
-                try:
-                    resp = self._request(
-                        "POST",
-                        FOREUP_RESERVATIONS_PATH,
-                        stage="reservation_submit",
-                        request_id=req_id,
-                        retry_safe=False,
-                        json=full_payload,
-                    )
-                except ForeUpError as exc:
-                    _emit("reservation_error", {"error": str(exc)})
-                    raise
-                try:
-                    response.update(resp.json())
-                except Exception:
-                    response.update({"raw_body": resp.text[:1000], "status_code": resp.status_code})
-                _emit("reservation_response", {"response": response, "status": resp.status_code})
-
-            def _submit_with_2fa_recovery() -> None:
-                try:
-                    _submit(None)
-                except ForeUpError as exc:
-                    msg = str(exc).lower()
-                    if "booking code" not in msg or request_code_callback is None or not customer_id:
-                        raise
-                    _emit("booking_code_required_detected", {"ttid": pending_reservation_id})
-                    self.request_booking_code(
-                        course_id=str(course_id or schedule_id),
-                        customer_id=str(customer_id),
-                        pending_reservation_id=pending_reservation_id,
-                        request_id=req_id,
-                    )
-                    _emit("awaiting_booking_code", {"ttid": pending_reservation_id})
-                    code = request_code_callback(pending_reservation_id)
-                    if not code:
-                        raise ForeUpError("Booking code was not provided in time")
-                    _submit(code)
+                    customer_id=customer_id,
+                    request_code_callback=request_code_callback,
+                    request_id=req_id, emit=_emit,
+                ))
 
             stage_latencies["reservation_submit"] = self._timed_stage(
                 "reservation_submit",
-                _submit_with_2fa_recovery,
+                _do_submit,
             )
 
             self._mark_idempotent_complete(idempotency_key)
@@ -312,6 +271,148 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         except (RetryableHttpError, ForeUpError):
             self._release_idempotency_key(idempotency_key)
             self._log_flow(req_id, flow_started, None, stage_latencies, "error")
+            raise
+
+    def _submit_reservation(
+        self,
+        *,
+        slot: dict[str, Any],
+        raw: dict[str, Any],
+        schedule_id: str,
+        course_id: str,
+        players: int,
+        holes: int,
+        pending_reservation_id: str,
+        captcha_token: Optional[str],
+        confirmation_code: Optional[str],
+        request_id: str,
+        emit: Callable[[str, dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        """POST the full reservation for an existing hold. Shared by the polled
+        booking path and the pre-staged path so 2FA and payload behaviour cannot
+        drift between them."""
+        full_payload = self._build_full_reservation_payload(
+            slot=slot, raw=raw,
+            schedule_id=schedule_id, course_id=course_id,
+            players=players, holes=holes,
+            pending_reservation_id=pending_reservation_id,
+            captcha_token=captcha_token,
+            validate_only=False,
+            confirmation_code=confirmation_code,
+        )
+        logger.info("reservation_payload", extra={"payload": full_payload, "slot_raw": slot})
+        emit("reservation_payload", {"payload": full_payload, "with_code": bool(confirmation_code)})
+        try:
+            resp = self._request(
+                "POST",
+                FOREUP_RESERVATIONS_PATH,
+                stage="reservation_submit",
+                request_id=request_id,
+                retry_safe=False,
+                json=full_payload,
+            )
+        except ForeUpError as exc:
+            emit("reservation_error", {"error": str(exc)})
+            raise
+        try:
+            response = dict(resp.json())
+        except Exception:
+            response = {"raw_body": resp.text[:1000], "status_code": resp.status_code}
+        emit("reservation_response", {"response": response, "status": resp.status_code})
+        return response
+
+    def _submit_with_2fa_recovery(
+        self,
+        *,
+        slot: dict[str, Any],
+        raw: dict[str, Any],
+        schedule_id: str,
+        course_id: str,
+        players: int,
+        holes: int,
+        pending_reservation_id: str,
+        captcha_token: Optional[str],
+        customer_id: Optional[str],
+        request_code_callback: Optional[Callable[[str], str]],
+        request_id: str,
+        emit: Callable[[str, dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        common = dict(
+            slot=slot, raw=raw, schedule_id=schedule_id, course_id=course_id,
+            players=players, holes=holes,
+            pending_reservation_id=pending_reservation_id,
+            captcha_token=captcha_token, request_id=request_id, emit=emit,
+        )
+        try:
+            return self._submit_reservation(confirmation_code=None, **common)
+        except ForeUpError as exc:
+            msg = str(exc).lower()
+            if "booking code" not in msg or request_code_callback is None or not customer_id:
+                raise
+            emit("booking_code_required_detected", {"ttid": pending_reservation_id})
+            self.request_booking_code(
+                course_id=str(course_id or schedule_id),
+                customer_id=str(customer_id),
+                pending_reservation_id=pending_reservation_id,
+                request_id=request_id,
+            )
+            emit("awaiting_booking_code", {"ttid": pending_reservation_id})
+            code = request_code_callback(pending_reservation_id)
+            if not code:
+                raise ForeUpError("Booking code was not provided in time")
+            return self._submit_reservation(confirmation_code=code, **common)
+
+    def complete_prestaged_hold(
+        self,
+        *,
+        idempotency_key: str,
+        pending_reservation_id: str,
+        target_time: str,
+        template: dict[str, Any],
+        schedule_id: str,
+        course_id: str,
+        players: int,
+        holes: int = 18,
+        captcha_token: Optional[str] = None,
+        customer_id: Optional[str] = None,
+        request_code_callback: Optional[Callable[[str], str]] = None,
+        request_id: Optional[str] = None,
+        debug_callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
+    ) -> dict[str, Any]:
+        """Finish the booking for a hold created by a pre-staged fire.
+
+        The hold already exists, so this runs only the reservation submit —
+        through the same shared path as a polled booking, 2FA recovery included.
+        `template` carries the per-course fields (side id, fees, booking class)
+        cached from a reference teesheet, standing in for the slot data a poll
+        would normally supply.
+        """
+        req_id = request_id or str(uuid.uuid4())
+
+        def _emit(event: str, data: dict[str, Any]) -> None:
+            if debug_callback:
+                try:
+                    debug_callback(event, data)
+                except Exception:
+                    pass
+
+        synthetic_slot = {"time": target_time, "raw_time": target_time, "raw": template}
+        self._acquire_idempotency_key(idempotency_key)
+        try:
+            response = self._submit_with_2fa_recovery(
+                slot=synthetic_slot, raw=template,
+                schedule_id=schedule_id, course_id=course_id or schedule_id,
+                players=players, holes=holes,
+                pending_reservation_id=pending_reservation_id,
+                captcha_token=captcha_token,
+                customer_id=customer_id,
+                request_code_callback=request_code_callback,
+                request_id=req_id, emit=_emit,
+            )
+            self._mark_idempotent_complete(idempotency_key)
+            return response
+        except (RetryableHttpError, ForeUpError):
+            self._release_idempotency_key(idempotency_key)
             raise
 
     def probe_cold_hold(
@@ -326,6 +427,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         teesheet_side_id: str = "",
         green_fee: Any = 0,
         request_id: Optional[str] = None,
+        stage: str = "probe_cold_hold",
     ) -> dict[str, Any]:
         """Try to hold a tee time WITHOUT a preceding availability poll.
 
@@ -368,7 +470,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             resp = self._request(
                 "POST",
                 FOREUP_PENDING_RESERVATION_PATH,
-                stage="probe_cold_hold",
+                stage=stage,
                 request_id=req_id,
                 retry_safe=False,
                 data=payload,

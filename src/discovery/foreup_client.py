@@ -509,7 +509,7 @@ class ForeUpDiscoveryClient:
             # The pre-stage probe exists to measure how fast a hold really is.
             # Leaving it out meant sleeping up to 80ms inside the call being
             # timed, so the probe reported a path the real booking never takes.
-            "probe_cold_hold",
+            "probe_cold_hold", "prestage_hold",
         }
         if stage not in critical_stages:
             time.sleep(random.uniform(0.01, 0.08))

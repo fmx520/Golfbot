@@ -127,6 +127,9 @@ class StartJobRequest(BaseModel):
     course_ids: list[str] = Field(default_factory=list)
     ranking: str = "earliest"
     preselected_slot: dict[str, Any] | None = None
+    # Future Sight: exact times to fire pre-staged holds at, in priority order,
+    # at the release instant — before any polling. Requires auto_book.
+    prestage_times: list[str] = Field(default_factory=list)
 
 
 @dataclass
@@ -823,6 +826,88 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             _emit_event(queue, phase="auth", stage="session", message="No credentials — unauthenticated mode",
                         latency_ms=round((time.perf_counter() - auth_started) * 1000, 2))
 
+        # ---- Future Sight arming: validate targets against the course's real
+        # grid and cache the per-course payload fields, all BEFORE the release
+        # so a bad target fails now, not at 7pm. ----
+        def _norm_hhmm(t: str) -> str:
+            parts = t.strip().split(":")
+            try:
+                return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+            except (ValueError, IndexError):
+                return t.strip()
+
+        prestage_plan: dict[str, Any] | None = None
+        raw_targets = [_norm_hhmm(t) for t in (payload.get("prestage_times") or []) if t and t.strip()]
+        if raw_targets and not (auto_book and not payload.get("dry_run", True)):
+            _emit_event(queue, phase="sniper", stage="prestage_disabled",
+                        message="Future Sight targets ignored — pre-staged holds are real, so they "
+                                "require Auto-book ON and Dry Run OFF.")
+            raw_targets = []
+        if len(raw_targets) > 4:
+            _emit_event(queue, phase="sniper", stage="prestage_capped",
+                        message=f"Future Sight: {len(raw_targets)} targets given, using the first 4 "
+                                f"({', '.join(raw_targets[:4])}). Holds fire one at a time and a "
+                                f"rejection costs ~0.5s, so a long list just delays the poll fallback.")
+            raw_targets = raw_targets[:4]
+
+        if raw_targets:
+            ps_course = sniper_course_ids[0]
+            ps_class = payload.get("booking_class", "")
+            try:
+                if hasattr(discovery, "resolve_booking_class"):
+                    ps_class = discovery.resolve_booking_class(ps_course, ps_class)
+            except ForeUpError as exc:
+                _emit_event(queue, phase="confirm", stage="terminal",
+                            message=f"Future Sight: {exc}", terminal="failed")
+                _flush_race()
+                queue.put({"type": "status", "status": "failed"})
+                _finalize_worker()
+                return
+
+            # The release date's teesheet is empty until it opens, so the grid
+            # and the payload template come from a reference date that is
+            # bookable right now. Interval and phase are properties of the
+            # sheet; only first/last times shift with daylight.
+            ref_date = (datetime.now(EAST_COAST_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
+            ref_slots: list[dict[str, Any]] = []
+            try:
+                ref_slots = discovery.lookup_availability(
+                    schedule_id=ps_course, date=ref_date,
+                    players=payload["players"], holes=holes, booking_class=ps_class,
+                )
+            except ForeUpError as exc:
+                _emit_event(queue, phase="sniper", stage="prestage_grid",
+                            message=f"Future Sight: reference teesheet read failed ({exc}) — "
+                                    f"targets unvalidated, payload fields defaulted.")
+
+            template = (ref_slots[0].get("raw") or {}) if ref_slots else {}
+            ref_grid = analyze_teesheet_grid(sl.get("time", "") for sl in ref_slots)
+            if ref_grid.interval_minutes and ref_grid.consistent:
+                off = [t for t in raw_targets if not ref_grid.matches_interval(t)]
+                if off:
+                    near = ", ".join(ref_grid.grid_times[:4])
+                    _emit_event(queue, phase="confirm", stage="terminal",
+                                message=f"Future Sight: {', '.join(off)} not on this course's "
+                                        f"{ref_grid.interval_minutes}-minute grid (e.g. {near}...). "
+                                        f"These times do not exist on the sheet — fix the targets and re-arm.",
+                                terminal="failed")
+                    _flush_race()
+                    queue.put({"type": "status", "status": "failed"})
+                    _finalize_worker()
+                    return
+                _emit_event(queue, phase="sniper", stage="prestage_armed",
+                            message=f"Future Sight armed: {', '.join(raw_targets)} on course {ps_course} — "
+                                    f"validated against the {ref_grid.interval_minutes}-minute grid "
+                                    f"(reference {ref_date}). Holds fire at the release instant, before polling.")
+            else:
+                _emit_event(queue, phase="sniper", stage="prestage_grid",
+                            message=f"Future Sight: could not confirm the tee grid from {ref_date} "
+                                    f"({'; '.join(ref_grid.notes) or 'no data'}). Proceeding with "
+                                    f"unvalidated targets — polling remains the fallback.")
+
+            prestage_plan = {"times": raw_targets, "course": ps_course,
+                             "booking_class": ps_class, "template": template}
+
         captcha_token: str | None = None
         captcha_solved_at: float = 0
         captcha_solver = None
@@ -1099,7 +1184,103 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             captcha_refresher = Thread(target=_captcha_refresh_loop, daemon=True)
             captcha_refresher.start()
 
-        while time.perf_counter() - poll_start < timeout:
+        # ---- Future Sight: fire pre-staged holds at T+0, before any polling.
+        # Sequential in priority order — a rejection answers in ~150-500ms, and
+        # parallel holds that all succeed would squat on slots we won't book
+        # with no way to release them. First accept wins; the rest never fire.
+        if prestage_plan and booking is not None:
+            tmpl = prestage_plan["template"]
+            _emit_event(queue, phase="sniper", stage="prestage_fire",
+                        message=f"Future Sight: firing holds at {', '.join(prestage_plan['times'])} — "
+                                f"no discovery round trip, straight to the front of the queue.")
+            for ps_time in prestage_plan["times"]:
+                if _cancel_requested():
+                    cancelled = True
+                    break
+                fire_started = time.perf_counter()
+                race.record_first_poll(fire_started)  # first fire vs release = the headline offset
+                hold = booking.probe_cold_hold(
+                    target_time=f"{play_date} {ps_time}",
+                    schedule_id=str(prestage_plan["course"]),
+                    course_id=str(resolved_schedule_id),
+                    players=payload["players"], holes=holes,
+                    booking_class_id=str(tmpl.get("booking_class_id", prestage_plan["booking_class"] or "")),
+                    teesheet_side_id=str(tmpl.get("teesheet_side_id", "")),
+                    green_fee=tmpl.get("green_fee", 0),
+                    request_id=f"{request_id}-ps",
+                    stage="prestage_hold",
+                )
+                hold_ms = hold.get("latency_ms")
+                if not hold.get("accepted"):
+                    err = str(hold.get("error") or hold.get("response") or "")[:160]
+                    race.record_prestage(ps_time, "rejected", hold_ms, error=err)
+                    _emit_event(queue, phase="sniper", stage="prestage_miss",
+                                message=f"Pre-staged {ps_time}: rejected in {hold_ms:.0f}ms ({err}) — next target.")
+                    continue
+
+                race.record_prestage(ps_time, "hold_accepted", hold_ms)
+                race.record_slot_seen(fire_started)
+                _emit_event(queue, phase="sniper", stage="prestage_hit",
+                            message=f"PRE-STAGED HOLD ACCEPTED at {ps_time} in {hold_ms:.0f}ms — completing booking.")
+                try:
+                    submit_started = time.perf_counter()
+                    race.detect_to_submit_ms = 0.0
+                    prestage_response = booking.complete_prestaged_hold(
+                        idempotency_key=f"prestage-{job_id}-{ps_time}",
+                        pending_reservation_id=str(hold.get("reservation_id")),
+                        target_time=f"{play_date} {ps_time}",
+                        template=tmpl,
+                        schedule_id=str(prestage_plan["course"]),
+                        course_id=str(resolved_schedule_id),
+                        players=payload["players"], holes=holes,
+                        captcha_token=captcha_state.get("token"),
+                        customer_id=customer_id,
+                        request_code_callback=request_code_callback,
+                        request_id=request_id,
+                        debug_callback=_sniper_debug,
+                    )
+                    submit_ms = round((time.perf_counter() - submit_started) * 1000, 2)
+                    confirmed, reason = classify_reservation_response(prestage_response)
+                    race.booking_confirmed = confirmed
+                    race.submit_to_confirm_ms = submit_ms
+                    race.record_attempt(
+                        ps_time,
+                        "confirmed" if confirmed else ("failed" if confirmed is False else "unconfirmed"),
+                        error="" if confirmed else reason,
+                        latency_ms=submit_ms,
+                        response=prestage_response,
+                    )
+                    race.booked = True
+                    booked = True
+                    booking_response = prestage_response
+                    selected = {"time": ps_time, "available_spots": payload["players"],
+                                "green_fee": tmpl.get("green_fee", "?"), "raw": tmpl}
+                    if confirmed:
+                        _emit_event(queue, phase="checkout", stage="booking_submit",
+                                    message=f"Booking confirmed via pre-staged hold at {ps_time}",
+                                    latency_ms=submit_ms)
+                    else:
+                        _emit_event(queue, phase="checkout", stage="booking_unconfirmed",
+                                    message=f"Pre-staged submit at {ps_time} returned, but ForeUp's reply "
+                                            f"does not confirm a reservation ({reason}). VERIFY IN YOUR "
+                                            f"COURSE ACCOUNT before relying on this.",
+                                    latency_ms=submit_ms)
+                    break
+                except ForeUpError as exc:
+                    race.record_attempt(ps_time, "failed", error=str(exc),
+                                        latency_ms=round((time.perf_counter() - submit_started) * 1000, 2))
+                    _emit_event(queue, phase="checkout", stage="prestage_submit_failed",
+                                message=f"Pre-staged hold at {ps_time} could not be completed ({exc}) — "
+                                        f"the hold will expire on its own. Trying next target.")
+                    continue
+
+            if not booked and not cancelled and prestage_plan["times"]:
+                _emit_event(queue, phase="sniper", stage="prestage_exhausted",
+                            message="All pre-staged targets missed — falling back to live polling.")
+                # The fire sequence ate a second or two; give polling its full window.
+                poll_start = time.perf_counter()
+
+        while not booked and not cancelled and time.perf_counter() - poll_start < timeout:
             # Top of the loop is the safe point: no hold is open and no booking
             # is in flight, so stopping here cannot strand anything.
             if _cancel_requested():
@@ -1504,7 +1685,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.72"
+APP_VERSION = "0.73"
 
 @app.get("/health")
 def health() -> dict[str, str]:

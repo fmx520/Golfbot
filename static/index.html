@@ -190,6 +190,19 @@
           </div>
           <div class="form-help">Off: bot alerts you when a slot opens, you click to book. On: bot submits the reservation instantly. For 2FA courses (Bethpage) the slot is held while you enter the email code.</div>
         </div>
+
+        <div class="form-group">
+          <label for="prestageTimes">Future Sight &mdash; pre-stage target times (optional)</label>
+          <input type="text" id="prestageTimes" placeholder="e.g. 07:00, 07:09, 07:18" autocomplete="off">
+          <div class="form-help">
+            Exact times, comma-separated, in priority order (max 4). At the release instant these
+            fire as <em>direct holds</em> &mdash; no discovery round trip, ~300ms ahead of a polling
+            bot &mdash; and the first accept gets booked; later targets never fire. Times are checked
+            against the course's real tee grid at arm time (use the probe below to learn it), and
+            normal polling still runs as the fallback if every target misses. Requires Auto-book;
+            ignored on dry runs. Uses the first selected course.
+          </div>
+        </div>
       </div>
 
       <button class="btn btn-primary btn-block" id="searchBtn">Search Tee Times</button>

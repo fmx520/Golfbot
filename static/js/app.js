@@ -247,6 +247,9 @@ async function searchTeeTimes(opts = {}) {
     sniper_mode: isSniper,
     release_time: (isSniper && !$('snipeNow').checked) ? $('releaseTime').value : '',
     auto_book: isSniper ? $('autoBook').checked : false,
+    prestage_times: isSniper
+      ? ($('prestageTimes')?.value || '').split(',').map(s => s.trim()).filter(Boolean)
+      : [],
     anticaptcha_api_key: '',
   };
 

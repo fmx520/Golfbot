@@ -73,6 +73,24 @@ class TeeGrid:
         minutes = _to_minutes(time_str)
         return minutes is not None and _to_hhmm(minutes) in set(self.grid_times)
 
+    def matches_interval(self, time_str: str) -> bool:
+        """Is this time on the course's interval, extrapolating beyond what we saw?
+
+        `is_valid_target` only accepts times between the first and last slot we
+        observed — but on a busy reference day the morning may be fully booked,
+        so the observed span starts at noon while the release-day target is
+        07:00. The interval and phase are properties of the sheet, not of what
+        happens to be open, so validate against those: same modulus, same
+        offset, any hour.
+        """
+        minutes = _to_minutes(time_str)
+        if minutes is None or not self.interval_minutes or not self.first_time:
+            return False
+        anchor = _to_minutes(self.first_time)
+        if anchor is None:
+            return False
+        return (minutes - anchor) % self.interval_minutes == 0
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "interval_minutes": self.interval_minutes,

@@ -222,6 +222,10 @@ class RaceRecorder:
 
     polls: PollStats = field(default_factory=PollStats)
     attempts: list[dict[str, Any]] = field(default_factory=list)
+    # Pre-staged (Future Sight) hold fires at T+0, in priority order. One entry
+    # per target: {time, result, latency_ms, error}. result is hold_accepted /
+    # rejected / error / skipped.
+    prestage: list[dict[str, Any]] = field(default_factory=list)
 
     # 2FA / hold-keepalive evidence. Populated only when the booking-code path
     # fires. hold_refresh_failed distinguishes "the hold died while the user
@@ -278,6 +282,17 @@ class RaceRecorder:
         if self.first_slot_seen_offset_ms is not None or self._release_monotonic is None:
             return
         self.first_slot_seen_offset_ms = round((at_monotonic - self._release_monotonic) * 1000, 2)
+
+    def record_prestage(self, target_time: str, result: str, latency_ms: Optional[float] = None, error: str = "") -> None:
+        self.prestage.append(
+            {
+                "time": target_time,
+                "result": result,
+                "latency_ms": round(latency_ms, 2) if latency_ms is not None else None,
+                "error": error[:300],
+                "at": _now_iso(),
+            }
+        )
 
     def record_attempt(
         self,
@@ -343,6 +358,9 @@ class RaceRecorder:
             bits.append(f"{self.polls.count} polls")
         if self.polls.antibot:
             bits.append(f"{self.polls.antibot} anti-bot")
+        if self.prestage:
+            accepted = sum(1 for p in self.prestage if p.get("result") == "hold_accepted")
+            bits.append(f"pre-staged {len(self.prestage)} ({accepted} accepted)")
         if self.attempts:
             bits.append(f"{len(self.attempts)} submit attempts")
         if self.two_factor_triggered:
@@ -391,6 +409,7 @@ class RaceRecorder:
             },
             "polls": self.polls.as_dict(),
             "attempts": self.attempts,
+            "prestage": self.prestage,
             "two_factor": {
                 "triggered": self.two_factor_triggered,
                 "code_wait_ms": self.code_wait_ms,
