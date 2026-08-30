@@ -128,8 +128,11 @@ class StartJobRequest(BaseModel):
     course_ids: list[str] = Field(default_factory=list)
     ranking: str = "earliest"
     preselected_slot: dict[str, Any] | None = None
-    # Future Sight: exact times to fire pre-staged holds at, in priority order,
-    # at the release instant — before any polling. Requires auto_book.
+    # Future Sight: derive pre-stage targets from the user's time window and the
+    # course's learned grid, and fire them as direct holds at the release
+    # instant. Requires auto_book. prestage_times overrides with explicit times
+    # (API-only — the UI never sends it; users cannot know a course's grid).
+    future_sight: bool = False
     prestage_times: list[str] = Field(default_factory=list)
 
 
@@ -838,11 +841,13 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 return t.strip()
 
         prestage_plan: dict[str, Any] | None = None
+        fs_enabled = bool(payload.get("future_sight"))
         raw_targets = [_norm_hhmm(t) for t in (payload.get("prestage_times") or []) if t and t.strip()]
-        if raw_targets and not (auto_book and not payload.get("dry_run", True)):
+        if (fs_enabled or raw_targets) and not (auto_book and not payload.get("dry_run", True)):
             _emit_event(queue, phase="sniper", stage="prestage_disabled",
-                        message="Future Sight targets ignored — pre-staged holds are real, so they "
-                                "require Auto-book ON and Dry Run OFF.")
+                        message="Future Sight ignored — pre-staged holds are real, so it "
+                                "requires Auto-book ON and Dry Run OFF.")
+            fs_enabled = False
             raw_targets = []
         if len(raw_targets) > 4:
             _emit_event(queue, phase="sniper", stage="prestage_capped",
@@ -851,7 +856,26 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                                 f"rejection costs ~0.5s, so a long list just delays the poll fallback.")
             raw_targets = raw_targets[:4]
 
-        if raw_targets:
+        def _gen_targets(interval: int, phase: int, cap: int = 6) -> list[str]:
+            """Every real tee time inside the user's window, earliest first.
+
+            The user sets a window; the course sets the grid. The intersection
+            is the target list — nobody has to know that Red runs a 9-minute
+            sheet anchored at :03.
+            """
+            def _mins(t: str) -> int:
+                hh, mm = t.split(":")[:2]
+                return int(hh) * 60 + int(mm)
+            start, end = _mins(payload["time_start"]), _mins(payload["time_end"])
+            first = start + ((phase - start) % interval)
+            out = [f"{m // 60:02d}:{m % 60:02d}" for m in range(first, end + 1, interval)]
+            if len(out) > cap:
+                _emit_event(queue, phase="sniper", stage="prestage_window",
+                            message=f"Future Sight: your window holds {len(out)} tee times — "
+                                    f"pre-staging the first {cap} (earliest). Polling covers the rest.")
+            return out[:cap]
+
+        if raw_targets or fs_enabled:
             ps_course = sniper_course_ids[0]
             ps_class = payload.get("booking_class", "")
             try:
@@ -910,6 +934,15 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 grid_store.upsert_grid(course_id=str(ps_course), day_of_week=play_dow,
                                        grid=ref_grid.as_dict(), template=template,
                                        source_date=ref_date)
+                if fs_enabled and not raw_targets:
+                    hh, mm = ref_grid.first_time.split(":")[:2]
+                    phase = (int(hh) * 60 + int(mm)) % ref_grid.interval_minutes
+                    raw_targets = _gen_targets(ref_grid.interval_minutes, phase)
+                    if not raw_targets:
+                        _emit_event(queue, phase="sniper", stage="prestage_window",
+                                    message=f"Future Sight: no tee times on the {ref_grid.interval_minutes}-minute "
+                                            f"grid fall inside your {payload['time_start']}–{payload['time_end']} "
+                                            f"window — widen it. Falling back to pure polling.")
                 off = [t for t in raw_targets if not ref_grid.matches_interval(t)]
                 if off:
                     near = ", ".join(ref_grid.grid_times[:4])
@@ -922,16 +955,24 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     queue.put({"type": "status", "status": "failed"})
                     _finalize_worker()
                     return
-                same_dow = ref_date and datetime.strptime(ref_date, "%Y-%m-%d").date().weekday() == play_dow
-                _emit_event(queue, phase="sniper", stage="prestage_armed",
-                            message=f"Future Sight armed: {', '.join(raw_targets)} on course {ps_course} — "
-                                    f"validated against the {ref_grid.interval_minutes}-minute grid from "
-                                    f"{ref_date}{' (same weekday as the target)' if same_dow else ''}. "
-                                    f"Holds fire at the release instant, before polling.")
+                if raw_targets:
+                    same_dow = ref_date and datetime.strptime(ref_date, "%Y-%m-%d").date().weekday() == play_dow
+                    _emit_event(queue, phase="sniper", stage="prestage_armed",
+                                message=f"Future Sight armed: {', '.join(raw_targets)} on course {ps_course} — "
+                                        f"validated against the {ref_grid.interval_minutes}-minute grid from "
+                                        f"{ref_date}{' (same weekday as the target)' if same_dow else ''}. "
+                                        f"Holds fire at the release instant, before polling.")
             else:
                 # No usable live read — fall back to the registry.
                 stored = grid_store.fetch_grid(course_id=str(ps_course), day_of_week=play_dow)
                 if stored and stored.get("interval_minutes"):
+                    if fs_enabled and not raw_targets and stored.get("anchor_phase") is not None:
+                        raw_targets = _gen_targets(int(stored["interval_minutes"]), int(stored["anchor_phase"]))
+                        if not raw_targets:
+                            _emit_event(queue, phase="sniper", stage="prestage_window",
+                                        message=f"Future Sight: no tee times on the stored grid fall inside "
+                                                f"your {payload['time_start']}–{payload['time_end']} window — "
+                                                f"widen it. Falling back to pure polling.")
                     off = [t for t in raw_targets if grid_store.matches_stored_grid(t, stored) is False]
                     if off:
                         _emit_event(queue, phase="confirm", stage="terminal",
@@ -945,19 +986,28 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                         return
                     if not template:
                         template = stored.get("template") or {}
-                    _emit_event(queue, phase="sniper", stage="prestage_armed",
-                                message=f"Future Sight armed from the stored registry: "
-                                        f"{grid_store.parse_hhmm_row(stored)}. No live reference sheet was "
-                                        f"readable, so targets were validated against remembered data.")
+                    if raw_targets:
+                        _emit_event(queue, phase="sniper", stage="prestage_armed",
+                                    message=f"Future Sight armed: {', '.join(raw_targets)} — from the stored "
+                                            f"registry ({grid_store.parse_hhmm_row(stored)}). No live reference "
+                                            f"sheet was readable, so remembered data was used.")
                 else:
-                    _emit_event(queue, phase="sniper", stage="prestage_grid",
-                                message=f"Future Sight: no live reference sheet "
-                                        f"({'; '.join(ref_grid.notes) or 'no data'}) and nothing stored for "
-                                        f"this course/day yet. Proceeding with unvalidated targets — "
-                                        f"polling remains the fallback.")
+                    if fs_enabled and not raw_targets:
+                        _emit_event(queue, phase="sniper", stage="prestage_grid",
+                                    message=f"Future Sight: no live reference sheet and nothing stored for "
+                                            f"this course/day yet, so targets cannot be derived. Falling "
+                                            f"back to pure polling — run once more after any teesheet read "
+                                            f"and the registry will know this course.")
+                    else:
+                        _emit_event(queue, phase="sniper", stage="prestage_grid",
+                                    message=f"Future Sight: no live reference sheet "
+                                            f"({'; '.join(ref_grid.notes) or 'no data'}) and nothing stored for "
+                                            f"this course/day yet. Proceeding with unvalidated targets — "
+                                            f"polling remains the fallback.")
 
-            prestage_plan = {"times": raw_targets, "course": ps_course,
-                             "booking_class": ps_class, "template": template}
+            if raw_targets:
+                prestage_plan = {"times": raw_targets, "course": ps_course,
+                                 "booking_class": ps_class, "template": template}
 
         captcha_token: str | None = None
         captcha_solved_at: float = 0
@@ -1762,7 +1812,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.74"
+APP_VERSION = "0.75"
 
 @app.get("/health")
 def health() -> dict[str, str]:
