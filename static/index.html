@@ -249,21 +249,35 @@
       <button class="btn btn-danger btn-block mt-1 hidden" id="stopBtn">Stop</button>
 
       <div class="card mt-2">
-        <div class="card-title">Pre-stage probe (experimental)</div>
+        <div class="card-title">Course tee grid</div>
         <div class="form-help">
-          Tests whether ForeUp will hold a tee time <em>without</em> polling for it first.
-          If it works, a release can be raced by firing the hold directly at T+0 instead of
-          waiting on a 100&ndash;500ms discovery round trip. Uses the date, players, holes and
-          booking class above. <strong>Never books anything</strong> &mdash; but a successful hold
-          is real and releases itself after ~2 minutes, so pick a time you don't mind briefly
-          holding.
+          Shows which tee times this course actually offers &mdash; most run on a fixed interval
+          (every 9 minutes from :03, say), so times off that grid simply do not exist. Reads the
+          sheet for the date, players, holes and booking class above and holds nothing.
+          Future Sight works this out on its own, but running it here teaches Golfbot a course
+          whose own sheet is booked solid.
         </div>
-        <button class="btn btn-secondary btn-block mt-1" id="gridBtn">1. Show this course's tee grid</button>
-        <div class="form-group mt-1">
-          <label for="probeTime">Target time (must be on the grid)</label>
-          <select id="probeTime"><option value="">&mdash; run step 1 first &mdash;</option></select>
+        <button class="btn btn-secondary btn-block mt-1" id="gridBtn">Show this course's tee grid</button>
+
+        <!-- Operator tool, hidden unless the page is opened with ?debug=1. A
+             successful probe places a REAL hold for ~2 minutes, so it is not
+             something to leave in front of everyone booking a tee time. It fires
+             the same code path Future Sight uses at a release, which makes it the
+             only way to check the hold works for a course and booking class
+             without waiting for one. -->
+        <div class="hidden" id="probeTools">
+          <div class="form-help mt-2">
+            <strong>Cold-hold probe.</strong> Fires the same hold Future Sight fires at a release,
+            so you can check a course and booking class ahead of time. <strong>Never books
+            anything</strong> &mdash; but the hold is real and releases itself after ~2 minutes,
+            so pick a time you don't mind briefly holding.
+          </div>
+          <div class="form-group mt-1">
+            <label for="probeTime">Target time (must be on the grid)</label>
+            <select id="probeTime"><option value="">&mdash; show the grid first &mdash;</option></select>
+          </div>
+          <button class="btn btn-secondary btn-block" id="probeBtn" disabled>Fire cold-hold probe</button>
         </div>
-        <button class="btn btn-secondary btn-block" id="probeBtn" disabled>2. Fire cold-hold probe</button>
         <div class="event-log mt-1 hidden" id="probeOut"></div>
       </div>
 

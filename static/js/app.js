@@ -856,6 +856,11 @@ async function showTeeGrid() {
              + `<strong>Confidence:</strong> ${esc(g.confidence)} `
              + `(${g.observed_count} open now, ${g.grid_count} real tee times)<br>`
              + `<strong>Usable for pre-staging:</strong> ${g.usable_for_prestage ? 'yes' : 'NO'}`;
+    if (g.learned_courses && g.learned_courses.length) {
+      html += `<br><strong>Remembered:</strong> Golfbot now knows this grid for `
+            + `${esc(g.learned_courses.join(', '))} on this weekday, so Future Sight can `
+            + `aim here even when the reference sheet is full.`;
+    }
     if (breakdown) html += '<br><br>' + breakdown;
     if (g.notes && g.notes.length) {
       html += '<br><br>' + g.notes.map(n => '&bull; ' + esc(n)).join('<br>');
@@ -865,7 +870,7 @@ async function showTeeGrid() {
     probeLog('<strong>Failed:</strong> ' + esc(e.message));
   } finally {
     btn.disabled = false;
-    btn.textContent = "1. Show this course's tee grid";
+    btn.textContent = "Show this course's tee grid";
   }
 }
 
@@ -896,7 +901,7 @@ async function fireColdHoldProbe() {
     probeLog('<strong>Refused:</strong> ' + esc(e.message));
   } finally {
     btn.disabled = false;
-    btn.textContent = '2. Fire cold-hold probe';
+    btn.textContent = 'Fire cold-hold probe';
   }
 }
 
@@ -1021,6 +1026,11 @@ document.addEventListener('DOMContentLoaded', () => {
   $('connectBtn').addEventListener('click', connect);
   $('searchBtn').addEventListener('click', searchTeeTimes);
   $('stopBtn').addEventListener('click', stopJob);
+  // The cold-hold probe places a real hold on real inventory, so it stays out
+  // of the normal booking flow. ?debug=1 brings it back for diagnosing a course.
+  if (new URLSearchParams(location.search).get('debug') === '1') {
+    $('probeTools').classList.remove('hidden');
+  }
   $('gridBtn').addEventListener('click', showTeeGrid);
   $('probeBtn').addEventListener('click', fireColdHoldProbe);
   document.querySelectorAll('input[name="raceStrategy"]').forEach(el =>
