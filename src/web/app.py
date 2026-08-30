@@ -843,6 +843,22 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         prestage_plan: dict[str, Any] | None = None
         fs_enabled = bool(payload.get("future_sight"))
         raw_targets = [_norm_hhmm(t) for t in (payload.get("prestage_times") or []) if t and t.strip()]
+
+        # Pre-staging only beats polling when the targets are known in advance.
+        # At a release every time opens at once, so the whole window is a valid
+        # target list. Started mid-day, exactly one unknown slot has opened —
+        # firing at six times to find out which is a shotgun, while a single
+        # poll would just say. Burning the burst first also delays the polling
+        # that would have won.
+        if (fs_enabled or raw_targets) and not release_time_str:
+            _emit_event(queue, phase="sniper", stage="prestage_disabled",
+                        message="Future Sight needs a release time — started now, there is no known "
+                                "moment when times open, so pre-staged holds would fire at slots that "
+                                "are simply already booked. Running as Sniper (polling) instead, which "
+                                "is the right tool for a mid-day cancellation.")
+            fs_enabled = False
+            raw_targets = []
+
         if (fs_enabled or raw_targets) and not (auto_book and not payload.get("dry_run", True)):
             _emit_event(queue, phase="sniper", stage="prestage_disabled",
                         message="Future Sight ignored — pre-staged holds are real, so it "
@@ -1812,7 +1828,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.76"
+APP_VERSION = "0.77"
 
 @app.get("/health")
 def health() -> dict[str, str]:

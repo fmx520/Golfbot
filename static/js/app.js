@@ -233,6 +233,18 @@ async function searchTeeTimes(opts = {}) {
     return;
   }
 
+  // Future Sight has nothing to aim at without a release moment. The backend
+  // downgrades it to plain Sniper rather than firing blind, but say so here so
+  // an armed job is never quietly not the mode that was picked.
+  if (strategy === 'future_sight' && !$('releaseTime').value) {
+    showAlert('searchError', 'Future Sight needs a release time — it pre-stages holds for the instant ' +
+                             'the sheet opens. For a mid-day cancellation, choose Sniper instead.');
+    btn.disabled = false;
+    btn.innerHTML = 'Arm Future Sight';
+    $('eventLogContainer')?.classList.remove('sniper-armed');
+    return;
+  }
+
   const payload = {
     username: $('username').value.trim(),
     password: $('password').value.trim(),
@@ -715,6 +727,23 @@ function onStrategyChange() {
   } else {
     autoBook.disabled = false;
   }
+  // "Start now" is meaningless for Future Sight: with no release moment there
+  // is nothing to pre-stage against, and the holds would fire at slots that
+  // are simply already booked. Sniper is the right tool for that.
+  const now = $('snipeNow');
+  const nowHelp = $('snipeNowHelp');
+  if (strategy === 'future_sight') {
+    now.checked = false;
+    now.disabled = true;
+    if (nowHelp) nowHelp.textContent =
+      'Not available with Future Sight — pre-staged holds need a known release moment to aim at. ' +
+      'For a mid-day cancellation, choose Sniper instead.';
+  } else {
+    now.disabled = false;
+    if (nowHelp) nowHelp.textContent =
+      'For mid-day cancellations or when a course unexpectedly drops new times. Skips the countdown.';
+  }
+  toggleSnipeNow();
   toggleCaptchaKey();
 }
 
