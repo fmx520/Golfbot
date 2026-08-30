@@ -11,6 +11,9 @@ if _env_file.exists():
             _k, _, _v = _line.partition("=")
             os.environ.setdefault(_k.strip(), _v.strip())
 
+import json as _json
+import logging as _logging
+import sys as _sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -40,6 +43,57 @@ from src.discovery.grid import analyze_teesheet_grid
 from src.telemetry.race_log import RaceRecorder
 
 STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
+
+
+class _StructuredFormatter(_logging.Formatter):
+    """Render a log record and its `extra` fields as one JSON line.
+
+    The clients call logger.info("foreup_request", extra={...}) with the stage,
+    latency, status and retry count for every request. A stock formatter drops
+    all of that, so this keeps the fields that make the record worth having.
+    """
+
+    _BUILTIN = frozenset(_logging.LogRecord("", 0, "", 0, "", None, None).__dict__)
+
+    def format(self, record: _logging.LogRecord) -> str:
+        payload = {"event": record.getMessage(), "level": record.levelname, "logger": record.name}
+        for key, value in record.__dict__.items():
+            if key not in self._BUILTIN and key not in ("message", "asctime"):
+                payload[key] = value
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)[:2000]
+        try:
+            return "GOLFBOT_LOG " + _json.dumps(payload, default=str)
+        except Exception:
+            return f"GOLFBOT_LOG {{\"event\": {record.getMessage()!r}}}"
+
+
+def _configure_logging() -> None:
+    """Send app logs to stdout.
+
+    Nothing configured a handler, so every _log() call in the ForeUp clients —
+    per-request stage, latency, HTTP status, retry count — was being discarded.
+    That instrumentation has never produced a line in production, which is why a
+    slow request could not be broken down after the fact. Race records survived
+    only because they write to stdout directly, bypassing logging entirely.
+
+    Off by default in tests via LOG_LEVEL, and idempotent so repeated imports do
+    not stack handlers and duplicate every line.
+    """
+    root = _logging.getLogger()
+    if any(getattr(h, "_golfbot", False) for h in root.handlers):
+        return
+    handler = _logging.StreamHandler(_sys.stdout)
+    handler.setFormatter(_StructuredFormatter())
+    handler._golfbot = True  # type: ignore[attr-defined]
+    root.addHandler(handler)
+    root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    # Uvicorn already prints its own access lines; leave them alone.
+    for noisy in ("uvicorn.access", "httpx", "httpcore"):
+        _logging.getLogger(noisy).propagate = False
+
+
+_configure_logging()
 
 app = FastAPI(title="Golfbot Web UI")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -1450,7 +1504,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.71"
+APP_VERSION = "0.72"
 
 @app.get("/health")
 def health() -> dict[str, str]:
