@@ -530,6 +530,11 @@ function probeBase() {
     players: parseInt($('players').value),
     holes: parseInt($('holes').value),
     booking_class: $('bookingClass').value,
+    // Multi-course facilities: without these we would only read the course in
+    // the URL, which on Bethpage is Black and is usually full.
+    course_ids: Array.from(
+      document.querySelectorAll('#courseCheckboxes input[type=checkbox]:checked')
+    ).map(el => el.value),
   };
 }
 
@@ -559,11 +564,33 @@ async function showTeeGrid() {
     ).join('') || '<option value="">no grid found</option>';
     $('probeBtn').disabled = g.grid_times.length === 0;
 
-    let html = `<strong>Interval:</strong> ${g.interval_minutes}min &nbsp; `
+    // Always show what was actually read, so an empty result explains itself
+    // rather than looking like a broken lookup.
+    const breakdown = (g.courses || []).map(c =>
+      `&bull; ${esc(c.name || c.course_id)}: ${c.open_count} open`
+      + (c.interval_minutes ? `, ${c.interval_minutes}min grid` : '')
+      + (c.error ? ` — ${esc(c.error)}` : '')
+    ).join('<br>');
+
+    if (!g.observed_count) {
+      probeLog(
+        `<strong>No tee times found on ${esc(g.play_date)}.</strong><br><br>`
+        + (breakdown ? breakdown + '<br><br>' : '')
+        + 'Either that date has not been released yet, or the selected course(s) '
+        + 'are full. Tick a course that has availability (check the ForeUp site), '
+        + 'or pick a nearer date — the grid is a property of the course, so any '
+        + 'bookable date teaches us the same thing.'
+      );
+      return;
+    }
+
+    let html = `<strong>Course:</strong> ${esc(g.course_name || g.course_id)}<br>`
+             + `<strong>Interval:</strong> ${g.interval_minutes}min &nbsp; `
              + `<strong>Range:</strong> ${esc(g.first_time)}–${esc(g.last_time)}<br>`
              + `<strong>Confidence:</strong> ${esc(g.confidence)} `
              + `(${g.observed_count} open now, ${g.grid_count} real tee times)<br>`
              + `<strong>Usable for pre-staging:</strong> ${g.usable_for_prestage ? 'yes' : 'NO'}`;
+    if (breakdown) html += '<br><br>' + breakdown;
     if (g.notes && g.notes.length) {
       html += '<br><br>' + g.notes.map(n => '&bull; ' + esc(n)).join('<br>');
     }

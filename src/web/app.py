@@ -1450,7 +1450,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.70"
+APP_VERSION = "0.71"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -1531,6 +1531,10 @@ class GridRequest(BaseModel):
     foreup_booking_url: str | None = None
     schedule_id: str = ""
     course_id: str = ""
+    # Multi-course facilities (Bethpage: Black/Red/Green/Blue/Yellow) each have
+    # their own teesheet. Without these we would only ever read the one course
+    # in the URL — which may be fully booked while the others have plenty.
+    course_ids: list[str] = Field(default_factory=list)
     players: int = Field(default=1, ge=1, le=4)
     holes: int = Field(default=18, ge=9, le=18)
     booking_class: str = ""
@@ -1567,31 +1571,72 @@ def teesheet_grid(req: GridRequest) -> dict[str, Any]:
                 username=username, password=password,
                 schedule_id=schedule_id, course_id=course_id,
             )
-        booking_class = req.booking_class
-        if hasattr(discovery, "resolve_booking_class") and course_id:
-            booking_class = discovery.resolve_booking_class(course_id, req.booking_class)
 
-        slots = discovery.lookup_availability(
-            schedule_id=course_id or schedule_id,
-            date=req.play_date,
-            players=req.players,
-            holes=req.holes,
-            booking_class=booking_class,
-        )
+        # Read every course the user selected, not just the one in the URL. On a
+        # multi-course facility the URL course is often the busiest (Bethpage
+        # Black) and comes back empty while its siblings have times — which
+        # looks like a broken lookup rather than a full teesheet.
+        targets = [c for c in (req.course_ids or []) if c] or [course_id or schedule_id]
+        per_course: list[dict[str, Any]] = []
+        course_names = {
+            str(c.get("teesheet_id")): c.get("name", "")
+            for c in (getattr(discovery, "_course_options", None) or [])
+        }
+
+        for tid in targets:
+            entry: dict[str, Any] = {"course_id": tid, "name": course_names.get(str(tid), "")}
+            try:
+                bc = req.booking_class
+                if hasattr(discovery, "resolve_booking_class"):
+                    bc = discovery.resolve_booking_class(tid, req.booking_class)
+                entry["booking_class"] = bc
+                found = discovery.lookup_availability(
+                    schedule_id=tid, date=req.play_date,
+                    players=req.players, holes=req.holes, booking_class=bc,
+                )
+                entry["slots"] = found
+                entry["open_count"] = len(found)
+                entry["grid"] = analyze_teesheet_grid(sl.get("time", "") for sl in found)
+            except ForeUpError as exc:
+                entry["slots"] = []
+                entry["open_count"] = 0
+                entry["error"] = str(exc)[:300]
+                entry["grid"] = analyze_teesheet_grid([])
+            per_course.append(entry)
+
+        # Report against the first course that actually returned times, so a
+        # full Black does not hide a usable Red.
+        best = max(per_course, key=lambda e: e["open_count"])
+        slots = best["slots"]
+        course_id = best["course_id"]
     except AntiBotDetectedError as exc:
         raise HTTPException(status_code=502, detail=f"Anti-bot response: {exc}")
     except ForeUpError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
-    grid = analyze_teesheet_grid(s.get("time", "") for s in slots)
+    grid = best["grid"]
     result = grid.as_dict()
     result["play_date"] = req.play_date
     result["schedule_id"] = schedule_id
     result["course_id"] = course_id
+    result["course_name"] = best.get("name", "")
     result["open_times"] = [s.get("time", "") for s in slots]
     result["usable_for_prestage"] = bool(
         grid.consistent and grid.confidence in ("medium", "high")
     )
+    # Per-course breakdown so an empty result explains itself: which courses were
+    # read, under which booking class, and how many times each returned.
+    result["courses"] = [
+        {
+            "course_id": e["course_id"],
+            "name": e.get("name", ""),
+            "booking_class": e.get("booking_class", ""),
+            "open_count": e["open_count"],
+            "interval_minutes": e["grid"].interval_minutes,
+            "error": e.get("error", ""),
+        }
+        for e in per_course
+    ]
     return result
 
 
@@ -1640,6 +1685,13 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
         )
         steps.append("logged in")
 
+        # Probe the course the user actually selected. On a multi-course
+        # facility the URL course is often the busiest and comes back empty.
+        course_id = (
+            next((c for c in (req.course_ids or []) if c), "") or course_id or schedule_id
+        )
+        steps.append(f"course {course_id}")
+
         booking_class = req.booking_class
         if hasattr(discovery, "resolve_booking_class") and course_id:
             booking_class = discovery.resolve_booking_class(course_id, req.booking_class)
@@ -1649,9 +1701,19 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
         # slot. These (side id, fee shape) are stable for a course, so at a real
         # release they would come from cache rather than a live poll.
         slots = discovery.lookup_availability(
-            schedule_id=course_id or schedule_id, date=req.play_date,
+            schedule_id=course_id, date=req.play_date,
             players=req.players, holes=req.holes, booking_class=booking_class,
         )
+        if not slots:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No tee times returned for course {course_id} on {req.play_date} "
+                    f"(booking class {booking_class or 'default'}). Either that date is "
+                    f"not released yet or that course is full — run step 1 to see which "
+                    f"courses have times."
+                ),
+            )
         grid = analyze_teesheet_grid(sl.get("time", "") for sl in slots)
         steps.append(
             f"grid inferred: {grid.interval_minutes}min, "
