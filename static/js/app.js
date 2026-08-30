@@ -215,11 +215,60 @@ function onCourseChange() {
   applyLinkGate(course);
 }
 
+// Course crests. Inline SVG keyed by catalog key, so they cost no request and
+// stay sharp at any pixel density. A native <option> can only hold text, which
+// is why the dropdown keeps the catalog's emoji and the crest appears here, on
+// the detail panel, the moment a course is picked. Unknown keys (and the
+// paste-a-URL flow) fall back to the flag.
+const COURSE_CRESTS = {
+  bethpage: `<circle cx="16" cy="16" r="14.5" fill="#0c1611" stroke="#2fbf6d" stroke-width="1.2"/>
+    <circle cx="16" cy="16" r="11.5" fill="none" stroke="#f0b429" stroke-width="0.8" opacity="0.55"/>
+    <text x="16" y="21.5" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif"
+          font-size="15" font-weight="700" fill="#edf2ec">B</text>`,
+
+  sunken_meadow: `<circle cx="16" cy="16" r="14.5" fill="#0c1611" stroke="#2fbf6d" stroke-width="1.2"/>
+    <circle cx="16" cy="11.5" r="3.4" fill="#f0b429"/>
+    <path d="M7.5 19q3-2.6 6-0 3 2.6 6 0 3-2.6 6 0" fill="none" stroke="#58b6d8"
+          stroke-width="1.5" stroke-linecap="round"/>
+    <path d="M7.5 23.2q3-2.6 6-0 3 2.6 6 0 3-2.6 6 0" fill="none" stroke="#2fbf6d"
+          stroke-width="1.5" stroke-linecap="round" opacity="0.85"/>`,
+
+  montauk_downs: `<circle cx="16" cy="16" r="14.5" fill="#0c1611" stroke="#2fbf6d" stroke-width="1.2"/>
+    <path d="M9.5 10.5h3M19.5 10.5h3" stroke="#f0b429" stroke-width="1.3" stroke-linecap="round"/>
+    <path d="M16 6.5l2.4 3h-4.8z" fill="#edf2ec"/>
+    <rect x="14.1" y="9.4" width="3.8" height="2.8" rx="0.5" fill="#f0b429"/>
+    <path d="M14.4 12.4h3.2l1.5 9.6h-6.2z" fill="#edf2ec"/>
+    <path d="M13.6 17h4.8" stroke="#0c1611" stroke-width="1.4"/>
+    <path d="M8.5 22.4q3.6-1.8 7.5-1.8t7.5 1.8" fill="none" stroke="#2fbf6d"
+          stroke-width="1.5" stroke-linecap="round"/>`,
+
+  crab_meadow: `<circle cx="16" cy="16" r="14.5" fill="#0c1611" stroke="#2fbf6d" stroke-width="1.2"/>
+    <circle cx="10.2" cy="15.4" r="1.9" fill="#e5484d"/>
+    <circle cx="21.8" cy="15.4" r="1.9" fill="#e5484d"/>
+    <ellipse cx="16" cy="18.8" rx="5.2" ry="3.5" fill="#e5484d"/>
+    <path d="M11.2 21.6l-2 2.1M13.2 22.5l-1.2 2.3M20.8 21.6l2 2.1M18.8 22.5l1.2 2.3"
+          stroke="#e5484d" stroke-width="1.2" stroke-linecap="round"/>
+    <circle cx="14.3" cy="17.9" r="0.85" fill="#0c1611"/>
+    <circle cx="17.7" cy="17.9" r="0.85" fill="#0c1611"/>`,
+};
+
+const FALLBACK_CREST = `<circle cx="16" cy="16" r="14.5" fill="#0c1611" stroke="#2fbf6d" stroke-width="1.2"/>
+  <path d="M12.5 24V8.5" stroke="#edf2ec" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M12.5 9.2l8 2.9-8 2.9z" fill="#f0b429"/>
+  <circle cx="20" cy="22.5" r="1.9" fill="#edf2ec"/>`;
+
+function crestFor(key) {
+  return `<svg class="course-crest" viewBox="0 0 32 32" aria-hidden="true" focusable="false">`
+       + (COURSE_CRESTS[key] || FALLBACK_CREST) + `</svg>`;
+}
+
 function renderCourseDetail(course) {
   const chk = checkFor(course.key);
   const state = chk ? (PREFLIGHT_STATE[chk.status] || PREFLIGHT_STATE.unverified) : null;
   const rows = [];
 
+  rows.push(`<div class="course-detail-head">${crestFor(course.key)}
+    <span class="course-detail-name">${esc(course.name)}</span></div>`);
   rows.push(`<div class="course-detail-row"><span class="course-detail-label">Booking link</span>
     <a href="${esc(course.booking_url)}" target="_blank" rel="noopener">${esc(course.booking_url)}</a></div>`);
   rows.push(`<div class="course-detail-row"><span class="course-detail-label">IDs</span>

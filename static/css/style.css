@@ -1017,12 +1017,6 @@ body::before {
   .summary-value { text-align: left; }
 }
 
-.checkbox-list { display: flex; flex-direction: column; gap: 6px; padding: 8px; background: var(--bg-tertiary); border-radius: var(--radius-sm); }
-.checkbox-row { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: var(--fs-sm); }
-.checkbox-row input[type=checkbox] { margin: 0; }
-.checkbox-row .muted { color: var(--text-muted); font-size: var(--fs-xs); }
-.form-help { color: var(--text-muted); font-size: var(--fs-xs); margin-top: 4px; }
-
 /* Course link preflight: the banner is the one place the user is told whether
    the built-in ForeUp links were actually confirmed, so each verdict gets its
    own colour rather than a generic info style. */
@@ -1081,6 +1075,23 @@ body::before {
   gap: 8px;
   font-size: var(--fs-sm);
 }
+.course-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.course-crest { width: 30px; height: 30px; flex-shrink: 0; display: block; }
+
+.course-detail-name {
+  font-family: var(--font-display);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
 .course-detail-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
 .course-detail-label {
   flex: 0 0 88px;
