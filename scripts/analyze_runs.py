@@ -158,6 +158,23 @@ def _report_races(races: list[dict[str, Any]]) -> None:
         for key, values in latencies.items():
             print(f"  {key:<22} {_median(values):.0f}ms  (n={len(values)})")
 
+    # Future Sight: how the pre-staged fires are doing across races.
+    ps_races = [r for r in races if r.get("prestage")]
+    if ps_races:
+        fires = [p for r in ps_races for p in r["prestage"]]
+        accepted = [p for p in fires if p.get("result") == "hold_accepted"]
+        lat = [p["latency_ms"] for p in accepted if p.get("latency_ms") is not None]
+        print(f"\nFuture Sight: {len(ps_races)} race(s) pre-staged, "
+              f"{len(fires)} fires, {len(accepted)} holds accepted")
+        if lat:
+            print(f"  accepted-hold latency: median {_median(lat):.0f}ms")
+        reasons = Counter(
+            (p.get("error") or "").split("|")[-1].strip()[:60]
+            for p in fires if p.get("result") == "rejected"
+        )
+        for reason, count in reasons.most_common(3):
+            print(f"  {count:>3}x rejected: {reason or '(no body)'}")
+
     blocked_polls = sum((r.get("polls") or {}).get("antibot", 0) for r in races)
     if blocked_polls:
         print(f"\nAnti-bot rejected polls across all races: {blocked_polls}")

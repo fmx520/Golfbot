@@ -112,3 +112,25 @@ alter table races enable row level security;
 --
 --   select date_trunc('day', created_at) as day, count(*)
 --   from races group by 1 order by 1 desc;
+
+-- Future Sight post-mortem: what happened to each pre-staged fire in the last
+-- release, in firing order, with the offset from the release instant.
+--
+--   select r.run_id,
+--          p->>'time'   as target,
+--          p->>'result' as result,
+--          (p->>'latency_ms')::numeric as hold_ms,
+--          round(extract(epoch from
+--              (p->>'at')::timestamptz - (r.release_at)::timestamptz
+--          ) * 1000) as fired_at_offset_ms,
+--          left(p->>'error', 80) as error
+--   from races r, jsonb_array_elements(r.prestage) p
+--   where jsonb_array_length(r.prestage) > 0
+--   order by r.created_at desc, (p->>'at')::timestamptz
+--   limit 40;
+
+-- Did pre-staging beat polling? Compare how races end with and without it.
+--
+--   select (jsonb_array_length(coalesce(prestage,'[]')) > 0) as prestaged,
+--          outcome, count(*)
+--   from races group by 1, 2 order by 1 desc, 3 desc;
