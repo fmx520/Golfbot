@@ -693,6 +693,14 @@ function renderResults(jobData) {
 
   container.innerHTML = statusHtml;
 
+  // Mirror the run's timeline onto the results page so the log there isn't an
+  // empty box after every job.
+  const resultsLog = $('resultsEventLog');
+  if (resultsLog) {
+    resultsLog.innerHTML = $('eventLog')?.innerHTML || '';
+    resultsLog.scrollTop = resultsLog.scrollHeight;
+  }
+
   const bookNow = $('bookNowBtn');
   if (bookNow) {
     bookNow.onclick = () => {
