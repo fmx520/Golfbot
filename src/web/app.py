@@ -40,6 +40,7 @@ from src.booking.foreup_client import ForeUpBookingClient, classify_reservation_
 from src.config import load_config
 from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
 from src.discovery.grid import analyze_teesheet_grid
+from src.telemetry import grid_store
 from src.telemetry.race_log import RaceRecorder
 
 STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
@@ -865,24 +866,50 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 return
 
             # The release date's teesheet is empty until it opens, so the grid
-            # and the payload template come from a reference date that is
-            # bookable right now. Interval and phase are properties of the
-            # sheet; only first/last times shift with daylight.
-            ref_date = (datetime.now(EAST_COAST_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
-            ref_slots: list[dict[str, Any]] = []
+            # comes from a day that is already visible. Best reference: the same
+            # day-of-week one week earlier — the booking window means it is
+            # published right now, and weekend sheets can differ from weekday
+            # ones. Fall back to tomorrow, then to the stored registry, so a
+            # booked-solid reference day no longer means guessing.
             try:
-                ref_slots = discovery.lookup_availability(
-                    schedule_id=ps_course, date=ref_date,
-                    players=payload["players"], holes=holes, booking_class=ps_class,
-                )
-            except ForeUpError as exc:
-                _emit_event(queue, phase="sniper", stage="prestage_grid",
-                            message=f"Future Sight: reference teesheet read failed ({exc}) — "
-                                    f"targets unvalidated, payload fields defaulted.")
+                play_dt = datetime.strptime(play_date, "%Y-%m-%d").date()
+            except ValueError:
+                play_dt = (datetime.now(EAST_COAST_TZ) + timedelta(days=1)).date()
+            today_east = datetime.now(EAST_COAST_TZ).date()
+            week_before = play_dt - timedelta(days=7)
+            ref_candidates = []
+            if today_east <= week_before < play_dt:
+                ref_candidates.append(week_before.isoformat())
+            tomorrow = (today_east + timedelta(days=1)).isoformat()
+            if tomorrow not in ref_candidates:
+                ref_candidates.append(tomorrow)
+
+            ref_slots: list[dict[str, Any]] = []
+            ref_date = ""
+            for cand in ref_candidates:
+                try:
+                    found = discovery.lookup_availability(
+                        schedule_id=ps_course, date=cand,
+                        players=payload["players"], holes=holes, booking_class=ps_class,
+                    )
+                except ForeUpError as exc:
+                    _emit_event(queue, phase="sniper", stage="prestage_grid",
+                                message=f"Future Sight: teesheet read for {cand} failed ({exc}).")
+                    continue
+                if found:
+                    ref_slots, ref_date = found, cand
+                    break
 
             template = (ref_slots[0].get("raw") or {}) if ref_slots else {}
             ref_grid = analyze_teesheet_grid(sl.get("time", "") for sl in ref_slots)
+            play_dow = play_dt.weekday()
+
             if ref_grid.interval_minutes and ref_grid.consistent:
+                # Live read worked — validate, and bank what we learned so the
+                # next arm can survive a booked-out reference day.
+                grid_store.upsert_grid(course_id=str(ps_course), day_of_week=play_dow,
+                                       grid=ref_grid.as_dict(), template=template,
+                                       source_date=ref_date)
                 off = [t for t in raw_targets if not ref_grid.matches_interval(t)]
                 if off:
                     near = ", ".join(ref_grid.grid_times[:4])
@@ -895,15 +922,39 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     queue.put({"type": "status", "status": "failed"})
                     _finalize_worker()
                     return
+                same_dow = ref_date and datetime.strptime(ref_date, "%Y-%m-%d").date().weekday() == play_dow
                 _emit_event(queue, phase="sniper", stage="prestage_armed",
                             message=f"Future Sight armed: {', '.join(raw_targets)} on course {ps_course} — "
-                                    f"validated against the {ref_grid.interval_minutes}-minute grid "
-                                    f"(reference {ref_date}). Holds fire at the release instant, before polling.")
+                                    f"validated against the {ref_grid.interval_minutes}-minute grid from "
+                                    f"{ref_date}{' (same weekday as the target)' if same_dow else ''}. "
+                                    f"Holds fire at the release instant, before polling.")
             else:
-                _emit_event(queue, phase="sniper", stage="prestage_grid",
-                            message=f"Future Sight: could not confirm the tee grid from {ref_date} "
-                                    f"({'; '.join(ref_grid.notes) or 'no data'}). Proceeding with "
-                                    f"unvalidated targets — polling remains the fallback.")
+                # No usable live read — fall back to the registry.
+                stored = grid_store.fetch_grid(course_id=str(ps_course), day_of_week=play_dow)
+                if stored and stored.get("interval_minutes"):
+                    off = [t for t in raw_targets if grid_store.matches_stored_grid(t, stored) is False]
+                    if off:
+                        _emit_event(queue, phase="confirm", stage="terminal",
+                                    message=f"Future Sight: {', '.join(off)} not on the stored grid for this "
+                                            f"course/day ({grid_store.parse_hhmm_row(stored)}). Fix the targets "
+                                            f"and re-arm.",
+                                    terminal="failed")
+                        _flush_race()
+                        queue.put({"type": "status", "status": "failed"})
+                        _finalize_worker()
+                        return
+                    if not template:
+                        template = stored.get("template") or {}
+                    _emit_event(queue, phase="sniper", stage="prestage_armed",
+                                message=f"Future Sight armed from the stored registry: "
+                                        f"{grid_store.parse_hhmm_row(stored)}. No live reference sheet was "
+                                        f"readable, so targets were validated against remembered data.")
+                else:
+                    _emit_event(queue, phase="sniper", stage="prestage_grid",
+                                message=f"Future Sight: no live reference sheet "
+                                        f"({'; '.join(ref_grid.notes) or 'no data'}) and nothing stored for "
+                                        f"this course/day yet. Proceeding with unvalidated targets — "
+                                        f"polling remains the fallback.")
 
             prestage_plan = {"times": raw_targets, "course": ps_course,
                              "booking_class": ps_class, "template": template}
@@ -1190,10 +1241,24 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         # with no way to release them. First accept wins; the rest never fire.
         if prestage_plan and booking is not None:
             tmpl = prestage_plan["template"]
+            # A ForeUp release is not guaranteed to be atomic at T+0.000 — the
+            # sheet can publish a beat late, and a single pass through the
+            # targets would burn them all against an unpublished sheet and fall
+            # back to polling in exactly the race pre-staging exists to win. So
+            # the target list re-fires in a short burst: rejected holds cost
+            # nothing and hold nothing, and the first accept still stops
+            # everything.
+            burst_seconds = float(os.getenv("SNIPER_PRESTAGE_BURST_SECONDS", "5"))
+            burst_started = time.perf_counter()
+            burst_pass = 0
             _emit_event(queue, phase="sniper", stage="prestage_fire",
                         message=f"Future Sight: firing holds at {', '.join(prestage_plan['times'])} — "
-                                f"no discovery round trip, straight to the front of the queue.")
-            for ps_time in prestage_plan["times"]:
+                                f"no discovery round trip, straight to the front of the queue. "
+                                f"Re-firing for up to {burst_seconds:.0f}s in case the sheet publishes late.")
+          
+            while not booked and not cancelled:
+              burst_pass += 1
+              for ps_time in prestage_plan["times"]:
                 if _cancel_requested():
                     cancelled = True
                     break
@@ -1207,15 +1272,16 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     booking_class_id=str(tmpl.get("booking_class_id", prestage_plan["booking_class"] or "")),
                     teesheet_side_id=str(tmpl.get("teesheet_side_id", "")),
                     green_fee=tmpl.get("green_fee", 0),
-                    request_id=f"{request_id}-ps",
+                    request_id=f"{request_id}-ps{burst_pass}",
                     stage="prestage_hold",
                 )
                 hold_ms = hold.get("latency_ms")
                 if not hold.get("accepted"):
                     err = str(hold.get("error") or hold.get("response") or "")[:160]
                     race.record_prestage(ps_time, "rejected", hold_ms, error=err)
-                    _emit_event(queue, phase="sniper", stage="prestage_miss",
-                                message=f"Pre-staged {ps_time}: rejected in {hold_ms:.0f}ms ({err}) — next target.")
+                    if burst_pass == 1:
+                        _emit_event(queue, phase="sniper", stage="prestage_miss",
+                                    message=f"Pre-staged {ps_time}: rejected in {hold_ms:.0f}ms ({err}) — next target.")
                     continue
 
                 race.record_prestage(ps_time, "hold_accepted", hold_ms)
@@ -1274,10 +1340,21 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                                         f"the hold will expire on its own. Trying next target.")
                     continue
 
+              # Pass finished with nothing booked. Re-fire until the burst
+              # window closes, with a short breather between passes.
+              if booked or cancelled:
+                  break
+              if time.perf_counter() - burst_started >= burst_seconds:
+                  break
+              time.sleep(0.25)
+
             if not booked and not cancelled and prestage_plan["times"]:
+                fired = len(race.prestage)
                 _emit_event(queue, phase="sniper", stage="prestage_exhausted",
-                            message="All pre-staged targets missed — falling back to live polling.")
-                # The fire sequence ate a second or two; give polling its full window.
+                            message=f"All pre-staged targets missed across {burst_pass} pass(es) "
+                                    f"({fired} fires in {time.perf_counter() - burst_started:.1f}s) — "
+                                    f"falling back to live polling.")
+                # The fire burst ate a few seconds; give polling its full window.
                 poll_start = time.perf_counter()
 
         while not booked and not cancelled and time.perf_counter() - poll_start < timeout:
@@ -1685,7 +1762,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.73"
+APP_VERSION = "0.74"
 
 @app.get("/health")
 def health() -> dict[str, str]:

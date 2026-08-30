@@ -199,7 +199,8 @@
             fire as <em>direct holds</em> &mdash; no discovery round trip, ~300ms ahead of a polling
             bot &mdash; and the first accept gets booked; later targets never fire. Times are checked
             against the course's real tee grid at arm time (use the probe below to learn it), and
-            normal polling still runs as the fallback if every target misses. Requires Auto-book;
+            the list re-fires for ~5s in case the sheet publishes late, and normal polling
+            still runs as the fallback if every target misses. Requires Auto-book;
             ignored on dry runs. Uses the first selected course.
           </div>
         </div>
