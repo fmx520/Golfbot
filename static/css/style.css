@@ -1065,6 +1065,92 @@ body::before {
 .link-btn:hover { color: var(--accent-hover); }
 .link-btn:disabled { color: var(--text-muted); cursor: default; }
 
+/* ── Course picker ──────────────────────────────────────────────────────── */
+
+/* #courseSelect stays in the DOM as the source of truth but is taken out of
+   sight and out of the tab order; the rows below drive it. Scoped under
+   .form-group so it outranks the text-field `width: 100%` rule. */
+.form-group select.course-select-fallback {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.course-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.course-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  text-align: left;
+  padding: 10px 12px;
+  background: var(--bg-sunk);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--fs-base);
+  cursor: pointer;
+  transition: border-color .16s ease, background-color .16s ease, box-shadow .16s ease;
+}
+
+.course-row:hover {
+  border-color: var(--border-light);
+  background: var(--bg-tertiary);
+}
+
+.course-row.selected {
+  border-color: var(--accent-line);
+  background: linear-gradient(180deg, var(--accent-bg), rgba(47, 191, 109, 0.03));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.course-row .course-crest { width: 28px; height: 28px; }
+
+.course-row-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.course-row-name {
+  font-family: var(--font-display);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  line-height: 1.25;
+  min-width: 0;
+}
+
+.course-row.selected .course-row-name { color: var(--accent-hover); }
+
+.course-row-sub {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.course-row-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.course-row-badge { margin-left: auto; flex-shrink: 0; }
+
 .course-detail {
   margin-top: 0.5rem;
   padding: 10px;
@@ -1075,22 +1161,7 @@ body::before {
   gap: 8px;
   font-size: var(--fs-sm);
 }
-.course-detail-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--border);
-}
-
 .course-crest { width: 30px; height: 30px; flex-shrink: 0; display: block; }
-
-.course-detail-name {
-  font-family: var(--font-display);
-  font-size: var(--fs-md);
-  font-weight: 600;
-  color: var(--text-primary);
-}
 
 .course-detail-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
 .course-detail-label {

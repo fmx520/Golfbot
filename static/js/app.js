@@ -155,6 +155,7 @@ function renderCourseOptions() {
     opt.textContent = 'Paste a ForeUp URL';
     sel.appendChild(opt);
     sel.value = CUSTOM_COURSE;
+    renderCoursePicker();
     onCourseChange();
     return;
   }
@@ -181,13 +182,70 @@ function renderCourseOptions() {
 
   sel.value = previous || '';
   if (!sel.value) sel.selectedIndex = 0;
+  renderCoursePicker();
   onCourseChange();
+}
+
+// The picker mirrors the <select>: a row writes the key and dispatches `change`,
+// so onCourseChange and applyLinkGate run exactly as they do for a native pick.
+function renderCoursePicker() {
+  const box = $('coursePicker');
+  if (!box) return;
+  box.innerHTML = '';
+
+  const entries = S.catalog.map(c => ({
+    key: c.key,
+    name: c.name,
+    sub: c.note || '',
+    check: checkFor(c.key),
+  }));
+  entries.push({ key: CUSTOM_COURSE, name: 'Other course', sub: 'Paste a ForeUp booking URL', check: null });
+
+  entries.forEach(e => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'course-row';
+    row.dataset.key = e.key;
+
+    let badge = '';
+    if (e.check) {
+      const st = PREFLIGHT_STATE[e.check.status] || PREFLIGHT_STATE.unverified;
+      const label = e.check.status === 'ok' ? 'Verified' : (st.cls === 'bad' ? 'Wrong link' : 'Unconfirmed');
+      const kind = e.check.status === 'ok' ? 'success' : (st.cls === 'bad' ? 'error' : 'warning');
+      badge = `<span class="badge badge-${kind} course-row-badge">${st.icon} ${esc(label)}</span>`;
+    }
+
+    row.innerHTML = crestFor(e.key)
+      + `<span class="course-row-text">`
+      + `<span class="course-row-head"><span class="course-row-name">${esc(e.name)}</span>${badge}</span>`
+      + (e.sub ? `<span class="course-row-sub">${esc(e.sub)}</span>` : '')
+      + `</span>`;
+
+    row.addEventListener('click', () => {
+      const sel = $('courseSelect');
+      sel.value = e.key;
+      sel.dispatchEvent(new Event('change'));
+    });
+    box.appendChild(row);
+  });
+
+  syncPickerSelection();
+}
+
+function syncPickerSelection() {
+  const current = $('courseSelect')?.value || '';
+  document.querySelectorAll('#coursePicker .course-row').forEach(row => {
+    const on = row.dataset.key === current;
+    row.classList.toggle('selected', on);
+    row.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
 }
 
 function onCourseChange() {
   const key = $('courseSelect').value;
   S.courseKey = key;
   S.overrideBadLink = false;
+  syncPickerSelection();
 
   if (key === CUSTOM_COURSE) {
     show('customUrlCard');
@@ -267,8 +325,6 @@ function renderCourseDetail(course) {
   const state = chk ? (PREFLIGHT_STATE[chk.status] || PREFLIGHT_STATE.unverified) : null;
   const rows = [];
 
-  rows.push(`<div class="course-detail-head">${crestFor(course.key)}
-    <span class="course-detail-name">${esc(course.name)}</span></div>`);
   rows.push(`<div class="course-detail-row"><span class="course-detail-label">Booking link</span>
     <a href="${esc(course.booking_url)}" target="_blank" rel="noopener">${esc(course.booking_url)}</a></div>`);
   rows.push(`<div class="course-detail-row"><span class="course-detail-label">IDs</span>

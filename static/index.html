@@ -70,7 +70,12 @@
 
         <div class="form-group mt-1">
           <label for="courseSelect">Which course?</label>
-          <select id="courseSelect">
+          <!-- The visual picker is rendered into #coursePicker. #courseSelect stays
+               in the DOM as the single source of truth (and as the fallback if the
+               catalog never loads); the rows just write to it and fire `change`, so
+               every downstream reader is untouched. -->
+          <div class="course-picker" id="coursePicker" role="group" aria-label="Course"></div>
+          <select id="courseSelect" class="course-select-fallback" tabindex="-1" aria-hidden="true">
             <option value="" disabled selected>Loading courses&hellip;</option>
           </select>
         </div>
