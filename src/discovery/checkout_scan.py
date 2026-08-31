@@ -139,27 +139,49 @@ _CONCAT = re.compile(r"""(REST_API_URL|BASE_API_URL|COURSE_ID|API_URL)""")
 
 
 def find_api_calls(text: str, names: Iterable[str] = API_NAMES) -> list[dict[str, Any]]:
-    """Locate named API helpers and recover the URL each one builds.
+    """Locate named API helpers and recover the URL each one actually builds.
 
-    Minification renames the local function but leaves the exported name and
-    the URL string literals intact, so a window around the name is enough to
-    read the endpoint back out.
+    Minified bundles export as `e.postCreateBooking=n`, where `n` is a short
+    local defined *earlier*. Reading a window around the exported name is
+    useless -- the exports are chained together, so every name sits beside
+    every other name's URLs. Following the reference back to `const n=` is what
+    separates one endpoint from the next.
     """
     out: list[dict[str, Any]] = []
     for name in names:
-        for m in re.finditer(re.escape(name), text):
-            window = text[max(0, m.start() - 200): m.start() + 1600]
-            urls = [u for u in _URLISH.findall(window) if "/" in u]
-            bases = sorted(set(_CONCAT.findall(window)))
-            if not urls and not bases:
+        best: Optional[dict[str, Any]] = None
+        # The real assignment binds a short identifier; the chained placeholder
+        # list at the top of the module binds other `e.` names instead.
+        for m in re.finditer(r"\.%s\s*=\s*([A-Za-z_$][\w$]{0,4})\s*[,;)]" % re.escape(name), text):
+            ident = m.group(1)
+            head = text[: m.start()]
+            defn = max(
+                head.rfind(f"const {ident}="),
+                head.rfind(f"var {ident}="),
+                head.rfind(f",{ident}="),
+                head.rfind(f";{ident}="),
+            )
+            if defn == -1:
                 continue
-            out.append({
+            body = text[defn: m.start()]
+            if len(body) > 4000:  # not a definition, just a distant coincidence
+                body = body[-4000:]
+            urls = [u for u in _URLISH.findall(body) if "/" in u]
+            bases = sorted(set(_CONCAT.findall(body)))
+            method = "POST" if re.search(r"method\s*:\s*[\"']POST", body) else ""
+            cand = {
                 "name": name,
-                "url_fragments": sorted(set(urls))[:8],
+                "local": ident,
+                "method": method or ("POST" if name.startswith("post") else "GET"),
+                "url_fragments": sorted(set(urls))[:6],
                 "url_bases": bases,
-                "excerpt": " ".join(window[200:900].split())[:600],
-            })
-            break
+                "excerpt": " ".join(body.split())[:600],
+            }
+            # Prefer the tightest definition: the one with the fewest stray URLs.
+            if best is None or len(cand["url_fragments"]) < len(best["url_fragments"]):
+                best = cand
+        if best and best["url_fragments"]:
+            out.append(best)
     return out
 
 
