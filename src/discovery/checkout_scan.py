@@ -120,6 +120,49 @@ def scan_source(name: str, text: str, known_keys: Iterable[str]) -> dict[str, An
     }
 
 
+# ForeUp's booking bundle exports its API surface by name. Two of these are
+# calls we have never made, and one of them -- postNonCreditCardPaymentType --
+# is the shape of the "Pay at Facility" selection that sits between the code
+# prompt and Book Time.
+API_NAMES = (
+    "postNonCreditCardPaymentType",
+    "postCreateBooking",
+    "postCreditCardWindow",
+    "postPendingReservationRefresh",
+    "getDetailedCart",
+    "postGoogleBookingConversion",
+)
+
+# Path-ish string literals: what a fetch() target looks like once minified.
+_URLISH = re.compile(r"""["'`]([/][A-Za-z0-9_\-/{}.:]{3,120}|[A-Za-z0-9_]+/[A-Za-z0-9_\-/{}.:]{3,120})["'`]""")
+_CONCAT = re.compile(r"""(REST_API_URL|BASE_API_URL|COURSE_ID|API_URL)""")
+
+
+def find_api_calls(text: str, names: Iterable[str] = API_NAMES) -> list[dict[str, Any]]:
+    """Locate named API helpers and recover the URL each one builds.
+
+    Minification renames the local function but leaves the exported name and
+    the URL string literals intact, so a window around the name is enough to
+    read the endpoint back out.
+    """
+    out: list[dict[str, Any]] = []
+    for name in names:
+        for m in re.finditer(re.escape(name), text):
+            window = text[max(0, m.start() - 200): m.start() + 1600]
+            urls = [u for u in _URLISH.findall(window) if "/" in u]
+            bases = sorted(set(_CONCAT.findall(window)))
+            if not urls and not bases:
+                continue
+            out.append({
+                "name": name,
+                "url_fragments": sorted(set(urls))[:8],
+                "url_bases": bases,
+                "excerpt": " ".join(window[200:900].split())[:600],
+            })
+            break
+    return out
+
+
 def scan_checkout(
     *,
     html: str,
@@ -130,6 +173,7 @@ def scan_checkout(
 ) -> dict[str, Any]:
     """Scan the booking page and its scripts for the reservation payload builder."""
     results: list[dict[str, Any]] = []
+    sources: list[tuple[str, str]] = [("(booking page HTML)", html)]
     budget = MAX_BYTES
 
     # The page itself first: ForeUp inlines a good deal of its booking code.
@@ -142,10 +186,22 @@ def scan_checkout(
         if not text:
             continue
         budget -= len(text)
+        sources.append((url, text))
         found = scan_source(url, text, known_keys)
         # Only keep scripts that actually touch the reservation.
         if found["anchor_hits"]:
             results.append(found)
+
+    # Also hunt the named API helpers wherever they live, anchored or not.
+    api_calls: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for name, text in sources:
+        for call in find_api_calls(text):
+            if call["name"] in seen_names:
+                continue
+            seen_names.add(call["name"])
+            call["script"] = name
+            api_calls.append(call)
 
     anchored = [r for r in results if r["anchor_hits"]]
     all_candidates: set[str] = set()
@@ -157,6 +213,7 @@ def scan_checkout(
         "scripts_with_payload_code": [r["script"] for r in anchored],
         "results": anchored or results[:1],
         "candidate_fields": sorted(all_candidates)[:80],
+        "api_calls": api_calls,
         "verdict": (
             f"Found the reservation payload in {len(anchored)} source(s). "
             f"{len(all_candidates)} field name(s) appear near it that we do not send — "

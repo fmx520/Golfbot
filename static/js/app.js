@@ -996,6 +996,16 @@ async function scanCheckoutFields() {
       html += '<br><br><strong>Payload code found in:</strong><br>'
             + r.scripts_with_payload_code.map(x => '&bull; ' + esc(x)).join('<br>');
     }
+    if ((r.api_calls || []).length) {
+      // The endpoints ForeUp's own checkout calls. Any we don't call is a
+      // step we skip, which is the likeliest home of the fee.
+      html += '<br><br><strong>ForeUp checkout API calls found:</strong>';
+      for (const a of r.api_calls) {
+        html += `<br>&bull; <strong>${esc(a.name)}</strong> &rarr; <code>`
+              + esc((a.url_fragments || []).join('  ')) + '</code>'
+              + ((a.url_bases || []).length ? ' <em>(' + esc(a.url_bases.join(', ')) + ')</em>' : '');
+      }
+    }
     if ((r.candidate_fields || []).length) {
       html += '<br><br><strong>Fields near it that we do NOT send:</strong><br>'
             + '<code>' + esc(r.candidate_fields.join(', ')) + '</code>';
