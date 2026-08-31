@@ -312,12 +312,28 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                 json=full_payload,
             )
         except ForeUpError as exc:
+            # emit() reaches the job's in-memory event log, which dies with the
+            # container and only exists for sniper runs. The body of this error
+            # is the single most diagnostic string we ever get -- it is what
+            # separates "a booking fee is required" from "time not available"
+            # from "a booking code is required" -- so it also goes to the log
+            # stream, where it survives and covers every worker.
+            logger.warning(
+                "reservation_error",
+                extra={"error": str(exc)[:1200], "request_id": request_id,
+                       "with_code": bool(confirmation_code)},
+            )
             emit("reservation_error", {"error": str(exc)})
             raise
         try:
             response = dict(resp.json())
         except Exception:
             response = {"raw_body": resp.text[:1000], "status_code": resp.status_code}
+        logger.info(
+            "reservation_response",
+            extra={"response": response, "status": resp.status_code,
+                   "request_id": request_id},
+        )
         emit("reservation_response", {"response": response, "status": resp.status_code})
         return response
 
@@ -516,6 +532,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         players: int,
         holes: int = 18,
         captcha_token: Optional[str] = None,
+        confirmation_code: Optional[str] = None,
         request_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Ask ForeUp whether it WOULD accept this booking, without booking it.
@@ -554,7 +571,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             pending_reservation_id=pending_reservation_id,
             captcha_token=captcha_token,
             validate_only=True,
-            confirmation_code=None,
+            confirmation_code=confirmation_code,
         )
 
         started = time.perf_counter()
@@ -569,20 +586,32 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             )
         except ForeUpError as exc:
             err = str(exc)
-            fee = "booking fee" in err.lower()
+            low = err.lower()
+            fee = "booking fee" in low
+            # The 2FA gate sits ahead of the fee gate in the real checkout, so
+            # hitting it means we have not reached the question we came to ask
+            # — not that the fee is fine. Reporting it as "some other error"
+            # would read as progress when it is nothing of the kind.
+            needs_code = "booking code" in low or "confirmation" in low
+            if needs_code:
+                verdict = ("Stopped at the 2FA gate, BEFORE the fee is even considered. "
+                           "This says nothing about the fee yet — enter the emailed code "
+                           "to push validation past this point.")
+            elif fee:
+                verdict = ("FEE CHECK RUNS AT VALIDATION. Matching the browser's request "
+                           "order will not help — the fee has to actually be paid.")
+            else:
+                verdict = ("Rejected for something other than the fee or the code — read "
+                           "the error; it names the field ForeUp wanted.")
             return {
                 "ok": False,
                 "latency_ms": round((time.perf_counter() - started) * 1000, 2),
                 "fee_blocked": fee,
+                "needs_code": needs_code,
+                "code_sent": bool(confirmation_code),
                 "error": err[:1500],
                 "validate_only_sent": True,
-                "verdict": (
-                    "FEE CHECK RUNS AT VALIDATION. Matching the browser's request "
-                    "order will not help — the fee has to actually be paid."
-                    if fee else
-                    "Rejected for something other than the fee — read the error; "
-                    "it names the field ForeUp wanted."
-                ),
+                "verdict": verdict,
             }
 
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -595,6 +624,8 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             "ok": True,
             "latency_ms": latency_ms,
             "fee_blocked": False,
+            "needs_code": False,
+            "code_sent": bool(confirmation_code),
             "response": body,
             "validate_only_sent": True,
             "verdict": (

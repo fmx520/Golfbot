@@ -1001,7 +1001,34 @@ async function fireValidateProbe() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...probeBase(), target_time: target, validate_after_hold: true }),
     });
-    const v = r.validate || {};
+    let v = r.validate || {};
+
+    // ForeUp gates on the emailed code before it looks at the fee, so a first
+    // pass that stops there has not answered the question we asked. Push
+    // through it against the SAME hold — the code is issued for that one.
+    if (v.needs_code && v.code_requested && v.hold_id) {
+      const code = prompt(
+        'ForeUp wants the emailed booking code before it will look at the fee.\n\n'
+        + 'Check your email and paste the code here to finish the check. '
+        + 'The hold is still open, so do this promptly.'
+      );
+      if (code && code.trim()) {
+        btn.textContent = 'Submitting code...';
+        const r2 = await api('/probe/cold-hold', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...probeBase(),
+            target_time: target,
+            validate_after_hold: true,
+            existing_hold_id: v.hold_id,
+            booking_code: code.trim(),
+          }),
+        });
+        v = r2.validate || v;
+        r.steps = (r.steps || []).concat(r2.steps || []);
+      }
+    }
     let html = r.steps.map(x => '&bull; ' + esc(x)).join('<br>')
              + `<br><br><strong>Hold:</strong> ${r.accepted ? 'ACCEPTED' : 'REJECTED'} in ${r.latency_ms}ms`;
     if (!r.accepted && r.error) html += '<br>' + esc(r.error);
@@ -1013,6 +1040,14 @@ async function fireValidateProbe() {
       html += `<br><br><strong>Validation:</strong> ${v.ok ? 'PASSED' : 'REJECTED'}`
             + (v.latency_ms ? ` in ${v.latency_ms}ms` : '')
             + `<br>${esc(v.verdict)}`;
+      if (v.needs_code && !v.code_sent) {
+        html += '<br><br><strong>Not an answer yet.</strong> ForeUp stopped at the code '
+              + 'gate, which sits ahead of the fee check, so the fee question is still '
+              + 'open. Re-run and enter the emailed code to get past it.';
+      }
+      if (v.code_request_error) {
+        html += '<br><br><strong>Could not request a code:</strong> ' + esc(v.code_request_error);
+      }
       if (v.fee_blocked) {
         html += '<br><br><strong>This is the decisive answer:</strong> the booking-fee '
               + 'check runs during validation, so reordering our requests to match the '

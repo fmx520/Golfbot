@@ -2056,7 +2056,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.88"
+APP_VERSION = "0.89"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -2338,6 +2338,11 @@ class ColdHoldProbeRequest(GridRequest):
     # the booking-fee check runs at validation or at commit — which decides
     # whether matching the browser's request order could ever be enough.
     validate_after_hold: bool = False
+    # Second leg of the validate probe. ForeUp emails a code tied to a specific
+    # pending reservation, so completing the check means reusing that same hold
+    # rather than taking a fresh one.
+    existing_hold_id: str = ""
+    booking_code: str = ""
 
 
 @app.post("/api/probe/cold-hold")
@@ -2423,7 +2428,11 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
                         f"({'; '.join(grid.notes)}). Pass skip_grid_check to override."
                     ),
                 )
-            if not grid.is_valid_target(req.target_time):
+            # matches_interval, not is_valid_target: the latter only accepts
+            # times between the first and last OPEN slot, and that window moves
+            # as times get booked. A target offered by the dropdown a minute
+            # ago would then be refused for being outside a span that shrank.
+            if not grid.matches_interval(req.target_time):
                 nearby = [t for t in grid.grid_times if t >= req.target_time][:3]
                 raise HTTPException(
                     status_code=400,
@@ -2438,36 +2447,72 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
         # Carry the shared per-course fields; deliberately NOT the target slot's
         # own polled data, since at a release that would not exist yet.
         template = (slots[0].get("raw") or {}) if slots else {}
-        result = booking.probe_cold_hold(
-            target_time=f"{req.play_date} {req.target_time}",
-            schedule_id=str(course_id or schedule_id),
-            course_id=str(schedule_id),
-            players=req.players,
-            holes=req.holes,
-            booking_class_id=str(template.get("booking_class_id", booking_class or "")),
-            teesheet_side_id=str(template.get("teesheet_side_id", "")),
-            green_fee=template.get("green_fee", 0),
-        )
+        if req.existing_hold_id:
+            # Second leg: the code belongs to the hold we already have, and
+            # taking another would strand one and invalidate the code.
+            steps.append(f"reusing hold {req.existing_hold_id} — no new hold taken")
+            result = {"accepted": True, "reservation_id": req.existing_hold_id,
+                      "latency_ms": 0, "reused_hold": True,
+                      "verdict": "Reused the hold from the first leg."}
+        else:
+            result = booking.probe_cold_hold(
+                target_time=f"{req.play_date} {req.target_time}",
+                schedule_id=str(course_id or schedule_id),
+                course_id=str(schedule_id),
+                players=req.players,
+                holes=req.holes,
+                booking_class_id=str(template.get("booking_class_id", booking_class or "")),
+                teesheet_side_id=str(template.get("teesheet_side_id", "")),
+                green_fee=template.get("green_fee", 0),
+            )
 
         # Optional second step: ask ForeUp whether it WOULD take this booking.
         # Only meaningful once a hold exists, since the reservation references it.
         if req.validate_after_hold:
-            if not result.get("accepted"):
+            hold_id = req.existing_hold_id or str(result.get("reservation_id") or "")
+            if not hold_id:
                 result["validate"] = {
                     "skipped": True,
                     "verdict": "No hold, so there was nothing to validate against.",
                 }
             else:
-                steps.append("hold accepted — asking ForeUp to validate the booking")
-                result["validate"] = booking.probe_validate_only(
-                    pending_reservation_id=str(result.get("reservation_id")),
+                steps.append(
+                    f"validating against hold {hold_id}"
+                    + (" with the emailed code" if req.booking_code else "")
+                )
+                v = booking.probe_validate_only(
+                    pending_reservation_id=hold_id,
                     target_time=f"{req.play_date} {req.target_time}",
                     template=template,
                     schedule_id=str(course_id or schedule_id),
                     course_id=str(schedule_id),
                     players=req.players,
                     holes=req.holes,
+                    confirmation_code=req.booking_code or None,
                 )
+                # ForeUp issues the code against one specific hold, so the
+                # second leg has to come back to this same one. Hand the id
+                # back rather than making the caller dig it out.
+                v["hold_id"] = hold_id
+                if v.get("needs_code") and not req.booking_code:
+                    customer_id = (
+                        discovery.get_customer_id()
+                        if hasattr(discovery, "get_customer_id") else None
+                    )
+                    if customer_id:
+                        try:
+                            booking.request_booking_code(
+                                course_id=str(schedule_id),
+                                customer_id=str(customer_id),
+                                pending_reservation_id=hold_id,
+                            )
+                            v["code_requested"] = True
+                            steps.append("booking code requested — check your email")
+                        except ForeUpError as exc:
+                            v["code_request_error"] = str(exc)[:400]
+                    else:
+                        v["code_request_error"] = "No customer id — cannot request a code."
+                result["validate"] = v
     except HTTPException:
         raise
     except AntiBotDetectedError as exc:
