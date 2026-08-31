@@ -249,6 +249,8 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             # payment processor calls back. So take the browser's route: get
             # the code, validate with it, then ask for the hosted payment page
             # and hand its URL back. The hold stays ours until it is paid. ----
+            # A true flag lets us skip a commit that would only be refused. A
+            # false one proves nothing -- see the recovery below.
             if _pick("booking_fee_required") and request_code_callback and customer_id:
                 fee_result = self._hold_and_request_payment(
                     slot=slot, raw=raw, schedule_id=schedule_id,
@@ -271,23 +273,60 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             # calling request_booking_code, waiting for the user to enter the
             # emailed code, and retrying the same submission with the code. ----
             response: dict[str, Any] = {}
+            code_used: list[str] = []
+            fee_blocked: list[str] = []
 
             def _do_submit() -> None:
-                response.update(self._submit_with_2fa_recovery(
-                    slot=slot, raw=raw,
-                    schedule_id=schedule_id, course_id=course_id or schedule_id,
-                    players=players, holes=holes,
-                    pending_reservation_id=pending_reservation_id,
-                    captcha_token=captcha_token,
-                    customer_id=customer_id,
-                    request_code_callback=request_code_callback,
-                    request_id=req_id, emit=_emit,
-                ))
+                try:
+                    response.update(self._submit_with_2fa_recovery(
+                        slot=slot, raw=raw,
+                        schedule_id=schedule_id, course_id=course_id or schedule_id,
+                        players=players, holes=holes,
+                        pending_reservation_id=pending_reservation_id,
+                        captcha_token=captcha_token,
+                        customer_id=customer_id,
+                        request_code_callback=request_code_callback,
+                        request_id=req_id, emit=_emit,
+                        code_sink=code_used,
+                    ))
+                except ForeUpError as exc:
+                    # The slot's booking_fee_required flag is not trustworthy --
+                    # Montauk reports false and still charges -- so the fee path
+                    # cannot be gated on it. ForeUp saying so IS the signal.
+                    # We already hold the slot, so recover into the payment flow
+                    # rather than losing a race we had won.
+                    if "booking fee" not in str(exc).lower():
+                        raise
+                    fee_blocked.append(str(exc))
 
             stage_latencies["reservation_submit"] = self._timed_stage(
                 "reservation_submit",
                 _do_submit,
             )
+
+            if fee_blocked:
+                if not (request_code_callback and customer_id):
+                    raise ForeUpError(
+                        f"This course charges a booking fee and there is no way to "
+                        f"collect it here: {fee_blocked[0]}"
+                    )
+                _emit("booking_fee_detected", {"error": fee_blocked[0]})
+                fee_result = self._hold_and_request_payment(
+                    slot=slot, raw=raw, schedule_id=schedule_id,
+                    course_id=course_id or schedule_id,
+                    players=players, holes=holes,
+                    pending_reservation_id=pending_reservation_id,
+                    captcha_token=captcha_token, customer_id=customer_id,
+                    request_code_callback=request_code_callback,
+                    request_id=req_id, emit=_emit,
+                    existing_code=code_used[0] if code_used else "",
+                )
+                self._mark_idempotent_complete(idempotency_key)
+                total_ms = round((time.perf_counter() - flow_started) * 1000, 2)
+                self._log_flow(req_id, flow_started, total_ms, stage_latencies, "awaiting_payment")
+                return fee_result, BookingLatency(
+                    request_id=req_id, total_ms=total_ms, stages=stage_latencies
+                )
 
             self._mark_idempotent_complete(idempotency_key)
             total_ms = round((time.perf_counter() - flow_started) * 1000, 2)
@@ -313,6 +352,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         request_code_callback: Callable[[str], str],
         request_id: str,
         emit: Callable[[str, dict[str, Any]], None],
+        existing_code: str = "",
     ) -> dict[str, Any]:
         """Drive a fee-required booking as far as we are able: to the payment page.
 
@@ -325,14 +365,16 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             val = raw.get(key, slot.get(key, default))
             return default if val is None else val
 
-        self.request_booking_code(
-            course_id=str(course_id),
-            customer_id=str(customer_id),
-            pending_reservation_id=pending_reservation_id,
-            request_id=request_id,
-        )
-        emit("awaiting_booking_code", {"ttid": pending_reservation_id})
-        code = request_code_callback(pending_reservation_id)
+        code = existing_code or ""
+        if not code:
+            self.request_booking_code(
+                course_id=str(course_id),
+                customer_id=str(customer_id),
+                pending_reservation_id=pending_reservation_id,
+                request_id=request_id,
+            )
+            emit("awaiting_booking_code", {"ttid": pending_reservation_id})
+            code = request_code_callback(pending_reservation_id)
         if not code:
             raise ForeUpError("Booking code was not provided in time")
 
@@ -462,6 +504,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         request_code_callback: Optional[Callable[[str], str]],
         request_id: str,
         emit: Callable[[str, dict[str, Any]], None],
+        code_sink: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         common = dict(
             slot=slot, raw=raw, schedule_id=schedule_id, course_id=course_id,
@@ -486,6 +529,8 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             code = request_code_callback(pending_reservation_id)
             if not code:
                 raise ForeUpError("Booking code was not provided in time")
+            if code_sink is not None:
+                code_sink.append(code)
             return self._submit_reservation(confirmation_code=code, **common)
 
     def complete_prestaged_hold(
