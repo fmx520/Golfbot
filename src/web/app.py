@@ -910,6 +910,28 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
     # once the race is decided, never on the hot path.
     grid_sample: dict[str, Any] = {"times": [], "template": {}, "course": ""}
 
+    # ForeUp hands every client the booking-fee flags on the slot itself. Until
+    # recently its backend did not act on them, so a reservation posted with no
+    # payment went through; it now refuses the conversion, which costs the whole
+    # race and reads as a narrow loss. The flag is knowable before the release,
+    # so say so then rather than at T+9s.
+    fee_warned: list[bool] = [False]
+
+    def _warn_if_fee_required(raw: dict[str, Any]) -> None:
+        if fee_warned[0] or not isinstance(raw, dict):
+            return
+        if not raw.get("booking_fee_required"):
+            return
+        fee_warned[0] = True
+        price = raw.get("booking_fee_price")
+        per = " per player" if raw.get("booking_fee_per_person") else ""
+        cost = f"${price}{per}" if price else "a booking fee"
+        _emit_event(queue, phase="sniper", stage="booking_fee_required",
+                    message=f"Heads up: this course charges {cost} at checkout. We can win the "
+                            f"hold, but the reservation we send carries no payment, so ForeUp "
+                            f"will refuse to convert it — the race is winnable and the booking "
+                            f"is not. Nothing here is a speed problem.")
+
     def _learn_grid_from_race() -> None:
         """Bank what this race saw about the course's grid. Never raises."""
         try:
@@ -1135,7 +1157,18 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             cands.sort(key=lambda c: (c["covers"], c["seen"]), reverse=True)
             chosen = cands[0] if cands else None
 
-            if chosen and not chosen["covers"]:
+            # A grid seen across a wide span and many times is describing the
+            # sheet, not one corner of it, so extrapolating past the observed
+            # window is reasonable. A thin sample is not. Span is what matters:
+            # 36 times over eight hours generalises; 8 over eighty minutes does
+            # not, however self-consistent it looks.
+            for c in cands:
+                span = (_hhmm_to_min(c["last"]) or 0) - (_hhmm_to_min(c["first"]) or 0)
+                c["trustworthy"] = c["covers"] or (c["seen"] >= 20 and span >= 240)
+            cands.sort(key=lambda c: (c["covers"], c["trustworthy"], c["seen"]), reverse=True)
+            chosen = cands[0] if cands else None
+
+            if chosen and not chosen["trustworthy"]:
                 # Every sample we have is from a different part of the day. The
                 # interval may well be the same, but tonight proved it need not
                 # be, and a wrong grid does not lose gracefully: all six holds
@@ -1143,12 +1176,12 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 # have worked.
                 _emit_event(queue, phase="sniper", stage="prestage_grid",
                             message=f"Future Sight: the only tee times we could see run "
-                                    f"{chosen['first']}–{chosen['last']}, which does not cover your "
-                                    f"{win_start}–{win_end} window. Courses can change interval "
-                                    f"between morning and twilight, so aiming there would be a guess — "
-                                    f"and a wrong guess is rejected outright, not narrowly lost. "
-                                    f"Running as Sniper (polling) instead. Once a release in this "
-                                    f"window is polled, the real grid is banked and this works.")
+                                    f"{chosen['first']}–{chosen['last']} ({chosen['seen']} times), which "
+                                    f"neither covers your {win_start}–{win_end} window nor spans enough "
+                                    f"of the day to extrapolate from safely. Aiming there would be a "
+                                    f"guess, and an off-grid target is rejected outright rather than "
+                                    f"narrowly lost. Running as Sniper (polling) instead — once a "
+                                    f"release in this window is polled, the real grid is banked.")
                 chosen = None
                 fs_enabled = False
                 raw_targets = []
@@ -1173,6 +1206,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     queue.put({"type": "status", "status": "failed"})
                     _finalize_worker()
                     return
+                _warn_if_fee_required(chosen["template"])
                 if raw_targets:
                     # Price and side ids vary across the day; take them from the
                     # observed slot nearest what we are actually going to fire at.
@@ -1528,7 +1562,10 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 )
                 hold_ms = hold.get("latency_ms")
                 if not hold.get("accepted"):
-                    err = str(hold.get("error") or hold.get("response") or "")[:160]
+                    # httpx's message is ~200 chars before the response body even
+                    # starts, so the old 160-char cut removed the only part that
+                    # says WHY. attempts[] kept 300 and was readable; this was not.
+                    err = str(hold.get("error") or hold.get("response") or "")[:600]
                     race.record_prestage(ps_time, "rejected", hold_ms, error=err)
                     if burst_pass == 1:
                         _emit_event(queue, phase="sniper", stage="prestage_miss",
@@ -1639,6 +1676,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 # downstream book_slot uses the right course IDs.
                 for s in slots:
                     s["_source_teesheet_id"] = current_teesheet
+                if slots:
+                    _warn_if_fee_required(slots[0].get("raw") or {})
                 if len(slots) > len(grid_sample["times"]):
                     grid_sample["times"] = [s.get("time", "") for s in slots]
                     grid_sample["template"] = slots[0].get("raw") or {}
@@ -2017,7 +2056,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.86"
+APP_VERSION = "0.87"
 
 @app.get("/health")
 def health() -> dict[str, str]:

@@ -28,8 +28,8 @@ create table if not exists races (
 
     -- The verdict.
     outcome          text,          -- won | late_start | blocked | lost_at_submit
-                                    -- | never_saw_slot | found_not_booked
-                                    -- | aborted | error
+                                    -- | blocked_by_fee | never_saw_slot
+                                    -- | found_not_booked | aborted | error
     summary          text,          -- one-line human-readable version
     success          boolean,
 
