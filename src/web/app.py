@@ -1555,7 +1555,13 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     schedule_id=str(prestage_plan["course"]),
                     course_id=str(resolved_schedule_id),
                     players=payload["players"], holes=holes,
-                    booking_class_id=str(tmpl.get("booking_class_id", prestage_plan["booking_class"] or "")),
+                    # The resolved class wins over the template's. The template
+                    # comes from a reference DAY, and a course can run different
+                    # booking classes on different days -- 2432 has been seen as
+                    # both 2139 and 50295 -- so taking the template's value fires
+                    # the hold under a class that may not apply to the play date,
+                    # which ForeUp rejects outright.
+                    booking_class_id=str(prestage_plan["booking_class"] or tmpl.get("booking_class_id", "")),
                     teesheet_side_id=str(tmpl.get("teesheet_side_id", "")),
                     green_fee=tmpl.get("green_fee", 0),
                     request_id=f"{request_id}-ps{burst_pass}",
@@ -2115,7 +2121,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.96"
+APP_VERSION = "0.97"
 
 @app.get("/health")
 def health() -> dict[str, str]:
