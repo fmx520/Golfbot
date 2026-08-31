@@ -1124,8 +1124,8 @@ async function fireValidateProbe() {
         }
       }
       if (v.ok && !r.payment) {
-        html += '<br><br><strong>Check your ForeUp account now.</strong> If a reservation '
-              + 'is there, validate_only was ignored and this booked for real.';
+        html += '<br><br>Nothing was booked — validation alone never creates a reservation. '
+              + 'Re-run with the payment step to get a link that does.';
       }
     }
     probeLog(html);

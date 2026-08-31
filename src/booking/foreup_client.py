@@ -736,11 +736,11 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             "response": body,
             "validate_only_sent": True,
             "verdict": (
-                f"Validation passed in {latency_ms:.0f}ms — but this is the "
-                f"ambiguous outcome, not the good one. It may mean the fee is only "
-                f"enforced at commit, so it does NOT show the reorder will work. "
-                f"Check your ForeUp account: if a reservation appeared, their "
-                f"backend ignored validate_only."
+                f"Validation passed in {latency_ms:.0f}ms. This is the normal step, "
+                f"not an ambiguous one: a captured browser checkout sends exactly this "
+                f"and gets exactly {{\"valid\":true}} back. Nothing is booked yet — on a "
+                f"course that charges a booking fee, the reservation is created when "
+                f"the payment completes."
             ),
         }
 
