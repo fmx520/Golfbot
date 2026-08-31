@@ -934,6 +934,7 @@ async function showTeeGrid() {
       `<option value="${esc(t)}">${esc(t)}${open.has(t) ? ' (open now)' : ' (booked now)'}</option>`
     ).join('') || '<option value="">no grid found</option>';
     $('probeBtn').disabled = g.grid_times.length === 0;
+    $('validateBtn').disabled = g.grid_times.length === 0;
 
     // Always show what was actually read, so an empty result explains itself
     // rather than looking like a broken lookup.
@@ -976,6 +977,61 @@ async function showTeeGrid() {
   } finally {
     btn.disabled = false;
     btn.textContent = "Show this course's tee grid";
+  }
+}
+
+async function fireValidateProbe() {
+  const target = $('probeTime').value;
+  if (!target) return;
+  if (!confirm(
+    `Ask ForeUp whether it would accept a booking at ${target}?\n\n`
+    + 'This holds the time, then sends the real booking request with '
+    + "validate_only set — ForeUp should answer without creating anything.\n\n"
+    + 'CAUTION: we have never sent that flag before. If ForeUp ignores it, this '
+    + 'BOOKS FOR REAL and charges any booking fee. Only aim it at a time you '
+    + 'would be happy to have.'
+  )) return;
+
+  const btn = $('validateBtn');
+  btn.disabled = true;
+  btn.textContent = 'Asking ForeUp...';
+  try {
+    const r = await api('/probe/cold-hold', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...probeBase(), target_time: target, validate_after_hold: true }),
+    });
+    const v = r.validate || {};
+    let html = r.steps.map(x => '&bull; ' + esc(x)).join('<br>')
+             + `<br><br><strong>Hold:</strong> ${r.accepted ? 'ACCEPTED' : 'REJECTED'} in ${r.latency_ms}ms`;
+    if (!r.accepted && r.error) html += '<br>' + esc(r.error);
+
+    if (v.skipped) {
+      html += '<br><br>' + esc(v.verdict);
+    } else if (v.verdict) {
+      // The fee answer is the entire point of this probe, so lead with it.
+      html += `<br><br><strong>Validation:</strong> ${v.ok ? 'PASSED' : 'REJECTED'}`
+            + (v.latency_ms ? ` in ${v.latency_ms}ms` : '')
+            + `<br>${esc(v.verdict)}`;
+      if (v.fee_blocked) {
+        html += '<br><br><strong>This is the decisive answer:</strong> the booking-fee '
+              + 'check runs during validation, so reordering our requests to match the '
+              + "browser cannot get past it. The fee has to be paid.";
+      }
+      if (v.error) html += '<br><br><strong>ForeUp said:</strong><br>' + esc(v.error);
+      if (v.response) html += '<br><br><strong>Response:</strong><br>'
+                            + esc(JSON.stringify(v.response).slice(0, 800));
+      if (v.ok) {
+        html += '<br><br><strong>Check your ForeUp account now.</strong> If a reservation '
+              + 'is there, validate_only was ignored and this booked for real.';
+      }
+    }
+    probeLog(html);
+  } catch (e) {
+    probeLog('<strong>Refused:</strong> ' + esc(e.message));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Ask ForeUp: would this book?';
   }
 }
 
@@ -1138,6 +1194,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   $('gridBtn').addEventListener('click', showTeeGrid);
   $('probeBtn').addEventListener('click', fireColdHoldProbe);
+  $('validateBtn').addEventListener('click', fireValidateProbe);
   document.querySelectorAll('input[name="raceStrategy"]').forEach(el =>
     el.addEventListener('change', onStrategyChange));
   $('snipeNow').addEventListener('change', toggleSnipeNow);

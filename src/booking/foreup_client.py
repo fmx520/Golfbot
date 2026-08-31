@@ -505,6 +505,107 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             ),
         }
 
+    def probe_validate_only(
+        self,
+        *,
+        pending_reservation_id: str,
+        target_time: str,
+        template: dict[str, Any],
+        schedule_id: str,
+        course_id: str,
+        players: int,
+        holes: int = 18,
+        captcha_token: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Ask ForeUp whether it WOULD accept this booking, without booking it.
+
+        `validate_only` is ForeUp's own field — it exists in our payload only
+        because it exists in the requests their site makes — and we have always
+        hardcoded it False. Sending True puts a question to their server that we
+        have so far only been able to reason about from the outside: does the
+        booking-fee check run here, or at commit?
+
+        That matters because it decides a whole branch of work. The failing
+        bookings return "A booking fee is required to book this tee time." at
+        the reservations endpoint. If that same message comes back under
+        validate_only, the check is part of validation and no amount of
+        reordering our requests to match the browser's will get past it — we
+        would need to actually pay. If validation passes, the answer is
+        genuinely unknown rather than encouraging: it may only be checking the
+        shape of the request.
+
+        Never raises: a rejection is the informative outcome, and its body is
+        the whole point. The caller must have created the hold first.
+
+        CAUTION: this trusts ForeUp to honour their own flag. We have never
+        exercised it. If their backend ignores validate_only, this books for
+        real — so aim it at a slot you would be happy to have.
+        """
+        req_id = request_id or str(uuid.uuid4())
+        slot = {"time": target_time, "raw_time": target_time, "raw": template}
+        payload = self._build_full_reservation_payload(
+            slot=slot,
+            raw=template,
+            schedule_id=schedule_id,
+            course_id=course_id,
+            players=players,
+            holes=holes,
+            pending_reservation_id=pending_reservation_id,
+            captcha_token=captcha_token,
+            validate_only=True,
+            confirmation_code=None,
+        )
+
+        started = time.perf_counter()
+        try:
+            resp = self._request(
+                "POST",
+                FOREUP_RESERVATIONS_PATH,
+                stage="probe_validate_only",
+                request_id=req_id,
+                retry_safe=False,
+                json=payload,
+            )
+        except ForeUpError as exc:
+            err = str(exc)
+            fee = "booking fee" in err.lower()
+            return {
+                "ok": False,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                "fee_blocked": fee,
+                "error": err[:1500],
+                "validate_only_sent": True,
+                "verdict": (
+                    "FEE CHECK RUNS AT VALIDATION. Matching the browser's request "
+                    "order will not help — the fee has to actually be paid."
+                    if fee else
+                    "Rejected for something other than the fee — read the error; "
+                    "it names the field ForeUp wanted."
+                ),
+            }
+
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw_body": resp.text[:1500], "status_code": resp.status_code}
+
+        return {
+            "ok": True,
+            "latency_ms": latency_ms,
+            "fee_blocked": False,
+            "response": body,
+            "validate_only_sent": True,
+            "verdict": (
+                f"Validation passed in {latency_ms:.0f}ms — but this is the "
+                f"ambiguous outcome, not the good one. It may mean the fee is only "
+                f"enforced at commit, so it does NOT show the reorder will work. "
+                f"Check your ForeUp account: if a reservation appeared, their "
+                f"backend ignored validate_only."
+            ),
+        }
+
     def submit_booking_code(
         self,
         *,

@@ -282,6 +282,15 @@
             <select id="probeTime"><option value="">&mdash; show the grid first &mdash;</option></select>
           </div>
           <button class="btn btn-secondary btn-block" id="probeBtn" disabled>Fire cold-hold probe</button>
+          <div class="form-help mt-2">
+            <strong>Would this book?</strong> Holds the time, then sends the real booking
+            request with ForeUp's own <code>validate_only</code> flag set, so they answer
+            without creating a reservation. Tells us whether the booking-fee check runs at
+            validation or at commit &mdash; which decides whether matching the browser's
+            request order could ever be enough. <strong>We have never sent that flag</strong>;
+            if ForeUp ignores it this books for real, so aim it at a time you would take.
+          </div>
+          <button class="btn btn-secondary btn-block" id="validateBtn" disabled>Ask ForeUp: would this book?</button>
         </div>
         <div class="event-log mt-1 hidden" id="probeOut"></div>
       </div>

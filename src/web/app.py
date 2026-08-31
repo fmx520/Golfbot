@@ -2056,7 +2056,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.87"
+APP_VERSION = "0.88"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -2334,6 +2334,10 @@ class ColdHoldProbeRequest(GridRequest):
     """A cold-hold probe. target_time must be a real time on the course grid."""
     target_time: str
     skip_grid_check: bool = False
+    # Chain a validate_only reservation onto a successful hold. Answers whether
+    # the booking-fee check runs at validation or at commit — which decides
+    # whether matching the browser's request order could ever be enough.
+    validate_after_hold: bool = False
 
 
 @app.post("/api/probe/cold-hold")
@@ -2444,6 +2448,26 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
             teesheet_side_id=str(template.get("teesheet_side_id", "")),
             green_fee=template.get("green_fee", 0),
         )
+
+        # Optional second step: ask ForeUp whether it WOULD take this booking.
+        # Only meaningful once a hold exists, since the reservation references it.
+        if req.validate_after_hold:
+            if not result.get("accepted"):
+                result["validate"] = {
+                    "skipped": True,
+                    "verdict": "No hold, so there was nothing to validate against.",
+                }
+            else:
+                steps.append("hold accepted — asking ForeUp to validate the booking")
+                result["validate"] = booking.probe_validate_only(
+                    pending_reservation_id=str(result.get("reservation_id")),
+                    target_time=f"{req.play_date} {req.target_time}",
+                    template=template,
+                    schedule_id=str(course_id or schedule_id),
+                    course_id=str(schedule_id),
+                    players=req.players,
+                    holes=req.holes,
+                )
     except HTTPException:
         raise
     except AntiBotDetectedError as exc:
@@ -2455,6 +2479,8 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
     result["target_time"] = req.target_time
     result["play_date"] = req.play_date
     result["grid"] = grid.as_dict()
+    # True only if ForeUp ignored validate_only, which is the one way this path
+    # can book. The UI says so explicitly rather than leaving it implied.
     result["booked_anything"] = False
     return result
 
