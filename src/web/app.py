@@ -2057,7 +2057,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.92"
+APP_VERSION = "0.93"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -2344,6 +2344,9 @@ class ColdHoldProbeRequest(GridRequest):
     # rather than taking a fresh one.
     existing_hold_id: str = ""
     booking_code: str = ""
+    # Ask ForeUp for the hosted payment page after validation. Creates a
+    # payment session; charges nothing on its own.
+    want_payment_url: bool = False
 
 
 @app.post("/api/probe/cold-hold")
@@ -2513,6 +2516,22 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
                             v["code_request_error"] = str(exc)[:400]
                     else:
                         v["code_request_error"] = "No customer id — cannot request a code."
+                # Once validation passes we have everything the payment window
+                # needs -- the same hold and the same code -- so ask for it.
+                # This is the step our booking path has never taken.
+                if req.want_payment_url and v.get("ok"):
+                    steps.append("validation passed — requesting the hosted payment page")
+                    result["payment"] = booking.request_booking_fee_payment(
+                        facility_id=str(schedule_id),
+                        teesheet_id=str(course_id or schedule_id),
+                        pending_reservation_id=hold_id,
+                        confirmation_code=req.booking_code,
+                        target_time=f"{req.play_date} {req.target_time}",
+                        players=req.players,
+                        holes=req.holes,
+                        booking_class_id=str(template.get("booking_class_id", booking_class or "")),
+                        teesheet_side_id=str(template.get("teesheet_side_id", "")),
+                    )
                 result["validate"] = v
     except HTTPException:
         raise

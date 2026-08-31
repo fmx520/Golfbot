@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -518,6 +519,99 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                 f"REAL and expires on its own in ~2 min; nothing was booked."
                 if held_id else
                 "Returned 200 but no reservation_id — inconclusive, read the response."
+            ),
+        }
+
+    def request_booking_fee_payment(
+        self,
+        *,
+        facility_id: str,
+        teesheet_id: str,
+        pending_reservation_id: str,
+        confirmation_code: str,
+        target_time: str,
+        players: int,
+        holes: int,
+        booking_class_id: str,
+        teesheet_side_id: str,
+        available_spots: int = 1,
+        request_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Ask ForeUp for the hosted payment page that settles the booking fee.
+
+        This is the step our booking path has never taken. On a fee-required
+        course, `users/reservations` does not create anything -- it answers
+        {"valid":true} and stops. The reservation is created server-side when
+        the payment processor calls back, so this request, and the hosted form
+        it returns, IS the booking.
+
+        Form-encoded, not JSON: the field list and encoding are taken verbatim
+        from a captured browser checkout. Returns the hosted payment URL, which
+        carries an Elavon TransactionSetupID and no ForeUp session -- the whole
+        question being whether that URL can be opened somewhere other than the
+        browser that created it.
+
+        Charges nothing by itself. It only sets up a payment page.
+        """
+        req_id = request_id or str(uuid.uuid4())
+        payload = {
+            "players": players,
+            "available_spots": available_spots,
+            "carts": "false",
+            "time": target_time,
+            "holes": holes,
+            "schedule_id": teesheet_id,
+            "course_id": facility_id,
+            "special_id": "false",
+            "recipient": "false",
+            "booking_class_id": booking_class_id,
+            "promo_code": "",
+            "player_list": "false",
+            "duration": 1,
+            "pending_reservation_id": pending_reservation_id,
+            "customer_message": "",
+            "frontend_course_id": facility_id,
+            "reservation_confirmation_uid": confirmation_code,
+            "teesheet_side_id": teesheet_side_id,
+        }
+
+        started = time.perf_counter()
+        try:
+            resp = self._request(
+                "POST",
+                f"/index.php/booking/credit_card_window/{facility_id}/purchase-fee",
+                stage="booking_fee_window",
+                request_id=req_id,
+                retry_safe=False,
+                data=payload,
+            )
+        except ForeUpError as exc:
+            return {
+                "ok": False,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                "error": str(exc)[:1200],
+                "payload_sent": payload,
+                "verdict": "ForeUp refused to open a payment window — read the error.",
+            }
+
+        html = resp.text or ""
+        match = re.search(r"""src=["'](https://[^"']*hostedpayments[^"']*)["']""", html)
+        setup = re.search(r"TransactionSetupID=([A-Za-z0-9-]+)", html)
+        return {
+            "ok": bool(match),
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            "payment_url": match.group(1) if match else "",
+            "transaction_setup_id": setup.group(1) if setup else "",
+            "payload_sent": payload,
+            "raw_html": html[:1200],
+            "verdict": (
+                "Payment page created. Open this URL on another device: if the card "
+                "form loads there, the hand-off works and paying it should create the "
+                "reservation. If it errors, the session cannot leave this browser."
+                if match else
+                "No hosted payment URL in the response — read raw_html. Either the "
+                "hold or the code was not accepted, or this course settles the fee "
+                "some other way."
             ),
         }
 

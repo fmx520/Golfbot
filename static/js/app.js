@@ -1072,9 +1072,11 @@ async function fireValidateProbe() {
             validate_after_hold: true,
             existing_hold_id: v.hold_id,
             booking_code: code.trim(),
+            want_payment_url: true,
           }),
         });
         v = r2.validate || v;
+        r.payment = r2.payment;
         r.steps = (r.steps || []).concat(r2.steps || []);
       }
     }
@@ -1105,7 +1107,23 @@ async function fireValidateProbe() {
       if (v.error) html += '<br><br><strong>ForeUp said:</strong><br>' + esc(v.error);
       if (v.response) html += '<br><br><strong>Response:</strong><br>'
                             + esc(JSON.stringify(v.response).slice(0, 800));
-      if (v.ok) {
+      if (r.payment) {
+        const pm = r.payment;
+        html += `<br><br><strong>Payment page:</strong> ${pm.ok ? 'created' : 'NOT created'}`
+              + (pm.latency_ms ? ` in ${Math.round(pm.latency_ms)}ms` : '');
+        if (pm.payment_url) {
+          // The whole point of the test: can this URL be opened elsewhere?
+          html += '<br><a href="' + esc(pm.payment_url) + '" target="_blank" rel="noopener">'
+                + esc(pm.payment_url) + '</a>'
+                + '<br><em>Open this on your phone. If a card form loads, the hand-off works.</em>';
+        }
+        html += '<br>' + esc(pm.verdict || '');
+        if (pm.error) html += '<br><strong>ForeUp said:</strong><br>' + esc(pm.error);
+        if (!pm.payment_url && pm.raw_html) {
+          html += '<br><strong>Response:</strong><br><code>' + esc(pm.raw_html.slice(0, 500)) + '</code>';
+        }
+      }
+      if (v.ok && !r.payment) {
         html += '<br><br><strong>Check your ForeUp account now.</strong> If a reservation '
               + 'is there, validate_only was ignored and this booked for real.';
       }
