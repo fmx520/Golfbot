@@ -980,6 +980,45 @@ async function showTeeGrid() {
   }
 }
 
+async function scanCheckoutFields() {
+  const btn = $('fieldsBtn');
+  btn.disabled = true;
+  btn.textContent = 'Reading ForeUp\u2019s checkout...';
+  try {
+    const r = await api('/probe/checkout-fields', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(probeBase()),
+    });
+    let html = `<strong>${esc(r.verdict)}</strong><br><br>`
+             + `Scanned ${r.scripts_scanned} source(s); we send ${r.fields_we_send} fields.`;
+    if ((r.scripts_with_payload_code || []).length) {
+      html += '<br><br><strong>Payload code found in:</strong><br>'
+            + r.scripts_with_payload_code.map(x => '&bull; ' + esc(x)).join('<br>');
+    }
+    if ((r.candidate_fields || []).length) {
+      html += '<br><br><strong>Fields near it that we do NOT send:</strong><br>'
+            + '<code>' + esc(r.candidate_fields.join(', ')) + '</code>';
+    }
+    for (const res of r.results || []) {
+      for (const h of res.anchor_hits || []) {
+        html += `<br><br><strong>${esc(h.anchor)}</strong> in ${esc(res.script)}:<br>`
+              + '<code>' + esc(h.excerpt) + '</code>';
+      }
+      for (const pm of (res.payment_mentions || []).slice(0, 12)) {
+        html += `<br><br><strong>payment hint &ldquo;${esc(pm.hint)}&rdquo;:</strong><br>`
+              + '<code>' + esc(pm.excerpt) + '</code>';
+      }
+    }
+    probeLog(html);
+  } catch (e) {
+    probeLog('<strong>Failed:</strong> ' + esc(e.message));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Scan ForeUp's checkout fields";
+  }
+}
+
 async function fireValidateProbe() {
   const target = $('probeTime').value;
   if (!target) return;
@@ -1230,6 +1269,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('gridBtn').addEventListener('click', showTeeGrid);
   $('probeBtn').addEventListener('click', fireColdHoldProbe);
   $('validateBtn').addEventListener('click', fireValidateProbe);
+  $('fieldsBtn').addEventListener('click', scanCheckoutFields);
   document.querySelectorAll('input[name="raceStrategy"]').forEach(el =>
     el.addEventListener('change', onStrategyChange));
   $('snipeNow').addEventListener('change', toggleSnipeNow);

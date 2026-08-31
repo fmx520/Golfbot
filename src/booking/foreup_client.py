@@ -521,6 +521,19 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             ),
         }
 
+    def reservation_payload_keys(self) -> list[str]:
+        """Every field we send on a reservation, for diffing against ForeUp's own.
+
+        Built from the real builder rather than a hand-kept list, so it cannot
+        drift away from what actually goes over the wire.
+        """
+        sample = self._build_full_reservation_payload(
+            slot={"time": "", "raw": {}}, raw={}, schedule_id="0", course_id="0",
+            players=1, holes=18, pending_reservation_id="", captcha_token=None,
+            validate_only=True, confirmation_code=None,
+        )
+        return sorted(sample.keys())
+
     def probe_validate_only(
         self,
         *,

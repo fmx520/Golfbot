@@ -40,6 +40,7 @@ from src.booking.foreup_client import ForeUpBookingClient, classify_reservation_
 from src.config import load_config
 from src.courses import COURSE_CATALOG, cached_preflight, run_preflight
 from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
+from src.discovery import checkout_scan
 from src.discovery.grid import analyze_teesheet_grid
 from src.telemetry import grid_store
 from src.telemetry.race_log import RaceRecorder
@@ -2056,7 +2057,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.89"
+APP_VERSION = "0.90"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -2526,6 +2527,68 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
     result["grid"] = grid.as_dict()
     # True only if ForeUp ignored validate_only, which is the one way this path
     # can book. The UI says so explicitly rather than leaving it implied.
+    result["booked_anything"] = False
+    return result
+
+
+@app.post("/api/probe/checkout-fields")
+def probe_checkout_fields(req: GridRequest) -> dict[str, Any]:
+    """Read ForeUp's own checkout script to find the fields we do not send.
+
+    The free attempt at the booking-fee question. Fetches the booking page and
+    its scripts and looks for the code that builds the reservation payload —
+    our payload contains strings distinctive enough to find it — then reports
+    every field name near it that we do not currently send.
+
+    Read-only. No hold, no reservation, nothing booked.
+    """
+    default_base_url = os.getenv("FOREUP_BASE_URL", "https://foreupsoftware.com")
+    base_url, schedule_id, course_id = _extract_foreup_target(
+        req.foreup_booking_url,
+        fallback_base_url=default_base_url,
+        fallback_schedule_id=req.schedule_id or os.getenv("FOREUP_SCHEDULE_ID", ""),
+        fallback_course_id=req.course_id or os.getenv("FOREUP_COURSE_ID", ""),
+    )
+    if not schedule_id:
+        raise HTTPException(status_code=400, detail="No schedule_id — pick a course first.")
+
+    discovery = ForeUpDiscoveryClient(base_url=base_url)
+    username = req.username or os.getenv("FOREUP_USERNAME", "")
+    password = req.password or os.getenv("FOREUP_PASSWORD", "")
+
+    # The checkout script may only be served to a signed-in session, and logging
+    # in costs nothing here — this endpoint is not on any race path.
+    if username and password:
+        try:
+            discovery.bootstrap_session(
+                username=username, password=password,
+                schedule_id=schedule_id, course_id=course_id,
+            )
+        except ForeUpError:
+            pass
+
+    page_url = f"{base_url}/index.php/booking/{schedule_id}"
+
+    def _fetch(url: str) -> str | None:
+        try:
+            resp = discovery.client.get(url, timeout=20.0)
+            return resp.text if resp.status_code < 400 else None
+        except Exception:  # noqa: BLE001 — a missing script is not an error
+            return None
+
+    html = _fetch(page_url)
+    if not html:
+        raise HTTPException(status_code=502, detail=f"Could not read {page_url}.")
+
+    booking = ForeUpBookingClient(base_url=base_url)
+    known = booking.reservation_payload_keys()
+
+    result = checkout_scan.scan_checkout(
+        html=html, base_url=base_url, page_url=page_url,
+        fetch=_fetch, known_keys=known,
+    )
+    result["page_url"] = page_url
+    result["fields_we_send"] = len(known)
     result["booked_anything"] = False
     return result
 
