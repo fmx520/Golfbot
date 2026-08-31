@@ -717,22 +717,7 @@ function addEvent(phase, stage, message, latencyMs, extra) {
     `<span class="event-message">${esc(message)}</span>` +
     (latencyMs ? `<span class="event-latency">${latencyMs}ms</span>` : '');
 
-  // The payment link is the one thing in the log a user must act on, and a
-  // race is already won by the time it appears — so it gets a real button
-  // rather than a line of text they have to notice and copy.
-  if (extra && extra.payment_url) {
-    const pay = document.createElement('div');
-    pay.className = 'card mt-1 payment-callout';
-    pay.innerHTML =
-      '<div class="card-title">Pay the booking fee to finish</div>'
-      + '<div class="form-help">Your tee time is <strong>held</strong> and we are keeping it '
-      + 'alive. It only becomes a reservation once this fee is paid, on ForeUp\u2019s own '
-      + 'payment page \u2014 we never see your card. Do it now; the hold will not last forever.</div>'
-      + `<a class="btn btn-primary btn-block mt-1" href="${esc(extra.payment_url)}" `
-      + 'target="_blank" rel="noopener">'
-      + `Pay $${esc(String(extra.booking_fee_total || ''))} and confirm the tee time</a>`;
-    log.appendChild(pay);
-  }
+  if (extra && extra.payment_url) showPaymentPrompt(extra);
 
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
@@ -1204,6 +1189,34 @@ async function stopJob() {
   // 'cancelled', so the UI only says stopped once the worker actually has.
 }
 
+function showPaymentPrompt(ev) {
+  // Won race, ticking hold, one human step left — so this opens over the page
+  // rather than appending to a log the user has to notice and scroll back to.
+  const url = ev.payment_url;
+  const fee = ev.booking_fee_total;
+  const when = (ev.slot && ev.slot.time) ? String(ev.slot.time).slice(-5) : '';
+  const label = fee ? `Pay $${fee} and confirm the tee time` : 'Pay and confirm the tee time';
+  const line = when ? `Your ${when} tee time is held.` : 'Your tee time is held.';
+
+  $('modalSlotLine').textContent = line;
+  $('modalPayLink').href = url;
+  $('modalPayLink').textContent = label;
+  show('paymentModal');
+
+  // The same prompt stays in the step flow, so dismissing the modal — or
+  // paying on another device — does not strand the link.
+  $('paymentSlotLine').textContent = line;
+  $('paymentLink').href = url;
+  $('paymentLink').textContent = label;
+  show('paymentContainer');
+
+  $('searchBtn').innerHTML = 'Awaiting booking fee payment...';
+}
+
+function hidePaymentModal() {
+  hide('paymentModal');
+}
+
 function showVerificationForm() {
   show('verificationContainer');
   $('verificationCode').focus();
@@ -1318,6 +1331,11 @@ document.addEventListener('DOMContentLoaded', () => {
   $('fieldsBtn').addEventListener('click', scanCheckoutFields);
   document.querySelectorAll('input[name="raceStrategy"]').forEach(el =>
     el.addEventListener('change', onStrategyChange));
+  $('modalDismiss').addEventListener('click', hidePaymentModal);
+  $('paymentModal').addEventListener('click', (e) => {
+    // Backdrop click closes; the card itself must not.
+    if (e.target === $('paymentModal')) hidePaymentModal();
+  });
   $('snipeNow').addEventListener('change', toggleSnipeNow);
   $('autoBook').addEventListener('change', toggleCaptchaKey);
   $('bookingClass').addEventListener('change', updateDateRange);

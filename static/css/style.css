@@ -1193,3 +1193,51 @@ body::before {
   }
   .sniper-armed .card::after { opacity: 0.8; }
 }
+
+
+/* ---------------------------------------------------------------------------
+   Payment prompt
+   ---------------------------------------------------------------------------
+   A won race ends with a booking fee that a human has to pay, against a hold
+   that is ticking. Living in the event log meant it scrolled away behind later
+   lines, so it gets a modal that cannot be missed and a persistent card in the
+   step flow for after the modal is dismissed. */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(4, 10, 7, 0.82);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+}
+
+.modal-card {
+  width: 100%;
+  max-width: 26rem;
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: 1.25rem;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+}
+
+.modal-title {
+  margin-bottom: 0.6rem;
+  font-family: var(--font-display, Georgia, serif);
+  font-size: 1.25rem;
+  color: var(--text-primary);
+}
+
+.modal-body { margin-bottom: 1rem; }
+.modal-body p { margin: 0 0 0.6rem; font-size: 0.9rem; color: var(--text-secondary); line-height: 1.5; }
+.modal-slot { font-weight: 600; color: var(--accent) !important; font-size: 1rem !important; }
+.modal-warn { color: var(--warning) !important; }
+
+.payment-card { border-color: var(--accent-line); }

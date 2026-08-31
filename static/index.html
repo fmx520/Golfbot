@@ -309,6 +309,19 @@
         </div>
       </div>
 
+      <div id="paymentContainer" class="hidden mt-2">
+        <div class="card payment-card">
+          <div class="card-title">Tee time held — pay to confirm</div>
+          <div class="card-subtitle" id="paymentSlotLine"></div>
+          <div class="form-help">
+            We are holding this slot and refreshing it for you. It becomes a real
+            reservation only once the booking fee is paid, on ForeUp&rsquo;s own payment
+            page &mdash; your card never touches Golfbot.
+          </div>
+          <a class="btn btn-primary btn-block mt-1" id="paymentLink" href="#" target="_blank" rel="noopener">Pay and confirm</a>
+        </div>
+      </div>
+
       <div id="verificationContainer" class="hidden mt-2">
         <div class="card">
           <div class="card-title">Booking Verification</div>
@@ -450,6 +463,23 @@
       </details>
     </section>
 
+
+  <div id="paymentModal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-title">Tee time held &mdash; one step left</div>
+      <div class="modal-body">
+        <p id="modalSlotLine" class="modal-slot"></p>
+        <p>
+          We won the slot and we are keeping the hold alive. ForeUp only turns it into a
+          reservation once the booking fee is paid, on their own payment page &mdash;
+          <strong>your card never touches Golfbot</strong>.
+        </p>
+        <p class="modal-warn">Pay now. The hold does not last forever.</p>
+      </div>
+      <a class="btn btn-primary btn-block" id="modalPayLink" href="#" target="_blank" rel="noopener">Pay and confirm</a>
+      <button class="btn btn-secondary btn-block mt-1" id="modalDismiss">I&rsquo;ll do it from the page</button>
+    </div>
+  </div>
   </div>
 
   <script src="/static/js/app.js?v={{VERSION}}"></script>
