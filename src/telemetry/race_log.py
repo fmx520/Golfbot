@@ -52,6 +52,7 @@ OUTCOME_UNCONFIRMED = "unconfirmed"
 OUTCOME_FOUND_NOT_BOOKED = "found_not_booked"
 OUTCOME_LOST_AT_SUBMIT = "lost_at_submit"
 OUTCOME_BLOCKED_BY_FEE = "blocked_by_fee"
+OUTCOME_AWAITING_PAYMENT = "awaiting_payment"
 OUTCOME_NEVER_SAW_SLOT = "never_saw_slot"
 OUTCOME_BLOCKED = "blocked"
 OUTCOME_LATE_START = "late_start"
@@ -66,6 +67,11 @@ _REASONS = {
         "before assuming you have the tee time."
     ),
     OUTCOME_FOUND_NOT_BOOKED: "Slot found but auto-book was off — nothing was submitted.",
+    OUTCOME_AWAITING_PAYMENT: (
+        "We won the hold and handed back a payment link. The race was won; "
+        "whether it became a tee time depends on the fee being paid before "
+        "the hold expires."
+    ),
     OUTCOME_BLOCKED_BY_FEE: (
         "We WON the hold and could not convert it: the course requires a "
         "booking fee at checkout and the reservation payload carries no "
@@ -250,6 +256,10 @@ class RaceRecorder:
     peer_ordinal: int = 0
     peer_count: int = 1
 
+    # Fee-required course: the slot was held and a payment link issued. Not a
+    # win (no reservation exists yet) and not a loss (we beat everyone to it).
+    awaiting_payment: bool = False
+
     captcha_solves: int = 0
     captcha_refreshes: int = 0
     captcha_stale_at_submit: bool = False
@@ -354,6 +364,8 @@ class RaceRecorder:
         )
 
     def classify(self) -> str:
+        if self.awaiting_payment:
+            return OUTCOME_AWAITING_PAYMENT
         if self.booked:
             return OUTCOME_WON if self.booking_confirmed else OUTCOME_UNCONFIRMED
         if self.error:

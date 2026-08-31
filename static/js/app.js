@@ -645,7 +645,7 @@ function startPolling() {
       const newEvents = data.events.slice(S.jobEvents.length);
       for (const ev of newEvents) {
         S.jobEvents.push(ev);
-        addEvent(ev.phase || 'system', ev.stage, ev.message, ev.latency_ms);
+        addEvent(ev.phase || 'system', ev.stage, ev.message, ev.latency_ms, ev);
       }
 
       if (data.status === 'awaiting_input') {
@@ -653,7 +653,8 @@ function startPolling() {
         fireNotification({ events: [{ slot: null }] });
       }
 
-      if (data.status === 'succeeded' || data.status === 'failed' || data.status === 'cancelled') {
+      if (data.status === 'succeeded' || data.status === 'failed'
+          || data.status === 'cancelled' || data.status === 'awaiting_payment') {
         clearInterval(S.pollTimer);
         S.pollTimer = null;
         hideVerificationForm();
@@ -695,7 +696,7 @@ function extractSlotsFromEvents(events) {
   }
 }
 
-function addEvent(phase, stage, message, latencyMs) {
+function addEvent(phase, stage, message, latencyMs, extra) {
   const log = $('eventLog');
   const line = document.createElement('div');
   line.className = 'event-line';
@@ -715,6 +716,23 @@ function addEvent(phase, stage, message, latencyMs) {
     `<span class="badge ${phaseClass} event-phase">${esc(phase)}</span>` +
     `<span class="event-message">${esc(message)}</span>` +
     (latencyMs ? `<span class="event-latency">${latencyMs}ms</span>` : '');
+
+  // The payment link is the one thing in the log a user must act on, and a
+  // race is already won by the time it appears — so it gets a real button
+  // rather than a line of text they have to notice and copy.
+  if (extra && extra.payment_url) {
+    const pay = document.createElement('div');
+    pay.className = 'card mt-1 payment-callout';
+    pay.innerHTML =
+      '<div class="card-title">Pay the booking fee to finish</div>'
+      + '<div class="form-help">Your tee time is <strong>held</strong> and we are keeping it '
+      + 'alive. It only becomes a reservation once this fee is paid, on ForeUp\u2019s own '
+      + 'payment page \u2014 we never see your card. Do it now; the hold will not last forever.</div>'
+      + `<a class="btn btn-primary btn-block mt-1" href="${esc(extra.payment_url)}" `
+      + 'target="_blank" rel="noopener">'
+      + `Pay $${esc(String(extra.booking_fee_total || ''))} and confirm the tee time</a>`;
+    log.appendChild(pay);
+  }
 
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;

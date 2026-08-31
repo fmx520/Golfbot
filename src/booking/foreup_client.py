@@ -242,7 +242,31 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                     f"pending_reservation did not return a reservation_id: {pending_response}"
                 )
 
-            # ---- Step 2: submit reservations; if course requires booking
+            # ---- Step 2a: courses that charge a booking fee cannot be
+            # committed by us at all. On those, users/reservations only
+            # validates -- a captured browser checkout sends validate_only and
+            # gets {"valid":true} -- and the reservation is created when the
+            # payment processor calls back. So take the browser's route: get
+            # the code, validate with it, then ask for the hosted payment page
+            # and hand its URL back. The hold stays ours until it is paid. ----
+            if _pick("booking_fee_required") and request_code_callback and customer_id:
+                fee_result = self._hold_and_request_payment(
+                    slot=slot, raw=raw, schedule_id=schedule_id,
+                    course_id=course_id or schedule_id,
+                    players=players, holes=holes,
+                    pending_reservation_id=pending_reservation_id,
+                    captcha_token=captcha_token, customer_id=customer_id,
+                    request_code_callback=request_code_callback,
+                    request_id=req_id, emit=_emit,
+                )
+                self._mark_idempotent_complete(idempotency_key)
+                total_ms = round((time.perf_counter() - flow_started) * 1000, 2)
+                self._log_flow(req_id, flow_started, total_ms, stage_latencies, "awaiting_payment")
+                return fee_result, BookingLatency(
+                    request_id=req_id, total_ms=total_ms, stages=stage_latencies
+                )
+
+            # ---- Step 2b: submit reservations; if course requires booking
             # code, ForeUp returns a 400 with that exact message — recover by
             # calling request_booking_code, waiting for the user to enter the
             # emailed code, and retrying the same submission with the code. ----
@@ -273,6 +297,91 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             self._release_idempotency_key(idempotency_key)
             self._log_flow(req_id, flow_started, None, stage_latencies, "error")
             raise
+
+    def _hold_and_request_payment(
+        self,
+        *,
+        slot: dict[str, Any],
+        raw: dict[str, Any],
+        schedule_id: str,
+        course_id: str,
+        players: int,
+        holes: int,
+        pending_reservation_id: str,
+        captcha_token: Optional[str],
+        customer_id: str,
+        request_code_callback: Callable[[str], str],
+        request_id: str,
+        emit: Callable[[str, dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        """Drive a fee-required booking as far as we are able: to the payment page.
+
+        We already hold the slot. What we cannot do is create the reservation --
+        that happens when the payment completes -- so this gets the emailed
+        code, validates with it, and returns the hosted payment URL for a human
+        to finish. Verified end to end against a live course.
+        """
+        def _pick(key: str, default: Any = "") -> Any:
+            val = raw.get(key, slot.get(key, default))
+            return default if val is None else val
+
+        self.request_booking_code(
+            course_id=str(course_id),
+            customer_id=str(customer_id),
+            pending_reservation_id=pending_reservation_id,
+            request_id=request_id,
+        )
+        emit("awaiting_booking_code", {"ttid": pending_reservation_id})
+        code = request_code_callback(pending_reservation_id)
+        if not code:
+            raise ForeUpError("Booking code was not provided in time")
+
+        validated = self.probe_validate_only(
+            pending_reservation_id=pending_reservation_id,
+            target_time=slot.get("raw_time", slot.get("time", "")),
+            template=raw,
+            schedule_id=str(schedule_id),
+            course_id=str(course_id),
+            players=players, holes=holes,
+            captcha_token=captcha_token,
+            confirmation_code=code,
+            request_id=request_id,
+        )
+        if not validated.get("ok"):
+            raise ForeUpError(
+                f"ForeUp would not validate the booking: {validated.get('error') or validated}"
+            )
+
+        payment = self.request_booking_fee_payment(
+            facility_id=str(course_id),
+            teesheet_id=str(schedule_id),
+            pending_reservation_id=pending_reservation_id,
+            confirmation_code=code,
+            target_time=slot.get("raw_time", slot.get("time", "")),
+            players=players, holes=holes,
+            booking_class_id=str(_pick("booking_class_id", "")),
+            teesheet_side_id=str(_pick("teesheet_side_id", "")),
+            available_spots=int(_pick("available_spots", players) or players),
+            request_id=request_id,
+        )
+        emit("booking_fee_payment", {"payment": payment})
+        if not payment.get("payment_url"):
+            raise ForeUpError(
+                f"Could not open a payment page for the held slot: "
+                f"{payment.get('error') or payment.get('verdict')}"
+            )
+
+        fee = _pick("booking_fee_price", 0)
+        per_person = bool(_pick("booking_fee_per_person", False))
+        total = (fee * players) if per_person else fee
+        return {
+            "awaiting_payment": True,
+            "pending_reservation_id": pending_reservation_id,
+            "payment_url": payment["payment_url"],
+            "booking_fee_total": total,
+            "players": players,
+            "slot_time": slot.get("time", ""),
+        }
 
     def _submit_reservation(
         self,
