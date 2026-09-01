@@ -219,6 +219,109 @@ def fetch_grid(*, course_id: str, day_of_week: int) -> Optional[dict[str, Any]]:
         return None
 
 
+# A tee sheet's interval and phase belong to the COURSE, not the day. Across
+# every course we have read on more than one day, all days agree:
+#
+#   2431 Black    Mon, Sun                    10min @ :00
+#   2432 Red      Mon Tue Wed Thu Fri Sun      9min @ :03
+#   2433 Blue     Wed Thu Fri Sat              9min @ :03
+#   2434 Green    Tue Wed Fri Sat              9min @ :03
+#   2436 Montauk  6 days                       9min @ :03
+#   2437          Tue Wed Thu Fri Sat          9min @ :06
+#
+# Zero counterexamples in 27 rows. Note 2437 runs :06 where its neighbours run
+# :03 -- phase is course-specific, so this infers from the SAME course's other
+# days and never globally.
+#
+# What does not transfer is first_time/last_time: the operating window really
+# does differ (weekend early starts), and green fees vary by day. That is fine,
+# because _gen_targets() builds targets inside the user's requested window and
+# never consults first/last. Interval plus phase is all it needs.
+#
+# Without this, learning Saturday means waiting for a Saturday. With it, one
+# read of any day makes every day aimable.
+INFER_MIN_SIBLING_DAYS = 2
+INFER_MIN_TOTAL_OBSERVED = 12
+
+
+def fetch_course_grids(*, course_id: str) -> list[dict[str, Any]]:
+    """Every stored day for one course. Returns [] when absent or on error."""
+    url = _grids_url()
+    if not url:
+        return []
+    try:
+        import httpx
+
+        resp = httpx.get(
+            url,
+            params={"course_id": f"eq.{course_id}", "limit": "7"},
+            headers=_sink_headers(),
+            timeout=TIMEOUT_SECONDS,
+        )
+        if resp.status_code >= 400:
+            _log(f"fetch_course failed {resp.status_code}: {resp.text[:200]}")
+            return []
+        rows = resp.json()
+        return rows if isinstance(rows, list) else []
+    except Exception as exc:  # noqa: BLE001
+        _log(f"fetch_course error {type(exc).__name__}: {exc}")
+        return []
+
+
+def infer_grid(*, course_id: str, day_of_week: int) -> Optional[dict[str, Any]]:
+    """Derive a day's grid from the same course's other days.
+
+    Returns a row shaped like fetch_grid's, plus ``inferred_from`` (the
+    weekdays it was derived from) and ``observed_count`` totalling the
+    observations backing it. Returns None unless every sibling day agrees on
+    (interval, phase) -- a course that genuinely runs two different intervals
+    must not be papered over.
+
+    The template comes from the strongest sibling of the SAME day type
+    (weekend vs weekday) where one exists, because green fees differ between
+    them; failing that, the strongest sibling of any day.
+    """
+    siblings = [r for r in fetch_course_grids(course_id=str(course_id))
+                if int(r.get("day_of_week", -1)) != int(day_of_week)
+                and r.get("interval_minutes") and r.get("anchor_phase") is not None]
+    if len(siblings) < INFER_MIN_SIBLING_DAYS:
+        return None
+
+    intervals = {int(r["interval_minutes"]) for r in siblings}
+    phases = {int(r["anchor_phase"]) for r in siblings}
+    if len(intervals) != 1 or len(phases) != 1:
+        _log(
+            f"cannot infer course {course_id} dow {day_of_week}: siblings "
+            f"disagree (intervals {sorted(intervals)}, phases {sorted(phases)})"
+        )
+        return None
+
+    total_seen = sum(int(r.get("observed_count") or 0) for r in siblings)
+    if total_seen < INFER_MIN_TOTAL_OBSERVED:
+        return None
+
+    want_weekend = int(day_of_week) >= 5
+    same_type = [r for r in siblings if (int(r["day_of_week"]) >= 5) == want_weekend]
+    pool = same_type or siblings
+    best = max(pool, key=lambda r: int(r.get("observed_count") or 0))
+
+    return {
+        "course_id": str(course_id),
+        "day_of_week": int(day_of_week),
+        "interval_minutes": intervals.pop(),
+        "anchor_phase": phases.pop(),
+        # Deliberately blank: we know the rhythm, not the operating window.
+        "first_time": "",
+        "last_time": "",
+        "observed_count": total_seen,
+        "confidence": "inferred",
+        "template": best.get("template") or {},
+        "source_date": str(best.get("source_date") or ""),
+        "inferred_from": sorted(int(r["day_of_week"]) for r in siblings),
+        "inferred_template_dow": int(best["day_of_week"]),
+    }
+
+
 def matches_stored_grid(time_str: str, stored: dict[str, Any]) -> Optional[bool]:
     """Validate a target against a stored grid row. None when the row is unusable."""
     interval = stored.get("interval_minutes")

@@ -287,6 +287,9 @@ def _event(job: JobState, stage: str, message: str, **extra: Any) -> None:
 # single-slot module global is unambiguous -- there is never a second race here.
 _race_for_decisions: list[Any] = []
 
+_DOW_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
+              "Friday", "Saturday", "Sunday"]
+
 _PERSISTED_EVENT_STAGES = frozenset({
     "prestage_disabled", "prestage_grid", "prestage_window", "prestage_capped",
     "prestage_armed", "prestage_rotated", "prestage_fire", "prestage_exhausted",
@@ -1188,6 +1191,37 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                              f"({grid_store.parse_hhmm_row(stored)})",
                 })
 
+            # Nothing observed for this weekday? A tee sheet's interval and
+            # phase belong to the course, not the day -- every course we have
+            # read on more than one day agrees with itself on all of them. So
+            # derive them from the course's other days rather than standing
+            # down. This is what stops "learning Saturday" from requiring an
+            # actual Saturday: Bethpage Black goes from 2 aimable days to 7.
+            #
+            # first/last stay blank on purpose. We know the rhythm, not the
+            # operating window, and _gen_targets only needs the rhythm.
+            if not cands or not any(c.get("seen") for c in cands):
+                guess = grid_store.infer_grid(course_id=str(ps_course), day_of_week=play_dow)
+                if guess:
+                    src = ", ".join(_DOW_NAMES[d] for d in guess["inferred_from"])
+                    cands.append({
+                        "interval": int(guess["interval_minutes"]),
+                        "phase": int(guess["anchor_phase"]),
+                        "first": "", "last": "",
+                        "seen": int(guess["observed_count"]),
+                        "template": guess.get("template") or {},
+                        "inferred": True,
+                        "label": f"a {guess['interval_minutes']}-minute grid inferred from "
+                                 f"this course's {src} ({guess['observed_count']} times seen "
+                                 f"across those days, all agreeing)",
+                    })
+                    _emit_event(queue, phase="sniper", stage="prestage_grid",
+                                message=f"Future Sight: no teesheet has ever been read for this "
+                                        f"course on a {_DOW_NAMES[play_dow]}. Inferring the grid from "
+                                        f"{src}, which all run {guess['interval_minutes']} minutes on "
+                                        f"the same phase — a sheet's rhythm belongs to the course, not "
+                                        f"the day. Targets come from that rhythm inside your window.")
+
             for c in cands:
                 c["covers"] = _sample_covers(c["first"], c["last"], win_start, win_end)
             cands.sort(key=lambda c: (c["covers"], c["seen"]), reverse=True)
@@ -1200,7 +1234,15 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             # not, however self-consistent it looks.
             for c in cands:
                 span = (_hhmm_to_min(c["last"]) or 0) - (_hhmm_to_min(c["first"]) or 0)
-                c["trustworthy"] = c["covers"] or (c["seen"] >= 20 and span >= 240)
+                # An inference has no span by construction, but the worry span
+                # guards against -- one interval read at twilight not holding in
+                # the morning -- is answered directly when several whole days of
+                # the same course independently agree on the interval.
+                c["trustworthy"] = (
+                    c["covers"]
+                    or (c["seen"] >= 20 and span >= 240)
+                    or bool(c.get("inferred") and c["seen"] >= 20)
+                )
             cands.sort(key=lambda c: (c["covers"], c["trustworthy"], c["seen"]), reverse=True)
             chosen = cands[0] if cands else None
 
@@ -2251,7 +2293,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.05"
+APP_VERSION = "1.06"
 
 @app.get("/health")
 def health() -> dict[str, str]:
