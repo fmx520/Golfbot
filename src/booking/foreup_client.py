@@ -676,6 +676,38 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
             ),
         }
 
+    def release_pending_reservation(
+        self,
+        *,
+        pending_reservation_id: str,
+        request_id: Optional[str] = None,
+    ) -> bool:
+        """Hand a hold back to the sheet instead of squatting on it.
+
+        Firing every pre-staged target at once means we can win several holds
+        and only want one. A hold expires on its own in ~2 minutes, but leaving
+        three of them parked is exactly the behaviour that gets an account
+        flagged, and it takes those times off the sheet for everyone else --
+        including the other five people using this bot. This is the DELETE the
+        browser itself sends when you back out of a booking.
+
+        Best effort by design: a failed release is not worth failing a booking
+        over, and the hold expires regardless.
+        """
+        if not pending_reservation_id:
+            return False
+        try:
+            self._request(
+                "DELETE",
+                f"{FOREUP_PENDING_RESERVATION_PATH}/{pending_reservation_id}",
+                stage="release_pending_reservation",
+                request_id=request_id or str(uuid.uuid4()),
+                retry_safe=False,
+            )
+            return True
+        except Exception:  # noqa: BLE001 -- see docstring; the hold self-expires
+            return False
+
     def request_booking_fee_payment(
         self,
         *,
