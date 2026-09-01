@@ -155,6 +155,7 @@ function renderCourseOptions() {
     opt.textContent = 'Paste a ForeUp URL';
     sel.appendChild(opt);
     sel.value = CUSTOM_COURSE;
+    renderCoursePicker();
     onCourseChange();
     return;
   }
@@ -181,13 +182,70 @@ function renderCourseOptions() {
 
   sel.value = previous || '';
   if (!sel.value) sel.selectedIndex = 0;
+  renderCoursePicker();
   onCourseChange();
+}
+
+// The picker mirrors the <select>: a row writes the key and dispatches `change`,
+// so onCourseChange and applyLinkGate run exactly as they do for a native pick.
+function renderCoursePicker() {
+  const box = $('coursePicker');
+  if (!box) return;
+  box.innerHTML = '';
+
+  const entries = S.catalog.map(c => ({
+    key: c.key,
+    name: c.name,
+    sub: c.note || '',
+    check: checkFor(c.key),
+  }));
+  entries.push({ key: CUSTOM_COURSE, name: 'Other course', sub: 'Paste a ForeUp booking URL', check: null });
+
+  entries.forEach(e => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'course-row';
+    row.dataset.key = e.key;
+
+    let badge = '';
+    if (e.check) {
+      const st = PREFLIGHT_STATE[e.check.status] || PREFLIGHT_STATE.unverified;
+      const label = e.check.status === 'ok' ? 'Verified' : (st.cls === 'bad' ? 'Wrong link' : 'Unconfirmed');
+      const kind = e.check.status === 'ok' ? 'success' : (st.cls === 'bad' ? 'error' : 'warning');
+      badge = `<span class="badge badge-${kind} course-row-badge">${st.icon} ${esc(label)}</span>`;
+    }
+
+    row.innerHTML = crestFor(e.key)
+      + `<span class="course-row-text">`
+      + `<span class="course-row-head"><span class="course-row-name">${esc(e.name)}</span>${badge}</span>`
+      + (e.sub ? `<span class="course-row-sub">${esc(e.sub)}</span>` : '')
+      + `</span>`;
+
+    row.addEventListener('click', () => {
+      const sel = $('courseSelect');
+      sel.value = e.key;
+      sel.dispatchEvent(new Event('change'));
+    });
+    box.appendChild(row);
+  });
+
+  syncPickerSelection();
+}
+
+function syncPickerSelection() {
+  const current = $('courseSelect')?.value || '';
+  document.querySelectorAll('#coursePicker .course-row').forEach(row => {
+    const on = row.dataset.key === current;
+    row.classList.toggle('selected', on);
+    row.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
 }
 
 function onCourseChange() {
   const key = $('courseSelect').value;
   S.courseKey = key;
   S.overrideBadLink = false;
+  syncPickerSelection();
 
   if (key === CUSTOM_COURSE) {
     show('customUrlCard');
@@ -213,6 +271,53 @@ function onCourseChange() {
 
   renderCourseDetail(course);
   applyLinkGate(course);
+}
+
+// Course crests. Inline SVG keyed by catalog key, so they cost no request and
+// stay sharp at any pixel density. A native <option> can only hold text, which
+// is why the dropdown keeps the catalog's emoji and the crest appears here, on
+// the detail panel, the moment a course is picked. Unknown keys (and the
+// paste-a-URL flow) fall back to the flag.
+const COURSE_CRESTS = {
+  bethpage: `<circle cx="16" cy="16" r="14.5" fill="#0c1611" stroke="#2fbf6d" stroke-width="1.2"/>
+    <circle cx="16" cy="16" r="11.5" fill="none" stroke="#f0b429" stroke-width="0.8" opacity="0.55"/>
+    <text x="16" y="21.5" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif"
+          font-size="15" font-weight="700" fill="#edf2ec">B</text>`,
+
+  sunken_meadow: `<circle cx="16" cy="16" r="14.5" fill="#0c1611" stroke="#2fbf6d" stroke-width="1.2"/>
+    <circle cx="16" cy="11.5" r="3.4" fill="#f0b429"/>
+    <path d="M7.5 19q3-2.6 6-0 3 2.6 6 0 3-2.6 6 0" fill="none" stroke="#58b6d8"
+          stroke-width="1.5" stroke-linecap="round"/>
+    <path d="M7.5 23.2q3-2.6 6-0 3 2.6 6 0 3-2.6 6 0" fill="none" stroke="#2fbf6d"
+          stroke-width="1.5" stroke-linecap="round" opacity="0.85"/>`,
+
+  montauk_downs: `<circle cx="16" cy="16" r="14.5" fill="#0c1611" stroke="#2fbf6d" stroke-width="1.2"/>
+    <path d="M9.5 10.5h3M19.5 10.5h3" stroke="#f0b429" stroke-width="1.3" stroke-linecap="round"/>
+    <path d="M16 6.5l2.4 3h-4.8z" fill="#edf2ec"/>
+    <rect x="14.1" y="9.4" width="3.8" height="2.8" rx="0.5" fill="#f0b429"/>
+    <path d="M14.4 12.4h3.2l1.5 9.6h-6.2z" fill="#edf2ec"/>
+    <path d="M13.6 17h4.8" stroke="#0c1611" stroke-width="1.4"/>
+    <path d="M8.5 22.4q3.6-1.8 7.5-1.8t7.5 1.8" fill="none" stroke="#2fbf6d"
+          stroke-width="1.5" stroke-linecap="round"/>`,
+
+  crab_meadow: `<circle cx="16" cy="16" r="14.5" fill="#0c1611" stroke="#2fbf6d" stroke-width="1.2"/>
+    <circle cx="10.2" cy="15.4" r="1.9" fill="#e5484d"/>
+    <circle cx="21.8" cy="15.4" r="1.9" fill="#e5484d"/>
+    <ellipse cx="16" cy="18.8" rx="5.2" ry="3.5" fill="#e5484d"/>
+    <path d="M11.2 21.6l-2 2.1M13.2 22.5l-1.2 2.3M20.8 21.6l2 2.1M18.8 22.5l1.2 2.3"
+          stroke="#e5484d" stroke-width="1.2" stroke-linecap="round"/>
+    <circle cx="14.3" cy="17.9" r="0.85" fill="#0c1611"/>
+    <circle cx="17.7" cy="17.9" r="0.85" fill="#0c1611"/>`,
+};
+
+const FALLBACK_CREST = `<circle cx="16" cy="16" r="14.5" fill="#0c1611" stroke="#2fbf6d" stroke-width="1.2"/>
+  <path d="M12.5 24V8.5" stroke="#edf2ec" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M12.5 9.2l8 2.9-8 2.9z" fill="#f0b429"/>
+  <circle cx="20" cy="22.5" r="1.9" fill="#edf2ec"/>`;
+
+function crestFor(key) {
+  return `<svg class="course-crest" viewBox="0 0 32 32" aria-hidden="true" focusable="false">`
+       + (COURSE_CRESTS[key] || FALLBACK_CREST) + `</svg>`;
 }
 
 function renderCourseDetail(course) {
@@ -540,7 +645,7 @@ function startPolling() {
       const newEvents = data.events.slice(S.jobEvents.length);
       for (const ev of newEvents) {
         S.jobEvents.push(ev);
-        addEvent(ev.phase || 'system', ev.stage, ev.message, ev.latency_ms);
+        addEvent(ev.phase || 'system', ev.stage, ev.message, ev.latency_ms, ev);
       }
 
       if (data.status === 'awaiting_input') {
@@ -548,7 +653,8 @@ function startPolling() {
         fireNotification({ events: [{ slot: null }] });
       }
 
-      if (data.status === 'succeeded' || data.status === 'failed' || data.status === 'cancelled') {
+      if (data.status === 'succeeded' || data.status === 'failed'
+          || data.status === 'cancelled' || data.status === 'awaiting_payment') {
         clearInterval(S.pollTimer);
         S.pollTimer = null;
         hideVerificationForm();
@@ -590,7 +696,7 @@ function extractSlotsFromEvents(events) {
   }
 }
 
-function addEvent(phase, stage, message, latencyMs) {
+function addEvent(phase, stage, message, latencyMs, extra) {
   const log = $('eventLog');
   const line = document.createElement('div');
   line.className = 'event-line';
@@ -610,6 +716,8 @@ function addEvent(phase, stage, message, latencyMs) {
     `<span class="badge ${phaseClass} event-phase">${esc(phase)}</span>` +
     `<span class="event-message">${esc(message)}</span>` +
     (latencyMs ? `<span class="event-latency">${latencyMs}ms</span>` : '');
+
+  if (extra && extra.payment_url) showPaymentPrompt(extra);
 
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
@@ -829,6 +937,7 @@ async function showTeeGrid() {
       `<option value="${esc(t)}">${esc(t)}${open.has(t) ? ' (open now)' : ' (booked now)'}</option>`
     ).join('') || '<option value="">no grid found</option>';
     $('probeBtn').disabled = g.grid_times.length === 0;
+    $('validateBtn').disabled = g.grid_times.length === 0;
 
     // Always show what was actually read, so an empty result explains itself
     // rather than looking like a broken lookup.
@@ -856,6 +965,11 @@ async function showTeeGrid() {
              + `<strong>Confidence:</strong> ${esc(g.confidence)} `
              + `(${g.observed_count} open now, ${g.grid_count} real tee times)<br>`
              + `<strong>Usable for pre-staging:</strong> ${g.usable_for_prestage ? 'yes' : 'NO'}`;
+    if (g.learned_courses && g.learned_courses.length) {
+      html += `<br><strong>Remembered:</strong> Golfbot now knows this grid for `
+            + `${esc(g.learned_courses.join(', '))} on this weekday, so Future Sight can `
+            + `aim here even when the reference sheet is full.`;
+    }
     if (breakdown) html += '<br><br>' + breakdown;
     if (g.notes && g.notes.length) {
       html += '<br><br>' + g.notes.map(n => '&bull; ' + esc(n)).join('<br>');
@@ -865,7 +979,164 @@ async function showTeeGrid() {
     probeLog('<strong>Failed:</strong> ' + esc(e.message));
   } finally {
     btn.disabled = false;
-    btn.textContent = "1. Show this course's tee grid";
+    btn.textContent = "Show this course's tee grid";
+  }
+}
+
+async function scanCheckoutFields() {
+  const btn = $('fieldsBtn');
+  btn.disabled = true;
+  btn.textContent = 'Reading ForeUp\u2019s checkout...';
+  try {
+    const r = await api('/probe/checkout-fields', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(probeBase()),
+    });
+    let html = `<strong>${esc(r.verdict)}</strong><br><br>`
+             + `Scanned ${r.scripts_scanned} source(s); we send ${r.fields_we_send} fields.`;
+    if ((r.scripts_with_payload_code || []).length) {
+      html += '<br><br><strong>Payload code found in:</strong><br>'
+            + r.scripts_with_payload_code.map(x => '&bull; ' + esc(x)).join('<br>');
+    }
+    if ((r.api_calls || []).length) {
+      // The endpoints ForeUp's own checkout calls. Any we don't call is a
+      // step we skip, which is the likeliest home of the fee.
+      html += '<br><br><strong>ForeUp checkout API calls found:</strong>';
+      for (const a of r.api_calls) {
+        html += `<br>&bull; <strong>${esc(a.name)}</strong> &rarr; <code>`
+              + esc((a.url_fragments || []).join('  ')) + '</code>'
+              + ((a.url_bases || []).length ? ' <em>(' + esc(a.url_bases.join(', ')) + ')</em>' : '');
+      }
+    }
+    if ((r.candidate_fields || []).length) {
+      html += '<br><br><strong>Fields near it that we do NOT send:</strong><br>'
+            + '<code>' + esc(r.candidate_fields.join(', ')) + '</code>';
+    }
+    for (const res of r.results || []) {
+      for (const h of res.anchor_hits || []) {
+        html += `<br><br><strong>${esc(h.anchor)}</strong> in ${esc(res.script)}:<br>`
+              + '<code>' + esc(h.excerpt) + '</code>';
+      }
+      for (const pm of (res.payment_mentions || []).slice(0, 12)) {
+        html += `<br><br><strong>payment hint &ldquo;${esc(pm.hint)}&rdquo;:</strong><br>`
+              + '<code>' + esc(pm.excerpt) + '</code>';
+      }
+    }
+    probeLog(html);
+  } catch (e) {
+    probeLog('<strong>Failed:</strong> ' + esc(e.message));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Scan ForeUp's checkout fields";
+  }
+}
+
+async function fireValidateProbe() {
+  const target = $('probeTime').value;
+  if (!target) return;
+  if (!confirm(
+    `Ask ForeUp whether it would accept a booking at ${target}?\n\n`
+    + 'This holds the time, then sends the real booking request with '
+    + "validate_only set — ForeUp should answer without creating anything.\n\n"
+    + 'CAUTION: we have never sent that flag before. If ForeUp ignores it, this '
+    + 'BOOKS FOR REAL and charges any booking fee. Only aim it at a time you '
+    + 'would be happy to have.'
+  )) return;
+
+  const btn = $('validateBtn');
+  btn.disabled = true;
+  btn.textContent = 'Asking ForeUp...';
+  try {
+    const r = await api('/probe/cold-hold', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...probeBase(), target_time: target, validate_after_hold: true }),
+    });
+    let v = r.validate || {};
+
+    // ForeUp gates on the emailed code before it looks at the fee, so a first
+    // pass that stops there has not answered the question we asked. Push
+    // through it against the SAME hold — the code is issued for that one.
+    if (v.needs_code && v.code_requested && v.hold_id) {
+      const code = prompt(
+        'ForeUp wants the emailed booking code before it will look at the fee.\n\n'
+        + 'Check your email and paste the code here to finish the check. '
+        + 'The hold is still open, so do this promptly.'
+      );
+      if (code && code.trim()) {
+        btn.textContent = 'Submitting code...';
+        const r2 = await api('/probe/cold-hold', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...probeBase(),
+            target_time: target,
+            validate_after_hold: true,
+            existing_hold_id: v.hold_id,
+            booking_code: code.trim(),
+            want_payment_url: true,
+          }),
+        });
+        v = r2.validate || v;
+        r.payment = r2.payment;
+        r.steps = (r.steps || []).concat(r2.steps || []);
+      }
+    }
+    let html = r.steps.map(x => '&bull; ' + esc(x)).join('<br>')
+             + `<br><br><strong>Hold:</strong> ${r.accepted ? 'ACCEPTED' : 'REJECTED'} in ${r.latency_ms}ms`;
+    if (!r.accepted && r.error) html += '<br>' + esc(r.error);
+
+    if (v.skipped) {
+      html += '<br><br>' + esc(v.verdict);
+    } else if (v.verdict) {
+      // The fee answer is the entire point of this probe, so lead with it.
+      html += `<br><br><strong>Validation:</strong> ${v.ok ? 'PASSED' : 'REJECTED'}`
+            + (v.latency_ms ? ` in ${v.latency_ms}ms` : '')
+            + `<br>${esc(v.verdict)}`;
+      if (v.needs_code && !v.code_sent) {
+        html += '<br><br><strong>Not an answer yet.</strong> ForeUp stopped at the code '
+              + 'gate, which sits ahead of the fee check, so the fee question is still '
+              + 'open. Re-run and enter the emailed code to get past it.';
+      }
+      if (v.code_request_error) {
+        html += '<br><br><strong>Could not request a code:</strong> ' + esc(v.code_request_error);
+      }
+      if (v.fee_blocked) {
+        html += '<br><br><strong>This is the decisive answer:</strong> the booking-fee '
+              + 'check runs during validation, so reordering our requests to match the '
+              + "browser cannot get past it. The fee has to be paid.";
+      }
+      if (v.error) html += '<br><br><strong>ForeUp said:</strong><br>' + esc(v.error);
+      if (v.response) html += '<br><br><strong>Response:</strong><br>'
+                            + esc(JSON.stringify(v.response).slice(0, 800));
+      if (r.payment) {
+        const pm = r.payment;
+        html += `<br><br><strong>Payment page:</strong> ${pm.ok ? 'created' : 'NOT created'}`
+              + (pm.latency_ms ? ` in ${Math.round(pm.latency_ms)}ms` : '');
+        if (pm.payment_url) {
+          // The whole point of the test: can this URL be opened elsewhere?
+          html += '<br><a href="' + esc(pm.payment_url) + '" target="_blank" rel="noopener">'
+                + esc(pm.payment_url) + '</a>'
+                + '<br><em>Open this on your phone. If a card form loads, the hand-off works.</em>';
+        }
+        html += '<br>' + esc(pm.verdict || '');
+        if (pm.error) html += '<br><strong>ForeUp said:</strong><br>' + esc(pm.error);
+        if (!pm.payment_url && pm.raw_html) {
+          html += '<br><strong>Response:</strong><br><code>' + esc(pm.raw_html.slice(0, 500)) + '</code>';
+        }
+      }
+      if (v.ok && !r.payment) {
+        html += '<br><br>Nothing was booked — validation alone never creates a reservation. '
+              + 'Re-run with the payment step to get a link that does.';
+      }
+    }
+    probeLog(html);
+  } catch (e) {
+    probeLog('<strong>Refused:</strong> ' + esc(e.message));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Ask ForeUp: would this book?';
   }
 }
 
@@ -896,7 +1167,7 @@ async function fireColdHoldProbe() {
     probeLog('<strong>Refused:</strong> ' + esc(e.message));
   } finally {
     btn.disabled = false;
-    btn.textContent = '2. Fire cold-hold probe';
+    btn.textContent = 'Fire cold-hold probe';
   }
 }
 
@@ -916,6 +1187,34 @@ async function stopJob() {
   }
   // The poller handles the rest — it hides the button when the job reports
   // 'cancelled', so the UI only says stopped once the worker actually has.
+}
+
+function showPaymentPrompt(ev) {
+  // Won race, ticking hold, one human step left — so this opens over the page
+  // rather than appending to a log the user has to notice and scroll back to.
+  const url = ev.payment_url;
+  const fee = ev.booking_fee_total;
+  const when = (ev.slot && ev.slot.time) ? String(ev.slot.time).slice(-5) : '';
+  const label = fee ? `Pay $${fee} and confirm the tee time` : 'Pay and confirm the tee time';
+  const line = when ? `Your ${when} tee time is held.` : 'Your tee time is held.';
+
+  $('modalSlotLine').textContent = line;
+  $('modalPayLink').href = url;
+  $('modalPayLink').textContent = label;
+  show('paymentModal');
+
+  // The same prompt stays in the step flow, so dismissing the modal — or
+  // paying on another device — does not strand the link.
+  $('paymentSlotLine').textContent = line;
+  $('paymentLink').href = url;
+  $('paymentLink').textContent = label;
+  show('paymentContainer');
+
+  $('searchBtn').innerHTML = 'Awaiting booking fee payment...';
+}
+
+function hidePaymentModal() {
+  hide('paymentModal');
 }
 
 function showVerificationForm() {
@@ -1021,10 +1320,22 @@ document.addEventListener('DOMContentLoaded', () => {
   $('connectBtn').addEventListener('click', connect);
   $('searchBtn').addEventListener('click', searchTeeTimes);
   $('stopBtn').addEventListener('click', stopJob);
+  // The cold-hold probe places a real hold on real inventory, so it stays out
+  // of the normal booking flow. ?debug=1 brings it back for diagnosing a course.
+  if (new URLSearchParams(location.search).get('debug') === '1') {
+    $('probeTools').classList.remove('hidden');
+  }
   $('gridBtn').addEventListener('click', showTeeGrid);
   $('probeBtn').addEventListener('click', fireColdHoldProbe);
+  $('validateBtn').addEventListener('click', fireValidateProbe);
+  $('fieldsBtn').addEventListener('click', scanCheckoutFields);
   document.querySelectorAll('input[name="raceStrategy"]').forEach(el =>
     el.addEventListener('change', onStrategyChange));
+  $('modalDismiss').addEventListener('click', hidePaymentModal);
+  $('paymentModal').addEventListener('click', (e) => {
+    // Backdrop click closes; the card itself must not.
+    if (e.target === $('paymentModal')) hidePaymentModal();
+  });
   $('snipeNow').addEventListener('change', toggleSnipeNow);
   $('autoBook').addEventListener('change', toggleCaptchaKey);
   $('bookingClass').addEventListener('change', updateDateRange);

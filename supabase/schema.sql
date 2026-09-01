@@ -28,8 +28,8 @@ create table if not exists races (
 
     -- The verdict.
     outcome          text,          -- won | late_start | blocked | lost_at_submit
-                                    -- | never_saw_slot | found_not_booked
-                                    -- | aborted | error
+                                    -- | blocked_by_fee | never_saw_slot
+                                    -- | found_not_booked | aborted | error
     summary          text,          -- one-line human-readable version
     success          boolean,
 
@@ -38,63 +38,73 @@ create table if not exists races (
     polls            jsonb,
     attempts         jsonb,
     captcha          jsonb,
+    prestage         jsonb,         -- Future Sight: one entry per hold fired
+    two_factor       jsonb,         -- booking-code path + hold keepalive
+    peers            jsonb,         -- our own concurrent jobs on this race
 
     aborted_reason   text,
     error            text
 );
 
--- The two axes you actually slice on: what happened, and when.
-create index if not exists races_outcome_idx    on races (outcome);
-create index if not exists races_recorded_idx   on races (recorded_at desc);
-create index if not exists races_created_idx    on races (created_at desc);
-
--- Leave RLS on with no policies. The service_role key used by the bot bypasses
--- RLS entirely, so writes keep working, while an anon key leaked from anywhere
--- else can neither read nor write this table.
-alter table races enable row level security;
-
 
 -- ---------------------------------------------------------------------------
--- Per-course tee-grid registry (src/telemetry/grid_store.py)
+-- Migration for a table created before v0.78
 -- ---------------------------------------------------------------------------
 --
--- Future Sight needs to know which exact tee times a course offers before it
--- can pre-stage holds against them. That's learned from a teesheet that is
--- already visible — one row per (course_id, day_of_week), so a Saturday sheet
--- doesn't get overwritten by a Tuesday read of the same course. The sink
--- reuses RACE_LOG_WEBHOOK_URL, swapping /races for /course_grids, so no extra
--- env var is needed once the races table above is wired up.
+-- prestage (v0.73), two_factor (v0.68) and peers (v0.78) were added to the
+-- record without columns. PostgREST rejects the WHOLE insert on any unmapped
+-- key, so a table missing these accepts NO races at all -- the symptom is a
+-- GOLFBOT_RACE_SINK_ERROR 400 line per run and an empty history. Safe to run
+-- more than once.
+
+alter table races add column if not exists prestage   jsonb;
+alter table races add column if not exists two_factor jsonb;
+alter table races add column if not exists peers      jsonb;
+
+-- Guard against this recurring: scripts/check_schema_drift.py compares the
+-- record's top-level keys against the columns above and fails on any gap.
+
+
+-- ---------------------------------------------------------------------------
+-- Course tee-time grid registry
+-- ---------------------------------------------------------------------------
+--
+-- Future Sight has to name an exact time before the sheet opens, so it needs to
+-- know the course's interval and anchor in advance. The live reference read is
+-- the primary source; this table is what makes the fallback work on a day when
+-- the reference sheet is booked solid or unreadable.
+--
+-- This table was referenced by src/telemetry/grid_store.py from the start but
+-- never actually created, so the fallback could never fire -- Future Sight
+-- reported "nothing stored for this course/day yet" no matter how many times
+-- you ran it.
 
 create table if not exists course_grids (
-    course_id         text not null,   -- ForeUp teesheet id (the URL's second number)
-    day_of_week       int  not null,   -- Python date.weekday(): Monday=0 .. Sunday=6
+    course_id        text not null,
+    day_of_week      int  not null,   -- 0=Monday .. 6=Sunday, matching date.weekday()
 
-    interval_minutes  int,             -- inferred tee interval, e.g. 8 or 10
-    anchor_phase      int,             -- (any observed time) mod interval_minutes
-    first_time        text,
-    last_time         text,
-    observed_count    int,
-    confidence        text,            -- none | low | medium | high
+    interval_minutes int  not null,   -- e.g. 10 for a 10-minute sheet
+    anchor_phase     int,             -- first_time mod interval; a sheet on :03 has phase 3
+    first_time       text,
+    last_time        text,
+    observed_count   int,
+    confidence       text,            -- none | low | medium | high
 
-    -- One real slot's raw ForeUp payload, for shaping a pre-staged hold's body.
-    template          jsonb,
+    -- The per-course payload fields a pre-staged hold needs (booking_class_id,
+    -- teesheet_side_id, green_fee). jsonb so new fields need no migration.
+    template         jsonb,
+    source_date      text,            -- which date this observation came from
+    updated_at       timestamptz not null default now(),
 
-    -- The date this grid was read from, and when. source_date is a display
-    -- field (kept text, like races.play_date, for the same reason: never fail
-    -- the insert over a cast). updated_at is what tells you the row is stale.
-    source_date       text,
-    updated_at        timestamptz not null default now(),
-
+    -- upsert_grid posts with on_conflict=course_id,day_of_week, which REQUIRES
+    -- this constraint to exist -- without it PostgREST rejects the merge.
     primary key (course_id, day_of_week)
 );
-
--- upsert_grid() POSTs with ?on_conflict=course_id,day_of_week — the primary
--- key above is exactly what PostgREST needs to resolve that.
 
 alter table course_grids enable row level security;
 
 -- upsert_grid() never sends updated_at, so the column default only fires on
--- the very first insert — a later re-learn of the same course/day would
+-- the very first insert -- a later re-learn of the same course/day would
 -- otherwise leave updated_at frozen at that first write, making every row
 -- look equally stale forever. This keeps it honest on every write.
 create or replace function course_grids_touch_updated_at()
@@ -109,6 +119,16 @@ drop trigger if exists course_grids_set_updated_at on course_grids;
 create trigger course_grids_set_updated_at
     before insert or update on course_grids
     for each row execute function course_grids_touch_updated_at();
+
+-- The two axes you actually slice on: what happened, and when.
+create index if not exists races_outcome_idx    on races (outcome);
+create index if not exists races_recorded_idx   on races (recorded_at desc);
+create index if not exists races_created_idx    on races (created_at desc);
+
+-- Leave RLS on with no policies. The service_role key used by the bot bypasses
+-- RLS entirely, so writes keep working, while an anon key leaked from anywhere
+-- else can neither read nor write this table.
+alter table races enable row level security;
 
 
 -- ---------------------------------------------------------------------------

@@ -70,7 +70,12 @@
 
         <div class="form-group mt-1">
           <label for="courseSelect">Which course?</label>
-          <select id="courseSelect">
+          <!-- The visual picker is rendered into #coursePicker. #courseSelect stays
+               in the DOM as the single source of truth (and as the fallback if the
+               catalog never loads); the rows just write to it and fire `change`, so
+               every downstream reader is untouched. -->
+          <div class="course-picker" id="coursePicker" role="group" aria-label="Course"></div>
+          <select id="courseSelect" class="course-select-fallback" tabindex="-1" aria-hidden="true">
             <option value="" disabled selected>Loading courses&hellip;</option>
           </select>
         </div>
@@ -249,28 +254,64 @@
       <button class="btn btn-danger btn-block mt-1 hidden" id="stopBtn">Stop</button>
 
       <div class="card mt-2">
-        <div class="card-title">Pre-stage probe (experimental)</div>
+        <div class="card-title">Course tee grid</div>
         <div class="form-help">
-          Tests whether ForeUp will hold a tee time <em>without</em> polling for it first.
-          If it works, a release can be raced by firing the hold directly at T+0 instead of
-          waiting on a 100&ndash;500ms discovery round trip. Uses the date, players, holes and
-          booking class above. <strong>Never books anything</strong> &mdash; but a successful hold
-          is real and releases itself after ~2 minutes, so pick a time you don't mind briefly
-          holding.
+          Shows which tee times this course actually offers &mdash; most run on a fixed interval
+          (every 9 minutes from :03, say), so times off that grid simply do not exist. Reads the
+          sheet for the date, players, holes and booking class above and holds nothing.
+          Future Sight works this out on its own, but running it here teaches Golfbot a course
+          whose own sheet is booked solid.
         </div>
-        <button class="btn btn-secondary btn-block mt-1" id="gridBtn">1. Show this course's tee grid</button>
-        <div class="form-group mt-1">
-          <label for="probeTime">Target time (must be on the grid)</label>
-          <select id="probeTime"><option value="">&mdash; run step 1 first &mdash;</option></select>
+        <button class="btn btn-secondary btn-block mt-1" id="gridBtn">Show this course's tee grid</button>
+
+        <!-- Operator tool, hidden unless the page is opened with ?debug=1. A
+             successful probe places a REAL hold for ~2 minutes, so it is not
+             something to leave in front of everyone booking a tee time. It fires
+             the same code path Future Sight uses at a release, which makes it the
+             only way to check the hold works for a course and booking class
+             without waiting for one. -->
+        <div class="hidden" id="probeTools">
+          <div class="form-help mt-2">
+            <strong>Cold-hold probe.</strong> Fires the same hold Future Sight fires at a release,
+            so you can check a course and booking class ahead of time. <strong>Never books
+            anything</strong> &mdash; but the hold is real and releases itself after ~2 minutes,
+            so pick a time you don't mind briefly holding.
+          </div>
+          <div class="form-group mt-1">
+            <label for="probeTime">Target time (must be on the grid)</label>
+            <select id="probeTime"><option value="">&mdash; show the grid first &mdash;</option></select>
+          </div>
+          <button class="btn btn-secondary btn-block" id="probeBtn" disabled>Fire cold-hold probe</button>
+          <div class="form-help mt-2">
+            <strong>Would this book?</strong> Holds the time, then sends the real booking
+            request with ForeUp's own <code>validate_only</code> flag set, so they answer
+            without creating a reservation. Tells us whether the booking-fee check runs at
+            validation or at commit &mdash; which decides whether matching the browser's
+            request order could ever be enough. <strong>We have never sent that flag</strong>;
+            if ForeUp ignores it this books for real, so aim it at a time you would take.
+          </div>
+          <button class="btn btn-secondary btn-block" id="validateBtn" disabled>Ask ForeUp: would this book?</button>
+          <div class="form-help mt-2">
+            <strong>What does ForeUp's checkout send?</strong> Reads the booking page and its
+            scripts and looks for the code that builds the reservation, then lists every field
+            near it that we don't send &mdash; which is where whatever pays the booking fee
+            would be. Read-only: no hold, no reservation, nothing booked.
+          </div>
+          <button class="btn btn-secondary btn-block" id="fieldsBtn">Scan ForeUp's checkout fields</button>
         </div>
-        <button class="btn btn-secondary btn-block" id="probeBtn" disabled>2. Fire cold-hold probe</button>
         <div class="event-log mt-1 hidden" id="probeOut"></div>
       </div>
 
-      <div class="mt-2" id="eventLogContainer" class="hidden">
-        <div class="card">
-          <div class="card-title">Job Progress</div>
-          <div class="event-log" id="eventLog"></div>
+      <div id="paymentContainer" class="hidden mt-2">
+        <div class="card payment-card">
+          <div class="card-title">Tee time held — pay to confirm</div>
+          <div class="card-subtitle" id="paymentSlotLine"></div>
+          <div class="form-help">
+            We are holding this slot and refreshing it for you. It becomes a real
+            reservation only once the booking fee is paid, on ForeUp&rsquo;s own payment
+            page &mdash; your card never touches Golfbot.
+          </div>
+          <a class="btn btn-primary btn-block mt-1" id="paymentLink" href="#" target="_blank" rel="noopener">Pay and confirm</a>
         </div>
       </div>
 
@@ -286,6 +327,13 @@
               <button class="btn btn-primary" id="submitCodeBtn" onclick="submitVerificationCode()">Verify</button>
             </div>
           </div>
+        </div>
+      </div>
+
+      <div class="mt-2" id="eventLogContainer">
+        <div class="card">
+          <div class="card-title">Job Progress</div>
+          <div class="event-log" id="eventLog"></div>
         </div>
       </div>
 
@@ -352,12 +400,43 @@
 
       <details class="faq-item">
         <summary>What is Sniper Mode?</summary>
-        <p>Sniper Mode is designed to beat other bots when courses release tee times at a fixed time (e.g., 7:00 PM). It pre-authenticates your session, then at release time polls the ForeUp API every 200ms (5 requests/second) until a matching slot appears. The booking fires within milliseconds of the slot showing up — before a human could even see it on screen. The 90-second timeout stops polling if nothing is released.</p>
+        <p>Sniper Mode is designed to beat other bots when courses release tee times at a fixed time (e.g., 7:00 PM). It pre-authenticates your session, then at release time polls the ForeUp API every 150&ndash;300ms until a matching slot appears, and books within milliseconds of the slot showing up. The 90-second timeout stops polling if nothing is released.</p>
+        <p>Sniper is also the right choice for a <strong>mid-day cancellation</strong> — someone drops a Saturday slot at 2pm and you want to grab it. That is what <strong>Start now</strong> is for: no release to wait on, just poll until something appears.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>What is Future Sight, and how is it different from Sniper?</summary>
+        <p>Sniper does two things at the release instant: it <em>asks</em> ForeUp what opened, then it books. Future Sight skips the asking. It works out the exact tee times your course will publish <em>before</em> the release, then fires holds directly at those times the moment the sheet opens — no discovery round trip, straight to the front of the queue.</p>
+        <p>That round trip is roughly 300ms, and a release is decided in less than that. Everything else about the race is work ForeUp does on its side that everyone pays equally; the lookup is the part we can simply not do.</p>
+        <p>It holds up to six times one at a time, in order, and stops at the first one accepted. If they all miss it re-fires for a few seconds in case the sheet published late, then falls back to normal polling — so a wrong guess costs a little time, never the race.</p>
+        <p>Because the holds are real, Future Sight requires <strong>Auto-book on and Dry Run off</strong>, and it needs a <strong>release time</strong>. Sniper and Future Sight are either/or: they are different tools, not two settings you stack.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>Why can't I use "Start now" with Future Sight?</summary>
+        <p>Pre-staging only beats polling when the times are known in advance. At a release, every time opens at once, so your whole window is worth aiming at. Started mid-day, exactly one slot has opened — somebody's cancellation — and nobody knows which. Firing six holds to find out is a shotgun in the dark, and a single poll would just tell you. Worse, the burst would delay the polling that was going to win.</p>
+        <p>So for a cancellation, pick Sniper with <strong>Start now</strong>. That is the tool built for it.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>How does Future Sight know the times before they're published?</summary>
+        <p>Courses run tee times on a fixed grid — Bethpage Red, for example, goes every 9 minutes anchored on :03, so 7:06, 7:15, 7:24 and so on. 7:10 does not exist there and a hold aimed at it fails no matter how fast it is.</p>
+        <p>Golfbot works the grid out by reading a day whose sheet is already published, preferring the same weekday a week earlier, and then intersects it with the time window you asked for. You never type a time in: you say "7:00 to 8:00" and it turns that into the real slots.</p>
+        <p>What it learns is remembered per course and weekday, so a day when the reference sheet is booked solid no longer means falling back to guessing. Pressing <strong>Show this course's tee grid</strong> for a date with plenty of open times is the fastest way to teach it a new course — and any release Golfbot polls gets banked automatically.</p>
+        <p>One caveat worth knowing: if the only times it could see were, say, twilight slots, the grid for your 7am window is extrapolated from those. It is usually right, because most courses use one interval all day — but that is the assumption, and off-grid targets are simply rejected and fall through to polling.</p>
+      </details>
+
+      <details class="faq-item">
+        <summary>Several of us are booking the same course. Do we fight each other?</summary>
+        <p>Not any more. Golfbot ranks slots the same way every time, so without this, everyone armed on the same course would pick the identical time and all but one would lose — a loss that looks exactly like losing to an outside bot.</p>
+        <p>When you arm, Golfbot checks whether other jobs are already racing <em>identical</em> criteria — same courses, date, booking class, players and holes — and rotates your pick order so each of you opens on a different time. Nobody loses a chance: every job still tries your whole window and still falls through to whatever is left. It only changes who goes first. You'll see a note saying you're #2 of 3 when it applies.</p>
+        <p>It only coordinates on an exact match. A different booking class sees different inventory, so steering you off a slot could point you at a time that does not exist for you. And if you are the only one armed, nothing changes at all.</p>
       </details>
 
       <details class="faq-item">
         <summary>What is Auto-Book?</summary>
-        <p>When enabled alongside Sniper Mode, the bot will automatically submit the booking the instant a matching slot is found — no manual intervention needed.</p>
+        <p>When enabled alongside Sniper Mode, the bot will automatically submit the booking the instant a matching slot is found — no manual intervention needed. Future Sight always books, so it switches Auto-book on and locks it there.</p>
+        <p>If your course emails a booking code, the run pauses and asks you for it, keeping the hold alive while it waits. You have about two minutes.</p>
       </details>
 
       <details class="faq-item">
@@ -367,21 +446,40 @@
 
       <details class="faq-item">
         <summary>What does the Release Time mean?</summary>
-        <p>This is the time your course publishes new tee times — for example, many NY state courses release at 7:00 PM for the following week. Set this to match your course's release schedule. The sniper arms early, pre-warms your session at T-5 seconds, and starts polling at exactly this time.</p>
+        <p>This is the time your course publishes new tee times — for example, many NY state courses release at 7:00 PM for the following week. Set this to match your course's release schedule. Golfbot arms early, re-warms your session shortly before, and starts racing at exactly this time.</p>
+        <p><strong>Arm a few minutes ahead, not hours.</strong> A couple of minutes is plenty to get set up, and leaving a job counting down all afternoon mostly just gives it more time to be interrupted.</p>
       </details>
 
       <details class="faq-item">
-        <summary>Sniper timeline</summary>
+        <summary>Race timeline</summary>
         <p>
-          <strong>T-120s</strong> — Authenticate &amp; pre-solve CAPTCHA<br>
-          <strong>T-5s</strong> — Re-warm session (fresh cookies + JWT)<br>
-          <strong>T-0s</strong> — Start polling every 200ms<br>
-          <strong>T+match</strong> — Slot found → book instantly or alert<br>
-          <strong>T+90s</strong> — Timeout if no slots found
+          <strong>At arming</strong> — Authenticate, pre-solve CAPTCHA, and (Future Sight) work out the target times<br>
+          <strong>T-12s</strong> — Re-warm session (fresh cookies + JWT)<br>
+          <strong>T-0s</strong> — Future Sight fires its holds; Sniper starts polling every 150&ndash;300ms<br>
+          <strong>T+match</strong> — Slot taken → book instantly or alert<br>
+          <strong>T+90s</strong> — Timeout if nothing was released
         </p>
+        <p>The re-warm used to sit at T-5s, which was not enough room: when it ran long it overran the release and polling silently started late. It now has real headroom, and if it ever does overrun, the run says so plainly instead of looking like an ordinary loss.</p>
       </details>
     </section>
 
+
+  <div id="paymentModal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-title">Tee time held &mdash; one step left</div>
+      <div class="modal-body">
+        <p id="modalSlotLine" class="modal-slot"></p>
+        <p>
+          We won the slot and we are keeping the hold alive. ForeUp only turns it into a
+          reservation once the booking fee is paid, on their own payment page &mdash;
+          <strong>your card never touches Golfbot</strong>.
+        </p>
+        <p class="modal-warn">Pay now. The hold does not last forever.</p>
+      </div>
+      <a class="btn btn-primary btn-block" id="modalPayLink" href="#" target="_blank" rel="noopener">Pay and confirm</a>
+      <button class="btn btn-secondary btn-block mt-1" id="modalDismiss">I&rsquo;ll do it from the page</button>
+    </div>
+  </div>
   </div>
 
   <script src="/static/js/app.js?v={{VERSION}}"></script>

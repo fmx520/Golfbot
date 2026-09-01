@@ -51,6 +51,8 @@ OUTCOME_WON = "won"
 OUTCOME_UNCONFIRMED = "unconfirmed"
 OUTCOME_FOUND_NOT_BOOKED = "found_not_booked"
 OUTCOME_LOST_AT_SUBMIT = "lost_at_submit"
+OUTCOME_BLOCKED_BY_FEE = "blocked_by_fee"
+OUTCOME_AWAITING_PAYMENT = "awaiting_payment"
 OUTCOME_NEVER_SAW_SLOT = "never_saw_slot"
 OUTCOME_BLOCKED = "blocked"
 OUTCOME_LATE_START = "late_start"
@@ -65,6 +67,16 @@ _REASONS = {
         "before assuming you have the tee time."
     ),
     OUTCOME_FOUND_NOT_BOOKED: "Slot found but auto-book was off — nothing was submitted.",
+    OUTCOME_AWAITING_PAYMENT: (
+        "We won the hold and handed back a payment link. The race was won; "
+        "whether it became a tee time depends on the fee being paid before "
+        "the hold expires."
+    ),
+    OUTCOME_BLOCKED_BY_FEE: (
+        "We WON the hold and could not convert it: the course requires a "
+        "booking fee at checkout and the reservation payload carries no "
+        "payment. This is not a speed problem — arriving earlier cannot fix it."
+    ),
     OUTCOME_LOST_AT_SUBMIT: (
         "We saw the slot and lost it during submit. The race is being lost "
         "between detection and confirmation, not in the poll loop."
@@ -237,6 +249,17 @@ class RaceRecorder:
     hold_refresh_failed: int = 0
     hold_refresh_first_error: str = ""
 
+    # Self-collision: how many of our own jobs were racing these exact criteria
+    # when this one armed, and which pick-order rotation it was given. Without
+    # this, losing to one of our own users is indistinguishable in the history
+    # from losing to a stranger's bot.
+    peer_ordinal: int = 0
+    peer_count: int = 1
+
+    # Fee-required course: the slot was held and a payment link issued. Not a
+    # win (no reservation exists yet) and not a loss (we beat everyone to it).
+    awaiting_payment: bool = False
+
     captcha_solves: int = 0
     captcha_refreshes: int = 0
     captcha_stale_at_submit: bool = False
@@ -289,7 +312,7 @@ class RaceRecorder:
                 "time": target_time,
                 "result": result,
                 "latency_ms": round(latency_ms, 2) if latency_ms is not None else None,
-                "error": error[:300],
+                "error": error[:600],
                 "at": _now_iso(),
             }
         )
@@ -324,7 +347,25 @@ class RaceRecorder:
     # ------------------------------------------------------------------
     # classification
     # ------------------------------------------------------------------
+    # ForeUp's wording when a course requires a booking fee we do not pay. The
+    # hold succeeds and only the conversion is refused, so without this the run
+    # lands in lost_at_submit and reads as a race we were too slow for — which
+    # sends every future investigation after latency instead of payment.
+    FEE_MARKERS = ("booking fee is required", "booking fee required")
+
+    def blocked_by_fee(self) -> bool:
+        """Did every failed attempt fail because the course wants a fee?"""
+        failed = [a for a in self.attempts if a.get("result") == "failed"]
+        if not failed:
+            return False
+        return all(
+            any(m in str(a.get("error", "")).lower() for m in self.FEE_MARKERS)
+            for a in failed
+        )
+
     def classify(self) -> str:
+        if self.awaiting_payment:
+            return OUTCOME_AWAITING_PAYMENT
         if self.booked:
             return OUTCOME_WON if self.booking_confirmed else OUTCOME_UNCONFIRMED
         if self.error:
@@ -339,6 +380,8 @@ class RaceRecorder:
             return OUTCOME_LATE_START
         if self.polls.antibot > 0:
             return OUTCOME_BLOCKED
+        if self.blocked_by_fee():
+            return OUTCOME_BLOCKED_BY_FEE
         if self.attempts:
             return OUTCOME_LOST_AT_SUBMIT
         if self.first_slot_seen_offset_ms is not None and not self.auto_book:
@@ -416,6 +459,10 @@ class RaceRecorder:
                 "hold_refresh_ok": self.hold_refresh_ok,
                 "hold_refresh_failed": self.hold_refresh_failed,
                 "hold_refresh_first_error": self.hold_refresh_first_error,
+            },
+            "peers": {
+                "ordinal": self.peer_ordinal,
+                "count": self.peer_count,
             },
             "captcha": {
                 "solves": self.captcha_solves,

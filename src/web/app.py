@@ -40,6 +40,7 @@ from src.booking.foreup_client import ForeUpBookingClient, classify_reservation_
 from src.config import load_config
 from src.courses import COURSE_CATALOG, cached_preflight, run_preflight
 from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
+from src.discovery import checkout_scan
 from src.discovery.grid import analyze_teesheet_grid
 from src.telemetry import grid_store
 from src.telemetry.race_log import RaceRecorder
@@ -144,6 +145,116 @@ class JobState:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     events: list[dict[str, Any]] = field(default_factory=list)
+    # Which race this job entered, and its slot in the queue of our own users
+    # who entered the same one. Derived from JOBS rather than a second registry
+    # so a finished job stops being a peer the moment its status changes.
+    racing_key: tuple | None = None
+    peer_ordinal: int = 0
+
+
+# A job stops competing once it reaches one of these.
+FINISHED_STATUSES = {"succeeded", "failed", "cancelled", "awaiting_payment"}
+
+
+def _racing_key(payload: dict[str, Any]) -> tuple:
+    """Identity of the race a job is entering.
+
+    Strict equality on every field that changes what ForeUp returns. Two jobs
+    coordinate only when they are asking the identical question — a resident
+    and a non-resident booking class are looking at different inventory, so
+    steering one off a slot could push it toward a time that does not exist in
+    its class. Anything that does not match exactly simply does not coordinate,
+    which is the current behavior.
+    """
+    courses = tuple(sorted(str(c) for c in (payload.get("course_ids") or []) if c))
+    return (
+        courses or (str(payload.get("schedule_id") or ""),),
+        str(payload.get("play_date") or ""),
+        str(payload.get("booking_class") or ""),
+        int(payload.get("players") or 0),
+        int(payload.get("holes") or 0),
+    )
+
+
+def _claim_peer_ordinal(job_id: str, key: tuple) -> tuple[int, int]:
+    """Assign this job its place among our own jobs racing the same slots.
+
+    Caller must hold JOB_LOCK. Returns (ordinal, peer_count). Ordinal is the
+    lowest free position, not the peer count -- when an earlier job finishes,
+    reusing its number keeps the set contiguous, where counting live peers
+    would hand out a duplicate and put two of our users back on one slot.
+    """
+    peers = [
+        j for j in JOBS.values()
+        if j.job_id != job_id and j.racing_key == key and j.status not in FINISHED_STATUSES
+    ]
+    taken = {j.peer_ordinal for j in peers}
+    ordinal = next(i for i in range(len(peers) + 1) if i not in taken)
+    return ordinal, len(peers) + 1
+
+
+def _hhmm_to_min(value: str) -> int | None:
+    """'07:06' -> 426. Tolerates a leading date and returns None on junk."""
+    text = (value or "").strip()
+    if " " in text:
+        text = text.split(" ", 1)[1]
+    parts = text.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]) * 60 + int(parts[1])
+    except ValueError:
+        return None
+
+
+def _sample_covers(first: str, last: str, start: str, end: str) -> bool:
+    """Did an observed sample actually span the hours we intend to fire into?
+
+    A tee sheet is not guaranteed to run one interval all day. Bethpage Red
+    runs 9 minutes at twilight and 10 in the morning, so a reference day whose
+    only open times were 17:00-18:21 yields a perfectly self-consistent
+    9-minute grid that is simply wrong about 7am. Extrapolating across that
+    boundary is how we came to fire at 07:06 and 07:15 into a 10-minute sheet,
+    where those times do not exist at all and ForeUp answers 400.
+    """
+    lo, hi = _hhmm_to_min(first), _hhmm_to_min(last)
+    ws, we = _hhmm_to_min(start), _hhmm_to_min(end)
+    if None in (lo, hi, ws, we):
+        return False
+    return lo <= we and ws <= hi
+
+
+def _template_near(slots: list[dict[str, Any]], when: str) -> dict[str, Any]:
+    """Payload template from the observed slot closest in time to `when`.
+
+    green_fee and the side/class ids ride on the individual slot and are not
+    constant across a day -- a twilight slot carries a twilight price. Taking
+    the sheet's first slot meant a morning hold could go out describing itself
+    as a 5pm twilight round, which is its own way to be rejected.
+    """
+    target = _hhmm_to_min(when)
+    best, best_gap = {}, None
+    for slot in slots:
+        minutes = _hhmm_to_min(slot.get("time", ""))
+        if minutes is None:
+            continue
+        gap = abs(minutes - target) if target is not None else 0
+        if best_gap is None or gap < best_gap:
+            best, best_gap = (slot.get("raw") or {}), gap
+    return best
+
+
+def _rotate(items: list[Any], ordinal: int) -> list[Any]:
+    """Rotate a preference list so concurrent jobs open on different slots.
+
+    Nothing is removed -- every job still tries the whole list and still falls
+    through to what is left. Only the opening pick moves, which is the one that
+    decides who dogpiles whom.
+    """
+    if ordinal <= 0 or len(items) < 2:
+        return items
+    shift = ordinal % len(items)
+    return items[shift:] + items[:shift]
 
 
 JOBS: dict[str, JobState] = {}
@@ -230,7 +341,12 @@ def _select_slot(slots: list[dict[str, Any]], payload: dict[str, Any]) -> dict[s
         candidates.sort(key=lambda s: (s.get("_course_priority", 999), _slot_time_str(s)))
     else:  # earliest
         candidates.sort(key=lambda s: _slot_time_str(s))
-    return candidates[0]
+
+    # Every ranking is deterministic, so our own concurrent users sort the
+    # identical list and pick the identical slot -- six jobs get one chance
+    # tried six times, with five guaranteed "Time not available". Rotating by
+    # the arm-time ordinal spreads the opening pick across the window.
+    return _rotate(candidates, int(payload.get("peer_ordinal") or 0))[0]
 
 
 def _extract_foreup_target(booking_url: str | None, fallback_base_url: str, fallback_schedule_id: str, fallback_course_id: str) -> tuple[str, str, str]:
@@ -784,10 +900,66 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         play_date=play_date,
         release_at=release_dt.isoformat(),
         auto_book=bool(auto_book and not payload.get("dry_run", True)),
+        peer_ordinal=int(payload.get("peer_ordinal") or 0),
+        peer_count=int(payload.get("peer_count") or 1),
     )
+
+    # Best teesheet sample this race saw. A freshly released sheet is the most
+    # complete view of a course's grid we ever get -- far better than a
+    # reference day that is half booked -- so it is worth banking. Collected in
+    # memory during the race (a length compare, nothing more) and written only
+    # once the race is decided, never on the hot path.
+    grid_sample: dict[str, Any] = {"times": [], "template": {}, "course": ""}
+
+    # ForeUp hands every client the booking-fee flags on the slot itself. Until
+    # recently its backend did not act on them, so a reservation posted with no
+    # payment went through; it now refuses the conversion, which costs the whole
+    # race and reads as a narrow loss. The flag is knowable before the release,
+    # so say so then rather than at T+9s.
+    fee_warned: list[bool] = [False]
+
+    def _warn_if_fee_required(raw: dict[str, Any]) -> None:
+        if fee_warned[0] or not isinstance(raw, dict):
+            return
+        if not raw.get("booking_fee_required"):
+            return
+        fee_warned[0] = True
+        price = raw.get("booking_fee_price")
+        per = " per player" if raw.get("booking_fee_per_person") else ""
+        cost = f"${price}{per}" if price else "a booking fee"
+        _emit_event(queue, phase="sniper", stage="booking_fee_required",
+                    message=f"Heads up: this course charges {cost} at checkout. We can win the "
+                            f"hold, but the reservation we send carries no payment, so ForeUp "
+                            f"will refuse to convert it — the race is winnable and the booking "
+                            f"is not. Nothing here is a speed problem.")
+
+    def _learn_grid_from_race() -> None:
+        """Bank what this race saw about the course's grid. Never raises."""
+        try:
+            if len(grid_sample["times"]) < 3:
+                return
+            observed = analyze_teesheet_grid(grid_sample["times"])
+            if not (observed.interval_minutes and observed.consistent):
+                return
+            play_dow = datetime.strptime(play_date, "%Y-%m-%d").date().weekday()
+            if grid_store.upsert_grid(course_id=str(grid_sample["course"]),
+                                      day_of_week=play_dow, grid=observed.as_dict(),
+                                      template=grid_sample["template"],
+                                      source_date=play_date):
+                _emit_event(queue, phase="sniper", stage="grid_learned",
+                            message=f"Learned this course's {observed.interval_minutes}-minute grid "
+                                    f"from the released sheet ({observed.observed_count} times seen). "
+                                    f"Future Sight can derive targets here from now on, even if the "
+                                    f"reference day is booked solid.")
+        except Exception:  # noqa: BLE001 — the registry must never affect a race
+            pass
 
     def _flush_race() -> None:
         """Emit the race record and surface the one-line verdict in the UI."""
+        # Every terminal path funnels through here, so this is the one place
+        # that guarantees a race's grid observation is banked exactly once. It
+        # no-ops on the arming-failure paths, where nothing was polled yet.
+        _learn_grid_from_race()
         try:
             record = race.flush()
             _emit_event(queue, phase="confirm", stage="race_summary",
@@ -927,6 +1099,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
 
             ref_slots: list[dict[str, Any]] = []
             ref_date = ""
+            template: dict[str, Any] = {}
             for cand in ref_candidates:
                 try:
                     found = discovery.lookup_availability(
@@ -941,88 +1114,134 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     ref_slots, ref_date = found, cand
                     break
 
-            template = (ref_slots[0].get("raw") or {}) if ref_slots else {}
+            template_seed = (ref_slots[0].get("raw") or {}) if ref_slots else {}
             ref_grid = analyze_teesheet_grid(sl.get("time", "") for sl in ref_slots)
             play_dow = play_dt.weekday()
+            win_start, win_end = payload["time_start"], payload["time_end"]
 
+            # Bank a good live read whether or not we end up aiming with it.
             if ref_grid.interval_minutes and ref_grid.consistent:
-                # Live read worked — validate, and bank what we learned so the
-                # next arm can survive a booked-out reference day.
                 grid_store.upsert_grid(course_id=str(ps_course), day_of_week=play_dow,
-                                       grid=ref_grid.as_dict(), template=template,
+                                       grid=ref_grid.as_dict(), template=template_seed,
                                        source_date=ref_date)
+
+            stored = grid_store.fetch_grid(course_id=str(ps_course), day_of_week=play_dow)
+
+            # ---- Pick which grid to aim with. ----
+            # The live read used to win unconditionally, so an 8-slot twilight
+            # sample beat a 40-observation grid learned from the real released
+            # sheet. Choose on evidence instead: a sample that covers the hours
+            # we are firing into beats one that does not, and more observations
+            # break the tie.
+            cands: list[dict[str, Any]] = []
+            if ref_grid.interval_minutes and ref_grid.consistent:
+                cands.append({
+                    "interval": int(ref_grid.interval_minutes),
+                    "phase": (_hhmm_to_min(ref_grid.first_time) or 0) % int(ref_grid.interval_minutes),
+                    "first": ref_grid.first_time, "last": ref_grid.last_time,
+                    "seen": ref_grid.observed_count, "template": template_seed,
+                    "label": f"the {ref_grid.interval_minutes}-minute grid read live from {ref_date}",
+                })
+            if stored and stored.get("interval_minutes") and stored.get("anchor_phase") is not None:
+                cands.append({
+                    "interval": int(stored["interval_minutes"]),
+                    "phase": int(stored["anchor_phase"]),
+                    "first": stored.get("first_time", ""), "last": stored.get("last_time", ""),
+                    "seen": int(stored.get("observed_count") or 0),
+                    "template": stored.get("template") or {},
+                    "label": f"the remembered {stored['interval_minutes']}-minute grid "
+                             f"({grid_store.parse_hhmm_row(stored)})",
+                })
+
+            for c in cands:
+                c["covers"] = _sample_covers(c["first"], c["last"], win_start, win_end)
+            cands.sort(key=lambda c: (c["covers"], c["seen"]), reverse=True)
+            chosen = cands[0] if cands else None
+
+            # A grid seen across a wide span and many times is describing the
+            # sheet, not one corner of it, so extrapolating past the observed
+            # window is reasonable. A thin sample is not. Span is what matters:
+            # 36 times over eight hours generalises; 8 over eighty minutes does
+            # not, however self-consistent it looks.
+            for c in cands:
+                span = (_hhmm_to_min(c["last"]) or 0) - (_hhmm_to_min(c["first"]) or 0)
+                c["trustworthy"] = c["covers"] or (c["seen"] >= 20 and span >= 240)
+            cands.sort(key=lambda c: (c["covers"], c["trustworthy"], c["seen"]), reverse=True)
+            chosen = cands[0] if cands else None
+
+            if chosen and not chosen["trustworthy"]:
+                # Every sample we have is from a different part of the day. The
+                # interval may well be the same, but tonight proved it need not
+                # be, and a wrong grid does not lose gracefully: all six holds
+                # come back 400 and the burst delays the polling that would
+                # have worked.
+                _emit_event(queue, phase="sniper", stage="prestage_grid",
+                            message=f"Future Sight: the only tee times we could see run "
+                                    f"{chosen['first']}–{chosen['last']} ({chosen['seen']} times), which "
+                                    f"neither covers your {win_start}–{win_end} window nor spans enough "
+                                    f"of the day to extrapolate from safely. Aiming there would be a "
+                                    f"guess, and an off-grid target is rejected outright rather than "
+                                    f"narrowly lost. Running as Sniper (polling) instead — once a "
+                                    f"release in this window is polled, the real grid is banked.")
+                chosen = None
+                fs_enabled = False
+                raw_targets = []
+
+            if chosen:
+                template = chosen["template"]
                 if fs_enabled and not raw_targets:
-                    hh, mm = ref_grid.first_time.split(":")[:2]
-                    phase = (int(hh) * 60 + int(mm)) % ref_grid.interval_minutes
-                    raw_targets = _gen_targets(ref_grid.interval_minutes, phase)
+                    raw_targets = _gen_targets(chosen["interval"], chosen["phase"])
                     if not raw_targets:
                         _emit_event(queue, phase="sniper", stage="prestage_window",
-                                    message=f"Future Sight: no tee times on the {ref_grid.interval_minutes}-minute "
-                                            f"grid fall inside your {payload['time_start']}–{payload['time_end']} "
-                                            f"window — widen it. Falling back to pure polling.")
-                off = [t for t in raw_targets if not ref_grid.matches_interval(t)]
+                                    message=f"Future Sight: no tee times on {chosen['label']} fall inside "
+                                            f"your {win_start}–{win_end} window — widen it. Falling back "
+                                            f"to pure polling.")
+                off = [t for t in raw_targets
+                       if (_hhmm_to_min(t) or 0) % chosen["interval"] != chosen["phase"] % chosen["interval"]]
                 if off:
-                    near = ", ".join(ref_grid.grid_times[:4])
                     _emit_event(queue, phase="confirm", stage="terminal",
-                                message=f"Future Sight: {', '.join(off)} not on this course's "
-                                        f"{ref_grid.interval_minutes}-minute grid (e.g. {near}...). "
+                                message=f"Future Sight: {', '.join(off)} are not on {chosen['label']}. "
                                         f"These times do not exist on the sheet — fix the targets and re-arm.",
                                 terminal="failed")
                     _flush_race()
                     queue.put({"type": "status", "status": "failed"})
                     _finalize_worker()
                     return
+                _warn_if_fee_required(chosen["template"])
                 if raw_targets:
-                    same_dow = ref_date and datetime.strptime(ref_date, "%Y-%m-%d").date().weekday() == play_dow
+                    # Price and side ids vary across the day; take them from the
+                    # observed slot nearest what we are actually going to fire at.
+                    if ref_slots:
+                        near = _template_near(ref_slots, raw_targets[0])
+                        if near:
+                            template = near
                     _emit_event(queue, phase="sniper", stage="prestage_armed",
                                 message=f"Future Sight armed: {', '.join(raw_targets)} on course {ps_course} — "
-                                        f"validated against the {ref_grid.interval_minutes}-minute grid from "
-                                        f"{ref_date}{' (same weekday as the target)' if same_dow else ''}. "
+                                        f"validated against {chosen['label']}, which covers "
+                                        f"{chosen['first']}–{chosen['last']} ({chosen['seen']} times seen). "
                                         f"Holds fire at the release instant, before polling.")
-            else:
-                # No usable live read — fall back to the registry.
-                stored = grid_store.fetch_grid(course_id=str(ps_course), day_of_week=play_dow)
-                if stored and stored.get("interval_minutes"):
-                    if fs_enabled and not raw_targets and stored.get("anchor_phase") is not None:
-                        raw_targets = _gen_targets(int(stored["interval_minutes"]), int(stored["anchor_phase"]))
-                        if not raw_targets:
-                            _emit_event(queue, phase="sniper", stage="prestage_window",
-                                        message=f"Future Sight: no tee times on the stored grid fall inside "
-                                                f"your {payload['time_start']}–{payload['time_end']} window — "
-                                                f"widen it. Falling back to pure polling.")
-                    off = [t for t in raw_targets if grid_store.matches_stored_grid(t, stored) is False]
-                    if off:
-                        _emit_event(queue, phase="confirm", stage="terminal",
-                                    message=f"Future Sight: {', '.join(off)} not on the stored grid for this "
-                                            f"course/day ({grid_store.parse_hhmm_row(stored)}). Fix the targets "
-                                            f"and re-arm.",
-                                    terminal="failed")
-                        _flush_race()
-                        queue.put({"type": "status", "status": "failed"})
-                        _finalize_worker()
-                        return
-                    if not template:
-                        template = stored.get("template") or {}
-                    if raw_targets:
-                        _emit_event(queue, phase="sniper", stage="prestage_armed",
-                                    message=f"Future Sight armed: {', '.join(raw_targets)} — from the stored "
-                                            f"registry ({grid_store.parse_hhmm_row(stored)}). No live reference "
-                                            f"sheet was readable, so remembered data was used.")
-                else:
-                    if fs_enabled and not raw_targets:
-                        _emit_event(queue, phase="sniper", stage="prestage_grid",
-                                    message=f"Future Sight: no live reference sheet and nothing stored for "
-                                            f"this course/day yet, so targets cannot be derived. Falling "
-                                            f"back to pure polling — run once more after any teesheet read "
-                                            f"and the registry will know this course.")
-                    else:
-                        _emit_event(queue, phase="sniper", stage="prestage_grid",
-                                    message=f"Future Sight: no live reference sheet "
-                                            f"({'; '.join(ref_grid.notes) or 'no data'}) and nothing stored for "
-                                            f"this course/day yet. Proceeding with unvalidated targets — "
-                                            f"polling remains the fallback.")
+            elif fs_enabled and not raw_targets:
+                _emit_event(queue, phase="sniper", stage="prestage_grid",
+                            message=f"Future Sight: no live reference sheet and nothing stored for "
+                                    f"this course/day yet, so targets cannot be derived. Falling "
+                                    f"back to pure polling. To teach it this course, press "
+                                    f"\u201cShow this course\u2019s tee grid\u201d for a date whose sheet is "
+                                    f"already published and has plenty of open times — the booking "
+                                    f"API only returns OPEN slots, so a nearly full day hides the "
+                                    f"real interval. Any release this bot polls also gets banked "
+                                    f"automatically.")
 
             if raw_targets:
+                ordinal = int(payload.get("peer_ordinal") or 0)
+                rotated = _rotate(raw_targets, ordinal)
+                if rotated != raw_targets:
+                    _emit_event(queue, phase="sniper", stage="prestage_rotated",
+                                message=f"Rotated to {', '.join(rotated)} — {payload.get('peer_count', 1)} "
+                                        f"of our own jobs are pre-staging these exact criteria, and "
+                                        f"targets are generated earliest-first, so unrotated we would all "
+                                        f"fire at the same time in the same order. Same targets, "
+                                        f"different opening shot.")
+                raw_targets = rotated
                 prestage_plan = {"times": raw_targets, "course": ps_course,
                                  "booking_class": ps_class, "template": template}
 
@@ -1336,7 +1555,13 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     schedule_id=str(prestage_plan["course"]),
                     course_id=str(resolved_schedule_id),
                     players=payload["players"], holes=holes,
-                    booking_class_id=str(tmpl.get("booking_class_id", prestage_plan["booking_class"] or "")),
+                    # The resolved class wins over the template's. The template
+                    # comes from a reference DAY, and a course can run different
+                    # booking classes on different days -- 2432 has been seen as
+                    # both 2139 and 50295 -- so taking the template's value fires
+                    # the hold under a class that may not apply to the play date,
+                    # which ForeUp rejects outright.
+                    booking_class_id=str(prestage_plan["booking_class"] or tmpl.get("booking_class_id", "")),
                     teesheet_side_id=str(tmpl.get("teesheet_side_id", "")),
                     green_fee=tmpl.get("green_fee", 0),
                     request_id=f"{request_id}-ps{burst_pass}",
@@ -1344,7 +1569,10 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 )
                 hold_ms = hold.get("latency_ms")
                 if not hold.get("accepted"):
-                    err = str(hold.get("error") or hold.get("response") or "")[:160]
+                    # httpx's message is ~200 chars before the response body even
+                    # starts, so the old 160-char cut removed the only part that
+                    # says WHY. attempts[] kept 300 and was readable; this was not.
+                    err = str(hold.get("error") or hold.get("response") or "")[:600]
                     race.record_prestage(ps_time, "rejected", hold_ms, error=err)
                     if burst_pass == 1:
                         _emit_event(queue, phase="sniper", stage="prestage_miss",
@@ -1455,6 +1683,12 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 # downstream book_slot uses the right course IDs.
                 for s in slots:
                     s["_source_teesheet_id"] = current_teesheet
+                if slots:
+                    _warn_if_fee_required(slots[0].get("raw") or {})
+                if len(slots) > len(grid_sample["times"]):
+                    grid_sample["times"] = [s.get("time", "") for s in slots]
+                    grid_sample["template"] = slots[0].get("raw") or {}
+                    grid_sample["course"] = current_teesheet
             except AntiBotDetectedError as exc:
                 # AntiBotDetectedError subclasses ForeUpError, so this used to be
                 # swallowed by the generic handler below and recorded as "0 slots"
@@ -1521,6 +1755,55 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     )
                     submit_ms = round((time.perf_counter() - submit_started) * 1000, 2)
                     race.submit_to_confirm_ms = submit_ms
+
+                    # Fee-required course: we hold the slot and ForeUp will only
+                    # turn it into a reservation once the fee is paid, on a
+                    # hosted page we cannot drive. The race is won; the booking
+                    # needs a human. Keep refreshing the hold so it survives
+                    # however long that takes.
+                    if booking_response.get("awaiting_payment"):
+                        ttid = str(booking_response.get("pending_reservation_id", ""))
+                        total = booking_response.get("booking_fee_total", 0)
+                        race.record_attempt(
+                            candidate.get("time", "?"), "awaiting_payment",
+                            latency_ms=submit_ms, response=booking_response,
+                        )
+                        race.awaiting_payment = True
+                        _emit_event(
+                            queue, phase="checkout", stage="awaiting_payment",
+                            message=(
+                                f"SLOT HELD at {candidate.get('time','?')} — one step left. "
+                                f"This course charges a ${total} booking fee, and ForeUp only "
+                                f"creates the reservation once it is paid. Open the link below "
+                                f"and pay now; the tee time stays held for you until you do. "
+                                f"Nothing is booked until that payment goes through."
+                            ),
+                            terminal="awaiting_payment",
+                            payment_url=booking_response.get("payment_url", ""),
+                            booking_fee_total=total,
+                            reservation_id=ttid,
+                            slot=candidate,
+                        )
+                        queue.put({"type": "status", "status": "awaiting_payment"})
+
+                        # The browser refreshes its hold every ~10s; do the same
+                        # so a slow payment does not lose the slot we just won.
+                        stop_hold = Event()
+
+                        def _keep_hold_alive() -> None:
+                            while not stop_hold.wait(8.0):
+                                err = booking.refresh_pending_reservation(
+                                    pending_reservation_id=ttid, request_id=request_id
+                                )
+                                if err:
+                                    race.hold_refresh_failed += 1
+                                else:
+                                    race.hold_refresh_ok += 1
+
+                        Thread(target=_keep_hold_alive, daemon=True).start()
+                        booked = True
+                        selected = candidate
+                        break
 
                     # A 200 from ForeUp is not proof of a booking — it answers a
                     # rejected reservation the same way. Check the body before
@@ -1627,6 +1910,15 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                         terminal="cancelled", tried_slots=tried_labels)
             _flush_race()
             queue.put({"type": "status", "status": "cancelled"})
+            _finalize_worker()
+            return
+
+        # Held-and-awaiting-payment is not a booking, and must not be reported
+        # as one. The link was already emitted; this just closes the run out
+        # honestly so the history does not count it as a win.
+        if booked and race.awaiting_payment:
+            _flush_race()
+            queue.put({"type": "status", "status": "awaiting_payment"})
             _finalize_worker()
             return
 
@@ -1829,7 +2121,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "0.79"
+APP_VERSION = "0.99"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -1927,14 +2219,19 @@ def connect(req: ConnectRequest) -> dict[str, Any]:
 def start_job(req: StartJobRequest) -> dict[str, str]:
     job_id = uuid.uuid4().hex[:12]
     state = JobState(job_id=job_id)
+    full_payload = req.model_dump()
+
+    key = _racing_key(full_payload)
     with JOB_LOCK:
         JOBS[job_id] = state
+        state.racing_key = key
+        state.peer_ordinal, peer_count = _claim_peer_ordinal(job_id, key)
+    full_payload["peer_ordinal"] = state.peer_ordinal
+    full_payload["peer_count"] = peer_count
 
     payload = req.model_dump()
     payload.pop("password", None)
     safe_payload = {k: v for k, v in payload.items() if k != "password"}
-
-    full_payload = req.model_dump()
     queue: Queue = Queue()
     cmd_queue: Queue = Queue()
     CMD_QUEUES[job_id] = cmd_queue
@@ -1948,6 +2245,14 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
 
     with JOB_LOCK:
         _event(JOBS[job_id], "job", "Job started", request=safe_payload)
+        if peer_count > 1:
+            _event(
+                JOBS[job_id], "job",
+                f"{peer_count} of our own jobs are racing these exact criteria. You are "
+                f"#{state.peer_ordinal + 1} — your pick order is rotated so we open on "
+                f"different slots instead of all fighting for the same one. Every time in "
+                f"your window is still tried.",
+            )
 
     return {"job_id": job_id}
 
@@ -2041,8 +2346,31 @@ def teesheet_grid(req: GridRequest) -> dict[str, Any]:
     except ForeUpError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
+    # Teach the registry from every course that produced a trustworthy grid --
+    # not just the best one, and not only when Future Sight happens to be
+    # arming. This button is the bootstrap: until it ran, upsert_grid was only
+    # reachable from the Future Sight path that had ALREADY read a live sheet,
+    # so the registry could only be written when it was not needed and was
+    # guaranteed empty on the day it was.
+    learned: list[str] = []
+    try:
+        play_dow = datetime.strptime(req.play_date, "%Y-%m-%d").date().weekday()
+    except ValueError:
+        play_dow = None
+    if play_dow is not None:
+        for entry in per_course:
+            eg = entry["grid"]
+            if not (eg.interval_minutes and eg.consistent):
+                continue
+            tmpl = (entry["slots"][0].get("raw") or {}) if entry["slots"] else {}
+            if grid_store.upsert_grid(course_id=str(entry["course_id"]), day_of_week=play_dow,
+                                      grid=eg.as_dict(), template=tmpl,
+                                      source_date=req.play_date):
+                learned.append(str(entry["course_id"]))
+
     grid = best["grid"]
     result = grid.as_dict()
+    result["learned_courses"] = learned
     result["play_date"] = req.play_date
     result["schedule_id"] = schedule_id
     result["course_id"] = course_id
@@ -2071,6 +2399,18 @@ class ColdHoldProbeRequest(GridRequest):
     """A cold-hold probe. target_time must be a real time on the course grid."""
     target_time: str
     skip_grid_check: bool = False
+    # Chain a validate_only reservation onto a successful hold. Answers whether
+    # the booking-fee check runs at validation or at commit — which decides
+    # whether matching the browser's request order could ever be enough.
+    validate_after_hold: bool = False
+    # Second leg of the validate probe. ForeUp emails a code tied to a specific
+    # pending reservation, so completing the check means reusing that same hold
+    # rather than taking a fresh one.
+    existing_hold_id: str = ""
+    booking_code: str = ""
+    # Ask ForeUp for the hosted payment page after validation. Creates a
+    # payment session; charges nothing on its own.
+    want_payment_url: bool = False
 
 
 @app.post("/api/probe/cold-hold")
@@ -2156,7 +2496,11 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
                         f"({'; '.join(grid.notes)}). Pass skip_grid_check to override."
                     ),
                 )
-            if not grid.is_valid_target(req.target_time):
+            # matches_interval, not is_valid_target: the latter only accepts
+            # times between the first and last OPEN slot, and that window moves
+            # as times get booked. A target offered by the dropdown a minute
+            # ago would then be refused for being outside a span that shrank.
+            if not grid.matches_interval(req.target_time):
                 nearby = [t for t in grid.grid_times if t >= req.target_time][:3]
                 raise HTTPException(
                     status_code=400,
@@ -2171,16 +2515,88 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
         # Carry the shared per-course fields; deliberately NOT the target slot's
         # own polled data, since at a release that would not exist yet.
         template = (slots[0].get("raw") or {}) if slots else {}
-        result = booking.probe_cold_hold(
-            target_time=f"{req.play_date} {req.target_time}",
-            schedule_id=str(course_id or schedule_id),
-            course_id=str(schedule_id),
-            players=req.players,
-            holes=req.holes,
-            booking_class_id=str(template.get("booking_class_id", booking_class or "")),
-            teesheet_side_id=str(template.get("teesheet_side_id", "")),
-            green_fee=template.get("green_fee", 0),
-        )
+        if req.existing_hold_id:
+            # Second leg: the code belongs to the hold we already have, and
+            # taking another would strand one and invalidate the code.
+            steps.append(f"reusing hold {req.existing_hold_id} — no new hold taken")
+            result = {"accepted": True, "reservation_id": req.existing_hold_id,
+                      "latency_ms": 0, "reused_hold": True,
+                      "verdict": "Reused the hold from the first leg."}
+        else:
+            result = booking.probe_cold_hold(
+                target_time=f"{req.play_date} {req.target_time}",
+                schedule_id=str(course_id or schedule_id),
+                course_id=str(schedule_id),
+                players=req.players,
+                holes=req.holes,
+                booking_class_id=str(template.get("booking_class_id", booking_class or "")),
+                teesheet_side_id=str(template.get("teesheet_side_id", "")),
+                green_fee=template.get("green_fee", 0),
+            )
+
+        # Optional second step: ask ForeUp whether it WOULD take this booking.
+        # Only meaningful once a hold exists, since the reservation references it.
+        if req.validate_after_hold:
+            hold_id = req.existing_hold_id or str(result.get("reservation_id") or "")
+            if not hold_id:
+                result["validate"] = {
+                    "skipped": True,
+                    "verdict": "No hold, so there was nothing to validate against.",
+                }
+            else:
+                steps.append(
+                    f"validating against hold {hold_id}"
+                    + (" with the emailed code" if req.booking_code else "")
+                )
+                v = booking.probe_validate_only(
+                    pending_reservation_id=hold_id,
+                    target_time=f"{req.play_date} {req.target_time}",
+                    template=template,
+                    schedule_id=str(course_id or schedule_id),
+                    course_id=str(schedule_id),
+                    players=req.players,
+                    holes=req.holes,
+                    confirmation_code=req.booking_code or None,
+                )
+                # ForeUp issues the code against one specific hold, so the
+                # second leg has to come back to this same one. Hand the id
+                # back rather than making the caller dig it out.
+                v["hold_id"] = hold_id
+                if v.get("needs_code") and not req.booking_code:
+                    customer_id = (
+                        discovery.get_customer_id()
+                        if hasattr(discovery, "get_customer_id") else None
+                    )
+                    if customer_id:
+                        try:
+                            booking.request_booking_code(
+                                course_id=str(schedule_id),
+                                customer_id=str(customer_id),
+                                pending_reservation_id=hold_id,
+                            )
+                            v["code_requested"] = True
+                            steps.append("booking code requested — check your email")
+                        except ForeUpError as exc:
+                            v["code_request_error"] = str(exc)[:400]
+                    else:
+                        v["code_request_error"] = "No customer id — cannot request a code."
+                # Once validation passes we have everything the payment window
+                # needs -- the same hold and the same code -- so ask for it.
+                # This is the step our booking path has never taken.
+                if req.want_payment_url and v.get("ok"):
+                    steps.append("validation passed — requesting the hosted payment page")
+                    result["payment"] = booking.request_booking_fee_payment(
+                        facility_id=str(schedule_id),
+                        teesheet_id=str(course_id or schedule_id),
+                        pending_reservation_id=hold_id,
+                        confirmation_code=req.booking_code,
+                        target_time=f"{req.play_date} {req.target_time}",
+                        players=req.players,
+                        holes=req.holes,
+                        booking_class_id=str(template.get("booking_class_id", booking_class or "")),
+                        teesheet_side_id=str(template.get("teesheet_side_id", "")),
+                    )
+                result["validate"] = v
     except HTTPException:
         raise
     except AntiBotDetectedError as exc:
@@ -2192,6 +2608,70 @@ def probe_cold_hold(req: ColdHoldProbeRequest) -> dict[str, Any]:
     result["target_time"] = req.target_time
     result["play_date"] = req.play_date
     result["grid"] = grid.as_dict()
+    # True only if ForeUp ignored validate_only, which is the one way this path
+    # can book. The UI says so explicitly rather than leaving it implied.
+    result["booked_anything"] = False
+    return result
+
+
+@app.post("/api/probe/checkout-fields")
+def probe_checkout_fields(req: GridRequest) -> dict[str, Any]:
+    """Read ForeUp's own checkout script to find the fields we do not send.
+
+    The free attempt at the booking-fee question. Fetches the booking page and
+    its scripts and looks for the code that builds the reservation payload —
+    our payload contains strings distinctive enough to find it — then reports
+    every field name near it that we do not currently send.
+
+    Read-only. No hold, no reservation, nothing booked.
+    """
+    default_base_url = os.getenv("FOREUP_BASE_URL", "https://foreupsoftware.com")
+    base_url, schedule_id, course_id = _extract_foreup_target(
+        req.foreup_booking_url,
+        fallback_base_url=default_base_url,
+        fallback_schedule_id=req.schedule_id or os.getenv("FOREUP_SCHEDULE_ID", ""),
+        fallback_course_id=req.course_id or os.getenv("FOREUP_COURSE_ID", ""),
+    )
+    if not schedule_id:
+        raise HTTPException(status_code=400, detail="No schedule_id — pick a course first.")
+
+    discovery = ForeUpDiscoveryClient(base_url=base_url)
+    username = req.username or os.getenv("FOREUP_USERNAME", "")
+    password = req.password or os.getenv("FOREUP_PASSWORD", "")
+
+    # The checkout script may only be served to a signed-in session, and logging
+    # in costs nothing here — this endpoint is not on any race path.
+    if username and password:
+        try:
+            discovery.bootstrap_session(
+                username=username, password=password,
+                schedule_id=schedule_id, course_id=course_id,
+            )
+        except ForeUpError:
+            pass
+
+    page_url = f"{base_url}/index.php/booking/{schedule_id}"
+
+    def _fetch(url: str) -> str | None:
+        try:
+            resp = discovery.client.get(url, timeout=20.0)
+            return resp.text if resp.status_code < 400 else None
+        except Exception:  # noqa: BLE001 — a missing script is not an error
+            return None
+
+    html = _fetch(page_url)
+    if not html:
+        raise HTTPException(status_code=502, detail=f"Could not read {page_url}.")
+
+    booking = ForeUpBookingClient(base_url=base_url)
+    known = booking.reservation_payload_keys()
+
+    result = checkout_scan.scan_checkout(
+        html=html, base_url=base_url, page_url=page_url,
+        fetch=_fetch, known_keys=known,
+    )
+    result["page_url"] = page_url
+    result["fields_we_send"] = len(known)
     result["booked_anything"] = False
     return result
 
