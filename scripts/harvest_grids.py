@@ -93,12 +93,15 @@ def main() -> int:
 
     results: list[TargetResult] = []
     login_failures: list[tuple[str, str]] = []
+    notes: list[tuple[str, str]] = []
 
     for course in courses:
-        client, targets, err = discover_targets(course, username=args.username, password=args.password)
+        client, targets, err, note = discover_targets(course, username=args.username, password=args.password)
         if err:
             login_failures.append((course.name, err))
             continue
+        if note:
+            notes.append((course.name, note))
         for target in targets:
             results.append(harvest_target(
                 client, target, weekdays=weekdays, players=args.players, holes=args.holes, dry_run=dry_run,
@@ -109,6 +112,7 @@ def main() -> int:
             "checked_at": today.isoformat(),
             "dry_run": dry_run,
             "login_failures": [{"course": n, "error": e} for n, e in login_failures],
+            "notes": [{"course": n, "note": note} for n, note in notes],
             "targets": [r.as_dict() for r in results],
         }, indent=2))
     else:
@@ -116,6 +120,8 @@ def main() -> int:
               f"{'(dry run)' if dry_run else ''}\n")
         for name, err in login_failures:
             print(f"  [SKIP] {name}: {err}")
+        for name, note in notes:
+            print(f"  [NOTE] {name}: {note}")
         for r in results:
             print(f"{r.target.course_name} — {r.target.teesheet_name} ({r.target.teesheet_id})")
             for d in r.days:

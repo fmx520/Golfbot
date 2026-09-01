@@ -2251,7 +2251,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.02"
+APP_VERSION = "1.03"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -2867,7 +2867,7 @@ def _run_harvest_job(harvest_id: str, req: HarvestRequest) -> None:
 
         for course in courses:
             log(f"{course.name}: connecting…")
-            client, targets, err = grid_harvest.discover_targets(
+            client, targets, err, note = grid_harvest.discover_targets(
                 course, username=req.username, password=req.password,
             )
             if err:
@@ -2877,6 +2877,8 @@ def _run_harvest_job(harvest_id: str, req: HarvestRequest) -> None:
                     if job:
                         job.login_failures.append({"course": course.name, "error": err})
                 continue
+            if note:
+                log(f"{course.name}: {note}")
             for target in targets:
                 result = grid_harvest.harvest_target(
                     client, target, weekdays=weekdays,

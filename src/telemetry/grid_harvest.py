@@ -98,15 +98,21 @@ def weekday_dates(start: date, horizon_days: int) -> dict[int, date]:
 
 def discover_targets(
     course: Course, *, username: str, password: str, base_url_override: str = ""
-) -> tuple[Optional[ForeUpDiscoveryClient], list[TeesheetTarget], str]:
+) -> tuple[Optional[ForeUpDiscoveryClient], list[TeesheetTarget], str, str]:
     """Bootstrap one session per catalog course and enumerate its teesheets.
 
     One page load covers every sibling teesheet on a multi-course facility
     (Bethpage's Black/Red/Blue/Green/Yellow), so this is one login per catalog
     entry, not one per teesheet.
+
+    Returns (client, targets, error, note). ``error`` non-empty means the
+    course is unreachable entirely — no client to use. ``note`` is informational
+    and comes with a real, usable client — currently only set when login failed
+    but the course turned out not to need one (see below).
     """
     base_url = base_url_override or course.base_url
     client = ForeUpDiscoveryClient(base_url=base_url)
+    note = ""
     try:
         client.bootstrap_session(
             username=username,
@@ -116,9 +122,20 @@ def discover_targets(
             request_id=f"harvest-{course.key}",
         )
     except ForeUpError as exc:
-        return None, [], f"Login failed: {exc}"
+        # bootstrap_session runs _init_session (an ordinary, unauthenticated
+        # page load) BEFORE it ever attempts the login POST, so a rejected
+        # login does not mean a rejected session — cookies and the
+        # booking-class list are already sitting on `client`, only the JWT is
+        # missing. Some facilities (municipal/town-run courses in particular)
+        # allow guest browsing and booking with no ForeUp account at all, so a
+        # 401 here is not necessarily "wrong password" — it can just as well
+        # mean "this course has no login to give it." Keep the same client and
+        # try to read the teesheet anyway; a course that genuinely requires an
+        # account will fail on its own below, with a clearer per-day reason
+        # than a login error that turned out to be beside the point.
+        note = f"Login failed ({exc}) — trying without it in case this course allows guest access."
     except Exception as exc:  # noqa: BLE001
-        return None, [], f"Could not reach ForeUp ({type(exc).__name__}: {exc})"
+        return None, [], f"Could not reach ForeUp ({type(exc).__name__}: {exc})", ""
 
     options = client.get_course_options()
     if not options:
@@ -140,7 +157,7 @@ def discover_targets(
             teesheet_name=opt.get("name") or tid,
             booking_class=booking_class,
         ))
-    return client, targets, ""
+    return client, targets, "", note
 
 
 def harvest_target(

@@ -111,7 +111,8 @@ COURSE_CATALOG: tuple[Course, ...] = (
         name="Bethpage State Park",
         emoji="⛳",
         booking_url="https://foreupsoftware.com/index.php/booking/19765/2431#/teetimes",
-        note="Five courses (Black, Red, Blue, Green, Yellow) share this booking page.",
+        note="Multiple courses and tee-time variants share this booking page: Black, Red, "
+             "Blue, Green, Yellow, plus 9-hole and early-AM options.",
     ),
     Course(
         key="montauk_downs",
