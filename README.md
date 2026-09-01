@@ -200,8 +200,9 @@ render logs --tail 1000 | grep GOLFBOT_RACE | python3 scripts/analyze_runs.py -
 1. Create a project at [supabase.com](https://supabase.com) (free tier is ample —
    one race record is ~1-2KB).
 2. Run [`supabase/schema.sql`](supabase/schema.sql) in Dashboard → SQL Editor.
-   It creates the `races` table, indexes, and leaves RLS enabled with no
-   policies.
+   It creates the `races` table and the `course_grids` table (Future Sight's
+   learned tee-grid registry — see below), with indexes, and leaves RLS
+   enabled with no policies.
 3. Copy the **`service_role`** key from Project Settings → API. Not the `anon`
    key — RLS is on, and only `service_role` bypasses it.
 4. Set these wherever the bot runs (Render → Environment, or `.env` locally):
@@ -230,6 +231,43 @@ and out of the repo. `.env` is gitignored.
 `supabase/schema.sql` also carries a commented query cookbook for the questions
 worth asking: where races are being lost, whether first-poll offsets are still
 landing before the release, and whether anti-bot rejections are climbing.
+
+### Learning every course's tee grid (Future Sight)
+
+Future Sight pre-stages a hold at an exact tee time, so it has to know the
+times a course actually offers before it can fire — that's the `course_grids`
+table above, one row per `(course_id, day_of_week)`. Normally a row is only
+learned as a side effect of arming a real job on that weekday, which makes it
+look like getting full coverage means running the bot on seven different
+calendar days.
+
+It doesn't. These courses release on a rolling window (many NY state courses
+publish a new day each night at 7pm, always keeping ~7 days visible), so the
+booking window visible **right now** already contains one date for every day
+of the week — today, tomorrow, +2 ... +6 are seven consecutive dates, which
+span Monday through Sunday exactly once. `scripts/harvest_grids.py` reads
+those dates in a single run, for every course and every sibling teesheet on a
+multi-course facility (Bethpage's Black/Red/Blue/Green/Yellow), and upserts
+whatever it learns:
+
+```bash
+python3 scripts/harvest_grids.py
+python3 scripts/harvest_grids.py --course bethpage --horizon-days 13
+python3 scripts/harvest_grids.py --dry-run --json   # preview without writing
+```
+
+Needs `FOREUP_USERNAME`/`FOREUP_PASSWORD` and `RACE_LOG_WEBHOOK_URL` (the
+Supabase sink above) — without a sink it reports what it would have learned
+but writes nothing. It's safe to re-run: a date that came back booked solid
+just gets another shot next time, and a shifted seasonal grid overwrites the
+old row rather than duplicating it. Since a booking window rolls forward on
+its own, running this weekly — a cron job, or by hand — is what keeps the
+registry current; nothing about it requires the bot to be armed on any
+particular day.
+
+Check coverage and staleness with the `course_grids` query in the schema's
+cookbook, or `python3 scripts/harvest_grids.py --dry-run` against a course to
+see what's currently reachable without writing anything.
 
 ## Architecture
 

@@ -55,6 +55,63 @@ alter table races enable row level security;
 
 
 -- ---------------------------------------------------------------------------
+-- Per-course tee-grid registry (src/telemetry/grid_store.py)
+-- ---------------------------------------------------------------------------
+--
+-- Future Sight needs to know which exact tee times a course offers before it
+-- can pre-stage holds against them. That's learned from a teesheet that is
+-- already visible — one row per (course_id, day_of_week), so a Saturday sheet
+-- doesn't get overwritten by a Tuesday read of the same course. The sink
+-- reuses RACE_LOG_WEBHOOK_URL, swapping /races for /course_grids, so no extra
+-- env var is needed once the races table above is wired up.
+
+create table if not exists course_grids (
+    course_id         text not null,   -- ForeUp teesheet id (the URL's second number)
+    day_of_week       int  not null,   -- Python date.weekday(): Monday=0 .. Sunday=6
+
+    interval_minutes  int,             -- inferred tee interval, e.g. 8 or 10
+    anchor_phase      int,             -- (any observed time) mod interval_minutes
+    first_time        text,
+    last_time         text,
+    observed_count    int,
+    confidence        text,            -- none | low | medium | high
+
+    -- One real slot's raw ForeUp payload, for shaping a pre-staged hold's body.
+    template          jsonb,
+
+    -- The date this grid was read from, and when. source_date is a display
+    -- field (kept text, like races.play_date, for the same reason: never fail
+    -- the insert over a cast). updated_at is what tells you the row is stale.
+    source_date       text,
+    updated_at        timestamptz not null default now(),
+
+    primary key (course_id, day_of_week)
+);
+
+-- upsert_grid() POSTs with ?on_conflict=course_id,day_of_week — the primary
+-- key above is exactly what PostgREST needs to resolve that.
+
+alter table course_grids enable row level security;
+
+-- upsert_grid() never sends updated_at, so the column default only fires on
+-- the very first insert — a later re-learn of the same course/day would
+-- otherwise leave updated_at frozen at that first write, making every row
+-- look equally stale forever. This keeps it honest on every write.
+create or replace function course_grids_touch_updated_at()
+returns trigger language plpgsql as $$
+begin
+    new.updated_at := now();
+    return new;
+end;
+$$;
+
+drop trigger if exists course_grids_set_updated_at on course_grids;
+create trigger course_grids_set_updated_at
+    before insert or update on course_grids
+    for each row execute function course_grids_touch_updated_at();
+
+
+-- ---------------------------------------------------------------------------
 -- Query cookbook
 -- ---------------------------------------------------------------------------
 
@@ -134,3 +191,11 @@ alter table races enable row level security;
 --   select (jsonb_array_length(coalesce(prestage,'[]')) > 0) as prestaged,
 --          outcome, count(*)
 --   from races group by 1, 2 order by 1 desc, 3 desc;
+
+-- Grid coverage: which course/weekday pairs are learned, and how stale.
+-- scripts/harvest_grids.py should keep this at 0 missing across every day.
+--
+--   select course_id, day_of_week, interval_minutes, confidence,
+--          source_date, now() - updated_at as age
+--   from course_grids
+--   order by course_id, day_of_week;
