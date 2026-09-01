@@ -43,7 +43,7 @@ from src.courses import COURSE_CATALOG, cached_preflight, run_preflight
 from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
 from src.discovery import checkout_scan
 from src.discovery.grid import analyze_teesheet_grid
-from src.telemetry import grid_store
+from src.telemetry import grid_harvest, grid_store
 from src.telemetry.race_log import RaceRecorder
 
 STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
@@ -2251,7 +2251,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.01"
+APP_VERSION = "1.02"
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -2804,6 +2804,143 @@ def probe_checkout_fields(req: GridRequest) -> dict[str, Any]:
     result["fields_we_send"] = len(known)
     result["booked_anything"] = False
     return result
+
+
+class HarvestRequest(BaseModel):
+    """Refresh course_grids using whichever ForeUp account is connected."""
+    username: str
+    password: str
+    course_keys: list[str] = Field(default_factory=list)  # empty = every catalog course
+    horizon_days: int = Field(default=10, ge=7, le=30)
+    players: int = Field(default=1, ge=1, le=4)
+    holes: int = Field(default=18, ge=9, le=18)
+    dry_run: bool = False
+
+
+@dataclass
+class HarvestJobState:
+    harvest_id: str
+    status: str = "running"  # running | succeeded | failed
+    started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    finished_at: str = ""
+    events: list[str] = field(default_factory=list)
+    results: list[dict[str, Any]] = field(default_factory=list)
+    login_failures: list[dict[str, str]] = field(default_factory=list)
+    error: str = ""
+
+
+HARVEST_LOCK = Lock()
+HARVEST_JOBS: dict[str, HarvestJobState] = {}
+
+
+def _run_harvest_job(harvest_id: str, req: HarvestRequest) -> None:
+    """Background worker for POST /api/harvest-grids.
+
+    A plain Thread rather than the Process-based job machinery above: this is
+    I/O-bound (HTTP calls + polite pauses between them), not CPU-bound, and
+    doesn't need hard-kill-on-cancel semantics — a run takes ~1-2 minutes and
+    nothing here holds a tee time or spends money, so letting it finish is
+    fine. Never raises past this function; a bug here must not take the app
+    with it.
+    """
+    def log(line: str) -> None:
+        with HARVEST_LOCK:
+            job = HARVEST_JOBS.get(harvest_id)
+            if job:
+                job.events.append(line)
+
+    try:
+        # Mirror scripts/harvest_grids.py's own safety net: without a sink,
+        # every real write silently fails and every day would come back
+        # "error" with no explanation. Say so once, up front, and preview
+        # instead — same behavior as the CLI's --dry-run fallback.
+        dry_run = req.dry_run
+        if not dry_run and not os.getenv("RACE_LOG_WEBHOOK_URL", "").strip():
+            log("No RACE_LOG_WEBHOOK_URL configured on this server — nothing can be "
+                "persisted. Previewing what would be learned instead.")
+            dry_run = True
+
+        wanted = set(req.course_keys) if req.course_keys else None
+        courses = [c for c in COURSE_CATALOG if not wanted or c.key in wanted]
+        today = datetime.now(EAST_COAST_TZ).date()
+        weekdays = grid_harvest.weekday_dates(today, max(7, req.horizon_days))
+
+        for course in courses:
+            log(f"{course.name}: connecting…")
+            client, targets, err = grid_harvest.discover_targets(
+                course, username=req.username, password=req.password,
+            )
+            if err:
+                log(f"{course.name}: {err}")
+                with HARVEST_LOCK:
+                    job = HARVEST_JOBS.get(harvest_id)
+                    if job:
+                        job.login_failures.append({"course": course.name, "error": err})
+                continue
+            for target in targets:
+                result = grid_harvest.harvest_target(
+                    client, target, weekdays=weekdays,
+                    players=req.players, holes=req.holes, dry_run=dry_run,
+                )
+                log(f"{course.name} — {target.teesheet_name}: {result.stored_count}/7 days learned")
+                with HARVEST_LOCK:
+                    job = HARVEST_JOBS.get(harvest_id)
+                    if job:
+                        job.results.append(result.as_dict())
+
+        with HARVEST_LOCK:
+            job = HARVEST_JOBS.get(harvest_id)
+            if job:
+                job.status = "succeeded"
+                job.finished_at = datetime.now(timezone.utc).isoformat()
+                total = len(job.results) * 7
+                stored = sum(r["stored_count"] for r in job.results)
+                job.events.append(f"Done — {stored}/{total} (course, weekday) pairs learned this run.")
+    except Exception as exc:  # noqa: BLE001 — a background job must never crash silently
+        with HARVEST_LOCK:
+            job = HARVEST_JOBS.get(harvest_id)
+            if job:
+                job.status = "failed"
+                job.finished_at = datetime.now(timezone.utc).isoformat()
+                job.error = f"{type(exc).__name__}: {exc}"
+                job.events.append(f"Failed: {job.error}")
+
+
+@app.post("/api/harvest-grids")
+def start_harvest(req: HarvestRequest) -> dict[str, str]:
+    """Kick off a tee-grid coverage refresh using the caller's ForeUp login.
+
+    This is the same src/telemetry/grid_harvest.py code scripts/harvest_grids.py
+    and the weekly GitHub Actions workflow run — the button just uses whichever
+    account is currently connected in the UI instead of stored secrets.
+    """
+    if not req.username or not req.password:
+        raise HTTPException(status_code=400, detail="ForeUp username and password are required")
+
+    harvest_id = uuid.uuid4().hex[:12]
+    with HARVEST_LOCK:
+        HARVEST_JOBS[harvest_id] = HarvestJobState(harvest_id=harvest_id)
+
+    Thread(target=_run_harvest_job, args=(harvest_id, req), daemon=True).start()
+    return {"harvest_id": harvest_id}
+
+
+@app.get("/api/harvest-grids/{harvest_id}")
+def get_harvest(harvest_id: str) -> dict[str, Any]:
+    with HARVEST_LOCK:
+        job = HARVEST_JOBS.get(harvest_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Harvest job not found")
+        return {
+            "harvest_id": job.harvest_id,
+            "status": job.status,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "events": list(job.events),
+            "results": list(job.results),
+            "login_failures": list(job.login_failures),
+            "error": job.error,
+        }
 
 
 @app.get("/api/courses")

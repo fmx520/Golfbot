@@ -302,6 +302,18 @@
         <div class="event-log mt-1 hidden" id="probeOut"></div>
       </div>
 
+      <div class="card mt-2">
+        <div class="card-title">Tee-Grid Coverage</div>
+        <div class="form-help">
+          Learns every supported course's tee-time grid for every day of the week, in one pass,
+          using the ForeUp account connected above &mdash; the same thing the weekly automated
+          refresh does, run on demand. Takes about a minute; never books or holds anything.
+        </div>
+        <button class="btn btn-secondary btn-block mt-1" id="harvestBtn">Refresh Tee-Grid Coverage</button>
+        <div class="event-log mt-1 hidden" id="harvestLog"></div>
+        <div class="hidden mt-1" id="harvestResults"></div>
+      </div>
+
       <div id="paymentContainer" class="hidden mt-2">
         <div class="card payment-card">
           <div class="card-title">Tee time held — pay to confirm</div>

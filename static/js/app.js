@@ -1310,6 +1310,91 @@ function updateSniperButtonLabel() {
 
 function toggleCaptchaKey() {}
 
+// Tee-grid coverage refresh: the same src/telemetry/grid_harvest.py logic
+// scripts/harvest_grids.py and the weekly GitHub Actions workflow run, but
+// using whichever ForeUp account is currently connected instead of stored
+// secrets. Backend runs it as a background job (it takes ~1-2 minutes), so
+// this polls for progress rather than blocking one long request.
+async function refreshTeeGridCoverage() {
+  const btn = $('harvestBtn');
+  const log = $('harvestLog');
+  const username = $('username').value.trim();
+  const password = $('password').value.trim();
+
+  hide('harvestResults');
+  show('harvestLog');
+  log.innerHTML = '';
+
+  if (!username || !password) {
+    log.innerHTML = '<div class="event-line">Enter your ForeUp email and password on Connect first.</div>';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-inline"></span> Refreshing…';
+
+  const appendLine = (text) => {
+    const line = document.createElement('div');
+    line.className = 'event-line';
+    line.textContent = text;
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  };
+
+  try {
+    const { harvest_id } = await api('/harvest-grids', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+
+    let seen = 0;
+    for (;;) {
+      await new Promise(r => setTimeout(r, 1500));
+      const data = await api(`/harvest-grids/${harvest_id}`);
+      for (; seen < data.events.length; seen++) appendLine(data.events[seen]);
+      if (data.status !== 'running') {
+        if (data.status === 'failed') appendLine('Failed: ' + (data.error || 'unknown error'));
+        renderHarvestResults(data);
+        break;
+      }
+    }
+  } catch (e) {
+    appendLine('Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Refresh Tee-Grid Coverage';
+  }
+}
+
+function renderHarvestResults(data) {
+  const el = $('harvestResults');
+  if (!data.results || !data.results.length) {
+    el.innerHTML = '<div class="form-help">No teesheets were reachable this run.</div>';
+    show('harvestResults');
+    return;
+  }
+
+  const rows = data.results.map(r => {
+    const chips = r.days.map(d => {
+      const cls = d.status === 'stored' ? 'badge-success' : d.status === 'unconfirmed' ? 'badge-warning' : 'badge-error';
+      const label = d.weekday.slice(0, 2);
+      return `<span class="badge ${cls}" title="${esc(d.weekday)} (${esc(d.date)}): ${esc(d.detail)}">${label}</span>`;
+    }).join(' ');
+    return `<tr>
+      <td>${esc(r.course_name)}<br><span class="muted">${esc(r.teesheet_name)}</span></td>
+      <td>${r.stored_count}/7</td>
+      <td>${chips}</td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `<div class="table-container"><table class="data-table">
+    <thead><tr><th>Course</th><th>Learned</th><th>Mon&ndash;Sun</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+  show('harvestResults');
+}
+
 // Init
 document.addEventListener('DOMContentLoaded', () => {
   goToStep(1);
@@ -1326,6 +1411,7 @@ document.addEventListener('DOMContentLoaded', () => {
     $('probeTools').classList.remove('hidden');
   }
   $('gridBtn').addEventListener('click', showTeeGrid);
+  $('harvestBtn').addEventListener('click', refreshTeeGridCoverage);
   $('probeBtn').addEventListener('click', fireColdHoldProbe);
   $('validateBtn').addEventListener('click', fireValidateProbe);
   $('fieldsBtn').addEventListener('click', scanCheckoutFields);

@@ -570,6 +570,8 @@ body::before {
 .badge-success { background: var(--success-bg); color: var(--success); border-color: rgba(74, 222, 128, 0.25); }
 .badge-warning { background: var(--warning-bg); color: var(--warning); border-color: rgba(217, 164, 65, 0.25); }
 .badge-error   { background: var(--error-bg);   color: var(--error);   border-color: rgba(229, 72, 77, 0.25); }
+
+.muted { color: var(--text-muted); font-size: var(--fs-xs); }
 .badge-info    { background: var(--info-bg);    color: var(--info);    border-color: rgba(88, 182, 216, 0.25); }
 .badge-neutral { background: var(--bg-tertiary); color: var(--text-muted); border-color: var(--border); }
 .badge-sniper  { background: var(--flag-bg);    color: var(--flag);    border-color: rgba(240, 180, 41, 0.28); }
