@@ -1,0 +1,52 @@
+name: Harvest tee-time grids
+
+# Future Sight can only pre-stage a hold at a time a course actually offers,
+# and that's learned from a teesheet that's already visible. The booking
+# window rolls forward daily, so the dates visible right now already span
+# every weekday exactly once (today, tomorrow, +2 ... +6) — no need to wait
+# for an actual Saturday to learn Saturday. See scripts/harvest_grids.py and
+# CHANGELOG.md for the full story.
+#
+# Runs weekly to stay ahead of seasonal grid changes and dates that came back
+# booked solid; "Run workflow" above runs it on demand.
+
+on:
+  schedule:
+    # 09:00 UTC every Sunday. Which day barely matters — the script re-derives
+    # the next occurrence of every weekday from whenever it runs — but a fixed
+    # weekly cadence is what actually keeps the registry from going stale.
+    - cron: "0 9 * * 0"
+  workflow_dispatch: {}
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Harvest grids
+        env:
+          FOREUP_USERNAME: ${{ secrets.FOREUP_USERNAME }}
+          FOREUP_PASSWORD: ${{ secrets.FOREUP_PASSWORD }}
+          RACE_LOG_WEBHOOK_URL: ${{ secrets.RACE_LOG_WEBHOOK_URL }}
+          RACE_LOG_WEBHOOK_TOKEN: ${{ secrets.RACE_LOG_WEBHOOK_TOKEN }}
+        run: |
+          python3 scripts/harvest_grids.py
+          code=$?
+          # Exit 1 means partial coverage -- some dates were booked solid or
+          # a teesheet was unreadable, which is normal week to week and gets
+          # picked up on a later run. That is not a workflow failure. Exit 2
+          # (nothing learned at all, or a login failure) is: it means the
+          # secrets above are missing or wrong, or every course is down.
+          if [ "$code" -eq 2 ]; then
+            echo "::error::Harvest reported total failure (exit 2) -- check the FOREUP_/RACE_LOG_ secrets."
+            exit 1
+          fi
+          exit 0

@@ -261,13 +261,33 @@ Supabase sink above) — without a sink it reports what it would have learned
 but writes nothing. It's safe to re-run: a date that came back booked solid
 just gets another shot next time, and a shifted seasonal grid overwrites the
 old row rather than duplicating it. Since a booking window rolls forward on
-its own, running this weekly — a cron job, or by hand — is what keeps the
-registry current; nothing about it requires the bot to be armed on any
-particular day.
+its own, running this weekly is what keeps the registry current; nothing
+about it requires the bot to be armed on any particular day.
 
 Check coverage and staleness with the `course_grids` query in the schema's
 cookbook, or `python3 scripts/harvest_grids.py --dry-run` against a course to
 see what's currently reachable without writing anything.
+
+#### Keeping it current automatically
+
+[`.github/workflows/harvest-grids.yml`](.github/workflows/harvest-grids.yml)
+runs the harvester every Sunday, and on demand from the Actions tab's **Run
+workflow** button — free (GitHub-hosted runners have normal internet access,
+where this sandbox's does not), no Render resource, no ongoing cost. One-time
+setup: add these under repo **Settings → Secrets and variables → Actions**:
+
+```
+FOREUP_USERNAME
+FOREUP_PASSWORD
+RACE_LOG_WEBHOOK_URL
+RACE_LOG_WEBHOOK_TOKEN
+```
+
+Same values as the Render environment. A run that logs in fine everywhere but
+learns nothing new that week (every probed date happened to be booked solid)
+is not treated as a failure — only exit code 2 (any course's login failed, or
+literally zero (course, weekday) pairs were learned) fails the workflow, so a
+normal partial week doesn't spam a "workflow failed" notification.
 
 ## Architecture
 
