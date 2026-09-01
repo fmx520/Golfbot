@@ -109,6 +109,23 @@ create table if not exists course_grids (
 
 alter table course_grids enable row level security;
 
+-- upsert_grid() never sends updated_at, so the column default only fires on
+-- the very first insert -- a later re-learn of the same course/day would
+-- otherwise leave updated_at frozen at that first write, making every row
+-- look equally stale forever. This keeps it honest on every write.
+create or replace function course_grids_touch_updated_at()
+returns trigger language plpgsql as $$
+begin
+    new.updated_at := now();
+    return new;
+end;
+$$;
+
+drop trigger if exists course_grids_set_updated_at on course_grids;
+create trigger course_grids_set_updated_at
+    before insert or update on course_grids
+    for each row execute function course_grids_touch_updated_at();
+
 -- The two axes you actually slice on: what happened, and when.
 create index if not exists races_outcome_idx    on races (outcome);
 create index if not exists races_recorded_idx   on races (recorded_at desc);
@@ -200,3 +217,11 @@ alter table races enable row level security;
 --   select (jsonb_array_length(coalesce(prestage,'[]')) > 0) as prestaged,
 --          outcome, count(*)
 --   from races group by 1, 2 order by 1 desc, 3 desc;
+
+-- Grid coverage: which course/weekday pairs are learned, and how stale.
+-- scripts/harvest_grids.py should keep this at 0 missing across every day.
+--
+--   select course_id, day_of_week, interval_minutes, confidence,
+--          source_date, now() - updated_at as age
+--   from course_grids
+--   order by course_id, day_of_week;
