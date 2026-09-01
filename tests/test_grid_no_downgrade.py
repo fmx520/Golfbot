@@ -109,10 +109,52 @@ def test_first_ever_write_succeeds():
     check("anchor phase computed", row and row["anchor_phase"] == (7 * 60 + 42) % 9, row)
 
 
+def test_todays_shrinking_sheet_does_not_thin_a_grid():
+    """Today's sheet only shrinks -- a later read is narrower, not truer.
+
+    Observed 2026-09-01: course 2432 Tuesday went 16:42->17:09 and 7->6 slots
+    across a single morning, purely from tee times passing.
+    """
+    from datetime import date
+    today = date.today().isoformat()
+    morning = dict(GOOD, first_time="16:42", last_time="18:21",
+                   observed_count=7, source_date=today)
+    later = {"interval_minutes": 9, "first_time": "17:09", "last_time": "18:21",
+             "observed_count": 6, "confidence": "medium"}
+    wrote, _ = _harness(morning, later, today)
+    check("later same-day read rejected when thinner", wrote is False,
+          "today's shrinking sheet overwrote the earlier, wider read")
+
+
+def test_todays_wider_read_still_writes():
+    """Only the shrink is blocked -- a genuinely better read of today wins."""
+    from datetime import date
+    today = date.today().isoformat()
+    early = dict(GOOD, first_time="17:00", last_time="18:00",
+                 observed_count=5, source_date=today)
+    wider = {"interval_minutes": 9, "first_time": "16:00", "last_time": "18:21",
+             "observed_count": 14, "confidence": "high"}
+    wrote, _ = _harness(early, wider, today)
+    check("wider same-day read accepted", wrote is True)
+
+
+def test_future_date_reread_still_refreshes():
+    """A future date's sheet does not shrink with the clock, so refresh it."""
+    future = dict(GOOD, source_date="2026-12-25", first_time="08:00",
+                  last_time="17:00", observed_count=30)
+    thinner = {"interval_minutes": 10, "first_time": "09:00", "last_time": "16:00",
+               "observed_count": 25, "confidence": "medium"}
+    wrote, _ = _harness(future, thinner, "2026-12-25")
+    check("future same-date re-read refreshes", wrote is True)
+
+
 if __name__ == "__main__":
     for fn in (test_thin_twilight_sample_does_not_clobber, test_better_sample_replaces,
                test_same_date_reread_refreshes, test_stale_row_gives_way,
-               test_first_ever_write_succeeds):
+               test_first_ever_write_succeeds,
+               test_todays_shrinking_sheet_does_not_thin_a_grid,
+               test_todays_wider_read_still_writes,
+               test_future_date_reread_still_refreshes):
         print(f"\n{fn.__name__}")
         fn()
     print(f"\n{'PASS' if FAILURES == 0 else str(FAILURES) + ' FAILURE(S)'}")

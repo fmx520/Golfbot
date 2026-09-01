@@ -76,6 +76,16 @@ def _grid_quality(first: str, last: str, observed: int) -> tuple[int, int]:
     return (span, int(observed or 0))
 
 
+def _is_today(source_date: str) -> bool:
+    """Is this reading a sheet for today, which shrinks as the day passes?"""
+    try:
+        from datetime import date as _date
+        y, m, d = (int(x) for x in str(source_date).split("-")[:3])
+        return _date(y, m, d) == _date.today()
+    except (ValueError, TypeError):
+        return False
+
+
 def _row_is_stale(row: dict[str, Any]) -> bool:
     """Grids drift with the season, so a very old row should not win forever."""
     stamp = str(row.get("updated_at") or row.get("source_date") or "")[:10]
@@ -128,9 +138,17 @@ def upsert_grid(
             existing.get("observed_count") or 0,
         )
         same_date = str(existing.get("source_date") or "") == str(source_date)
-        # Re-reading the same date is a refresh, not a downgrade -- prices and
-        # open-slot counts move through the day and the newer read is truer.
-        if not same_date and new_q < old_q and not _row_is_stale(existing):
+        # Re-reading the SAME date is normally a refresh rather than a
+        # downgrade -- prices and side ids move, and the newer read is truer.
+        #
+        # Except when that date is today. Today's sheet only ever shrinks: a
+        # tee time that has passed stops being returned, because the booking
+        # API lists only OPEN slots. Re-reading it at 10am after a 7am read
+        # does not produce a truer grid, it produces a later, narrower one.
+        # Observed on 2026-09-01: course 2432 Tuesday went 16:42->17:09 and
+        # 7->6 slots across a single morning, purely from time passing.
+        refresh_ok = same_date and not (_is_today(source_date) and new_q < old_q)
+        if not refresh_ok and new_q < old_q and not _row_is_stale(existing):
             _log(
                 f"kept existing grid for course {course_id} dow {day_of_week}: "
                 f"stored {old_q[0]}min span / {old_q[1]} slots "
