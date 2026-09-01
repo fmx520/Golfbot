@@ -283,6 +283,10 @@ def _event(job: JobState, stage: str, message: str, **extra: Any) -> None:
 # and until now the reason lived only in the page's event log -- so a lost race
 # left no record of why we fell back to polling, and three days of races looked
 # identical in the database. They now also go to stdout, which Render keeps.
+# Set by the sniper worker at startup. Each race runs in its own process, so a
+# single-slot module global is unambiguous -- there is never a second race here.
+_race_for_decisions: list[Any] = []
+
 _PERSISTED_EVENT_STAGES = frozenset({
     "prestage_disabled", "prestage_grid", "prestage_window", "prestage_capped",
     "prestage_armed", "prestage_rotated", "prestage_fire", "prestage_exhausted",
@@ -307,6 +311,16 @@ def _emit_event(
                 "prestage_decision", extra={"stage": stage, "detail": message})
         except Exception:  # noqa: BLE001 -- telemetry must never break a race
             pass
+        # Render's log store outlives a spin-down, but its retention is finite
+        # and it is not keyed by run_id -- correlating a decision to a race
+        # means timestamp-matching, which is how this got misdiagnosed twice.
+        # The race row is the durable, queryable home for it.
+        race = _race_for_decisions[0] if _race_for_decisions else None
+        if race is not None:
+            try:
+                race.record_decision(stage, message)
+            except Exception:  # noqa: BLE001 -- telemetry must never break a race
+                pass
     queue.put(
         {
             "type": "event",
@@ -922,6 +936,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         peer_ordinal=int(payload.get("peer_ordinal") or 0),
         peer_count=int(payload.get("peer_count") or 1),
     )
+
+    _race_for_decisions[:] = [race]
 
     # Best teesheet sample this race saw. A freshly released sheet is the most
     # complete view of a course's grid we ever get -- far better than a
@@ -2235,7 +2251,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.00"
+APP_VERSION = "1.01"
 
 @app.get("/health")
 def health() -> dict[str, str]:

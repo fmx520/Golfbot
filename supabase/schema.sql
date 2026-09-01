@@ -39,6 +39,7 @@ create table if not exists races (
     attempts         jsonb,
     captcha          jsonb,
     prestage         jsonb,         -- Future Sight: one entry per hold fired
+    prestage_decision jsonb,        -- why Future Sight armed or stood down
     two_factor       jsonb,         -- booking-code path + hold keepalive
     peers            jsonb,         -- our own concurrent jobs on this race
 
@@ -60,6 +61,11 @@ create table if not exists races (
 alter table races add column if not exists prestage   jsonb;
 alter table races add column if not exists two_factor jsonb;
 alter table races add column if not exists peers      jsonb;
+
+-- v1.01: why Future Sight armed or stood down. On 2026-08-31 the grid gate
+-- disarmed it silently and the reason lived only in the browser event log, so
+-- three days of losing races were indistinguishable in this table.
+alter table races add column if not exists prestage_decision jsonb;
 
 -- Guard against this recurring: scripts/check_schema_drift.py compares the
 -- record's top-level keys against the columns above and fails on any gap.

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -138,6 +139,19 @@ def _sink_headers() -> dict[str, str]:
     return headers
 
 
+_SINK_MAX_DRIFT_RETRIES = 6
+
+_PGRST_MISSING_COLUMN = re.compile(
+    r"Could not find the '([^']+)' column", re.IGNORECASE
+)
+
+
+def _missing_column(body: str) -> str:
+    """Pull the column name out of a PostgREST PGRST204 error body."""
+    match = _PGRST_MISSING_COLUMN.search(body or "")
+    return match.group(1) if match else ""
+
+
 def _post_to_sink(record: dict[str, Any]) -> dict[str, Any]:
     """POST the record to the durable sink. Best effort, never raises.
 
@@ -154,14 +168,41 @@ def _post_to_sink(record: dict[str, Any]) -> dict[str, Any]:
     try:
         import httpx  # already a dependency; imported late to keep startup lean
 
-        response = httpx.post(
-            url,
-            json=record,
-            headers=_sink_headers(),
-            timeout=SINK_TIMEOUT_SECONDS,
-        )
+        headers = _sink_headers()
+        payload = dict(record)
+        dropped: list[str] = []
+
+        # PostgREST maps top-level keys to columns and rejects the ENTIRE insert
+        # if one is unmapped (PGRST204). So shipping a new telemetry field before
+        # its migration lands does not lose that field -- it loses the whole race
+        # record, silently, for every run until someone notices. That has already
+        # happened to this project once.
+        #
+        # Retry without the offending column instead. A record missing one field
+        # is worth infinitely more than no record, and the dropped names are
+        # printed so the missing migration is obvious rather than invisible.
+        for _ in range(_SINK_MAX_DRIFT_RETRIES):
+            response = httpx.post(
+                url, json=payload, headers=headers, timeout=SINK_TIMEOUT_SECONDS,
+            )
+            if response.status_code < 400:
+                break
+            missing = _missing_column(response.text)
+            if not missing or missing not in payload:
+                break
+            payload.pop(missing)
+            dropped.append(missing)
+
         ok = response.status_code < 400
         status = {"configured": True, "ok": ok, "status_code": response.status_code}
+        if dropped:
+            status["dropped_columns"] = dropped
+            sys.stdout.write(
+                "GOLFBOT_RACE_SINK_DRIFT dropped unmapped column(s) "
+                f"{', '.join(dropped)} -- the races table needs a migration; "
+                "the rest of the record was saved\n"
+            )
+            sys.stdout.flush()
         if not ok:
             status["body"] = response.text[:200]
             sys.stdout.write(
@@ -238,6 +279,11 @@ class RaceRecorder:
     # per target: {time, result, latency_ms, error}. result is hold_accepted /
     # rejected / error / skipped.
     prestage: list[dict[str, Any]] = field(default_factory=list)
+    # Why Future Sight armed or stood down, keyed to this race. The reason used
+    # to live only in the browser's event log, so a lost race left no record of
+    # whether we pre-staged at all -- on 2026-08-31 the grid gate disarmed it
+    # silently and three days of races looked identical in the database.
+    prestage_decision: list[dict[str, Any]] = field(default_factory=list)
 
     # 2FA / hold-keepalive evidence. Populated only when the booking-code path
     # fires. hold_refresh_failed distinguishes "the hold died while the user
@@ -305,6 +351,16 @@ class RaceRecorder:
         if self.first_slot_seen_offset_ms is not None or self._release_monotonic is None:
             return
         self.first_slot_seen_offset_ms = round((at_monotonic - self._release_monotonic) * 1000, 2)
+
+    def record_decision(self, stage: str, detail: str) -> None:
+        """Bank an arming decision on the race row itself.
+
+        Keyed to run_id, so 'why did we not pre-stage' is one SQL query rather
+        than timestamp-matching against a log stream with finite retention.
+        """
+        self.prestage_decision.append(
+            {"stage": stage, "detail": detail[:600], "at": _now_iso()}
+        )
 
     def record_prestage(self, target_time: str, result: str, latency_ms: Optional[float] = None, error: str = "") -> None:
         self.prestage.append(
@@ -453,6 +509,7 @@ class RaceRecorder:
             "polls": self.polls.as_dict(),
             "attempts": self.attempts,
             "prestage": self.prestage,
+            "prestage_decision": self.prestage_decision,
             "two_factor": {
                 "triggered": self.two_factor_triggered,
                 "code_wait_ms": self.code_wait_ms,
