@@ -17,6 +17,7 @@ the subject: `git log --oneline --grep='(v0\.' -i`.
 
 | Version | Date | Summary | Commit |
 |---|---|---|---|
+| 1.02 | 2026-09-01 | "Refresh Tee-Grid Coverage" button in the UI, using the connected ForeUp account | `522c441` |
 | 1.01 | 2026-09-01 | Bank the Future Sight arming decision on the race row; sink survives schema drift | `618037d` |
 | 1.00 | 2026-09-01 | Fire pre-staged holds in parallel, alongside polling | `6203e3b` |
 | 0.99 | 2026-08-31 | Recover into the payment flow whenever ForeUp asks for a fee | `68613a1` |
