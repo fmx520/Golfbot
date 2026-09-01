@@ -49,6 +49,46 @@ def _log(detail: str) -> None:
         pass
 
 
+# A grid is only worth what it can speak for. The booking API returns ONLY open
+# slots, so a nearly-booked day yields a thin, perfectly self-consistent sample
+# -- and a blind upsert lets that sample overwrite a grid learned from a freshly
+# released sheet. That is not hypothetical: a 9-minute twilight sample once
+# replaced what should have been a 10-minute morning grid, and the pre-staged
+# holds fired at 07:06 and 07:15, times that do not exist on that sheet, for
+# twelve straight 400s.
+#
+# Span first (36 times across eight hours describes the sheet; 8 across eighty
+# minutes describes one corner of it), then observation count.
+GRID_STALE_DAYS = 45
+
+
+def _hhmm_minutes(value: str) -> Optional[int]:
+    try:
+        hh, mm = str(value).split(":")[:2]
+        return int(hh) * 60 + int(mm)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _grid_quality(first: str, last: str, observed: int) -> tuple[int, int]:
+    lo, hi = _hhmm_minutes(first), _hhmm_minutes(last)
+    span = (hi - lo) if (lo is not None and hi is not None and hi >= lo) else 0
+    return (span, int(observed or 0))
+
+
+def _row_is_stale(row: dict[str, Any]) -> bool:
+    """Grids drift with the season, so a very old row should not win forever."""
+    stamp = str(row.get("updated_at") or row.get("source_date") or "")[:10]
+    if not stamp:
+        return False
+    try:
+        from datetime import date as _date
+        y, m, d = (int(x) for x in stamp.split("-")[:3])
+        return (_date.today() - _date(y, m, d)).days > GRID_STALE_DAYS
+    except (ValueError, TypeError):
+        return False
+
+
 def upsert_grid(
     *,
     course_id: str,
@@ -72,14 +112,43 @@ def upsert_grid(
         except ValueError:
             phase = None
 
+    last = str(grid.get("last_time") or "")
+    observed = int(grid.get("observed_count") or 0)
+
+    # Do not let a thinner read clobber a better one. The write is an upsert on
+    # (course_id, day_of_week) with merge-duplicates, i.e. a blind overwrite, so
+    # this comparison is the only thing standing between a fully-booked
+    # reference day and the grid Future Sight aims with.
+    existing = fetch_grid(course_id=str(course_id), day_of_week=int(day_of_week))
+    if existing:
+        new_q = _grid_quality(first, last, observed)
+        old_q = _grid_quality(
+            str(existing.get("first_time") or ""),
+            str(existing.get("last_time") or ""),
+            existing.get("observed_count") or 0,
+        )
+        same_date = str(existing.get("source_date") or "") == str(source_date)
+        # Re-reading the same date is a refresh, not a downgrade -- prices and
+        # open-slot counts move through the day and the newer read is truer.
+        if not same_date and new_q < old_q and not _row_is_stale(existing):
+            _log(
+                f"kept existing grid for course {course_id} dow {day_of_week}: "
+                f"stored {old_q[0]}min span / {old_q[1]} slots "
+                f"({existing.get('first_time')}-{existing.get('last_time')}, "
+                f"from {existing.get('source_date')}) beats new "
+                f"{new_q[0]}min span / {new_q[1]} slots ({first}-{last}, "
+                f"from {source_date}) -- not overwriting"
+            )
+            return True
+
     row = {
         "course_id": str(course_id),
         "day_of_week": int(day_of_week),
         "interval_minutes": interval,
         "anchor_phase": phase,
         "first_time": first,
-        "last_time": str(grid.get("last_time") or ""),
-        "observed_count": int(grid.get("observed_count") or 0),
+        "last_time": last,
+        "observed_count": observed,
         "confidence": str(grid.get("confidence") or ""),
         "template": template or {},
         "source_date": source_date,

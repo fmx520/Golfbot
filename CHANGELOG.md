@@ -17,6 +17,7 @@ the subject: `git log --oneline --grep='(v0\.' -i`.
 
 | Version | Date | Summary | Commit |
 |---|---|---|---|
+| 1.04 | 2026-09-01 | A thin teesheet read can no longer overwrite a better stored grid | `pending` |
 | 1.03 | 2026-09-01 | Grid harvester learns guest-bookable courses too (a rejected login isn't always a wrong password) | `bce1ec8` |
 | 1.02 | 2026-09-01 | "Refresh Tee-Grid Coverage" button in the UI, using the connected ForeUp account | `522c441` |
 | 1.01 | 2026-09-01 | Bank the Future Sight arming decision on the race row; sink survives schema drift | `618037d` |
