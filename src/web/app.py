@@ -1866,6 +1866,17 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             loop_ms = round((time.perf_counter() - loop_start) * 1000, 1)
             race.record_poll(loop_ms, len(slots), poll_result)
 
+            # A pre-staged hold that landed DURING this poll beats anything the
+            # poll just found -- we already own that time, nobody can take it.
+            # Checking only at the top of the loop was not enough: on 2026-09-19
+            # the burst won 09:39 at T+1.0s, the poll cycle took until T+3.9s,
+            # and the poll path then spent its submit on 09:03 -- a slot our own
+            # burst had held and released seconds earlier -- and lost it to
+            # whoever picked it up. The win was not touched until T+4.1s.
+            won = _take_prestage_win()
+            if won and _complete_prestage_win(*won):
+                break
+
             untried = [s for s in slots if _slot_key(s) not in tried_keys] if not retry_same_slot else slots
             candidate = _select_slot(untried, payload) if untried else None
 
@@ -2293,7 +2304,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.06"
+APP_VERSION = "1.07"
 
 @app.get("/health")
 def health() -> dict[str, str]:

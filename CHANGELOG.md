@@ -17,6 +17,7 @@ the subject: `git log --oneline --grep='(v0\.' -i`.
 
 | Version | Date | Summary | Commit |
 |---|---|---|---|
+| 1.07 | 2026-09-20 | Take a hold won mid-poll before the poll path submits against it | `pending` |
 | 1.06 | 2026-09-01 | Infer an unseen weekday's grid from the same course's other days | `3a9652c` |
 | 1.05 | 2026-09-01 | Today's shrinking teesheet can no longer thin a stored grid | `6aa4da1` |
 | 1.04 | 2026-09-01 | A thin teesheet read can no longer overwrite a better stored grid | `9e64c45` |

@@ -61,11 +61,17 @@ class FakeDiscovery:
 
     def lookup_availability_fast(self, **kw):
         POLLS.append(time.perf_counter())
-        time.sleep(0.05)
-        return []
+        # SLOW_POLL_S lets a test make the burst land mid-poll, which is the
+        # window the 2026-09-19 self-collision happened in.
+        time.sleep(FakeDiscovery.SLOW_POLL_S)
+        return list(FakeDiscovery.POLL_SLOTS)
+
+    SLOW_POLL_S = 0.05
+    POLL_SLOTS: list = []
 
 
 POLLS: list[float] = []
+POLL_BOOKS: list[str] = []
 FIRES: list[tuple[str, float]] = []
 RELEASED: list[str] = []
 COMPLETED: list[str] = []
@@ -97,8 +103,10 @@ class FakeBooking:
         COMPLETED.append(target_time)
         return {"success": True, "reservation_id": "R1", "TTID": "T1"}
 
-    def book_slot(self, **kw):
-        raise AssertionError("poll path should not book in these tests")
+    def book_slot(self, *, slot=None, **kw):
+        POLL_BOOKS.append((slot or {}).get("time", "?"))
+        raise RuntimeError('{"success":false,"message":"Sorry, that tee time is '
+                           'no longer available."}')
 
     def refresh_pending_reservation(self, **kw):
         return None
@@ -121,8 +129,11 @@ def _align_to_release(lead_s: float = 4.0) -> str:
     return (datetime.fromtimestamp(nxt, app.EAST_COAST_TZ)).strftime("%H:%M")
 
 
-def _run(accept: set[str], timeout_s: float = 30.0) -> dict:
-    POLLS.clear(); FIRES.clear(); RELEASED.clear(); COMPLETED.clear()
+def _run(accept: set[str], timeout_s: float = 30.0, preserve_fakes: bool = False) -> dict:
+    POLLS.clear(); FIRES.clear(); RELEASED.clear(); COMPLETED.clear(); POLL_BOOKS.clear()
+    if not preserve_fakes:
+        FakeDiscovery.SLOW_POLL_S = 0.05
+        FakeDiscovery.POLL_SLOTS = []
     FakeBooking.ACCEPT = set(accept)
 
     app.ForeUpDiscoveryClient = FakeDiscovery
@@ -132,11 +143,11 @@ def _run(accept: set[str], timeout_s: float = 30.0) -> dict:
     payload = {
         "play_date": "2026-09-07",
         "players": 1, "holes": 18,
-        "time_start": "08:30", "time_end": "09:10",
+        "time_start": "08:30", "time_end": "09:45",
         "release_time": release,
         "auto_book": True, "dry_run": False,
         "future_sight": True,
-        "prestage_times": ["08:30", "08:40", "08:50", "09:00"],
+        "prestage_times": ["08:30", "08:50", "09:10", "09:40"],
         "course_ids": ["2431"], "schedule_id": "2431", "course_id": "2431",
         "username": "u", "password": "p",
         "timeout_seconds": 6,
@@ -201,7 +212,7 @@ def test_polling_runs_during_the_burst() -> None:
 
 def test_extra_holds_are_released() -> None:
     """Winning several holds must not leave us squatting on tee times."""
-    _run(accept={"08:30", "08:40", "08:50", "09:00"})
+    _run(accept={"08:30", "08:50", "09:10", "09:40"})
     if len(COMPLETED) != 1:
         return _fail(f"expected exactly 1 completed booking, got {len(COMPLETED)}: {COMPLETED}")
     if len(RELEASED) < 3:
@@ -218,11 +229,34 @@ def test_single_win_books_once() -> None:
     print(f"  ok: single hold booked once, nothing released")
 
 
+def test_win_landing_mid_poll_beats_the_poll_path():
+    """A hold won DURING a poll must be taken before the poll path submits.
+
+    2026-09-19: the burst won 09:39 at T+1.0s, the poll cycle ran until T+3.9s,
+    and the poll path then spent its submit on 09:03 -- a slot our own burst
+    had held and released seconds earlier -- and lost it. The win was not
+    touched until T+4.1s. Checking only at the top of the loop is not enough.
+    """
+    FakeDiscovery.SLOW_POLL_S = 1.2          # burst lands mid-poll
+    FakeDiscovery.POLL_SLOTS = [             # something for the poll to book
+        {"time": "09:10", "available_spots": 4, "green_fee": 80,
+         "raw": {"schedule_id": "2436", "course_id": "2436"}},
+    ]
+    FakeBooking.HOLD_LATENCY = 0.2
+    _run(accept={"09:40"}, preserve_fakes=True)
+    if not COMPLETED or not COMPLETED[0].endswith("09:40"):
+        return _fail(f"prestaged hold was not booked: {COMPLETED}")
+    if POLL_BOOKS:
+        return _fail(f"poll path submitted against {POLL_BOOKS} while a won hold was pending")
+    print("  ok: won hold taken before the poll path could submit")
+
+
 if __name__ == "__main__":
     os.environ["SNIPER_RACE_TIMEOUT_SECONDS"] = "4"
     os.environ["SNIPER_PRESTAGE_BURST_SECONDS"] = "2"
     for fn in (test_targets_fire_in_parallel, test_polling_runs_during_the_burst,
-               test_extra_holds_are_released, test_single_win_books_once):
+               test_extra_holds_are_released, test_single_win_books_once,
+               test_win_landing_mid_poll_beats_the_poll_path):
         print(f"\n{fn.__name__}")
         try:
             fn()
