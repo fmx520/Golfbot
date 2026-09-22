@@ -1,0 +1,226 @@
+# Where Golfbot actually stands
+
+Operational state as of **2026-09-22**, written for whoever picks this up next.
+`CHANGELOG.md` says what shipped; this says what is true, what is open, and what
+has already been ruled out so you don't re-litigate it.
+
+---
+
+## It works now. Here is the run that proves it.
+
+**2026-09-19, Montauk — two real bookings**, and the first time Future Sight has
+ever fired at a live release.
+
+```
+19:00:00.000  burst fires 09:03 09:12 09:21 09:30 09:39 09:48 — all at once
+19:00:01.016  FIVE OF SIX HOLDS ACCEPTED (~1.0s each)
+19:00:03.861  poll #1 finally returns (3.9s)
+19:00:14.874  09:39 confirmed — TTID_09191900145e71r, 4 players
+```
+
+`first_poll_offset_ms: 1.12` — the first hold left **1 millisecond** after the
+release, with no teesheet read in front of it. That is the whole design.
+
+For contrast, the three days we lost before this (`races` on 08-30/08-31): the
+first hold went out at **T+801ms** and **T+1189ms**, into a race ForeUp had
+already decided. We were losing on the time spent asking what opened.
+
+Run `732229020613` won on a grid the code itself labelled **an educated guess** —
+the only reference sheet available ran 13:06–17:00 against a 09:00–12:45 window.
+Five of six accepts says the guess was right. Before v1.04 that same situation
+would have disarmed Future Sight entirely and left us polling.
+
+---
+
+## How a race actually runs
+
+Two things happen **concurrently** from T+0. This is the single most important
+thing to understand before changing anything in `_sniper_worker_main`.
+
+```
+T+0 ──┬── BURST THREAD: fires every pre-staged target simultaneously.
+      │   Pre-built payloads from the stored grid — no discovery round trip.
+      │   Only ACQUIRES holds. First accept wins; the rest are released via
+      │   DELETE pending_reservation/{id}.
+      │
+      └── MAIN THREAD: polls, and completes the booking.
+          Completion (2FA, payment) lives here and ONLY here, so there is
+          exactly one booking in flight and no way to double-book.
+```
+
+Rules that are load-bearing, each bought with a lost race:
+
+- **The burst must never block polling.** It ran to completion first until
+  v1.00; that forced a gate which disarmed Future Sight on 08-31 and cost us
+  the race. On its own thread, a wrong grid costs the fallback nothing — which
+  is why v1.04 fires even on an untrusted grid rather than standing down.
+- **Targets fire in parallel.** Sequentially (pre-v1.00) they went out at
+  T+0.000, T+0.568, T+2.443, T+4.204 — only the first was ever really in the race.
+- **Check for a won hold before the poll path submits** (v1.07). On 09-19 the
+  burst won 09:39 at T+1.0s but the loop only looked at the top of the
+  iteration, so the poll path spent its submit on 09:03 — a slot *our own burst
+  had just released* — and lost it. We raced ourselves.
+- **Never call `_cancel_requested()` off the main thread.** It pops from
+  `cmd_queue` and pushes non-cancel messages back, so it can steal the 2FA code
+  mid-booking.
+
+---
+
+## Open items
+
+**1. The weekly grid harvest has never once succeeded.** *(needs a human)*
+
+`.github/workflows/harvest-grids.yml` fires Sundays 09:00 UTC. It ran 09-06 and
+09-13 and **failed both times in ~15 seconds**: all four repo secrets are empty.
+
+```
+FOREUP_USERNAME:        (empty)
+FOREUP_PASSWORD:        (empty)
+RACE_LOG_WEBHOOK_URL:   (empty)
+RACE_LOG_WEBHOOK_TOKEN: (empty)
+harvest_grids.py: error: ForeUp credentials required
+```
+
+That is why nearly every `course_grids` row still reads `updated_at 09-01 09:57`
+— one manual run, three weeks ago. Set them at
+`github.com/fmx520/Golfbot/settings/secrets/actions`; the same values are
+already Render env vars.
+
+**Rotate the Supabase service key before copying it there** — it was pasted into
+a chat transcript and is considered exposed. The DB password from that same
+transcript also still needs rotating.
+
+**2. Undecided: halve the burst request volume.**
+
+Parallel fires made each pass ~2.3× faster while `burst_seconds` (5) and the
+inter-pass gap (0.25s) stayed put, so roughly twice as many passes fit: ~44
+requests per burst where the sequential version sent ~20. This was a side effect
+of v1.00, not a decision.
+
+Widening the gap to ~0.75s restores the old volume and keeps the full 5s
+late-publish hedge. **Nothing has pushed back on us** — no rate limits, no
+anti-bot, five simultaneous holds accepted cleanly. This is precaution, not a
+fix. Note also that in both production Future Sight runs the re-fire passes have
+**never** demonstrably helped: 09-19 won on pass 1; 08-30 failed on all passes
+for an unrelated reason (wrong grid).
+
+---
+
+## Already ruled out — don't re-propose without new evidence
+
+**Render CPU upgrade.** Tempting, and I argued for it before the user correctly
+pushed back. The data splits:
+
+- *The median is ForeUp.* p50 goes ~250ms (empty sheet) → ~400–540ms (full sheet
+  at the release). That is their server under load. More local CPU cannot help.
+- *The tail is us.* Multi-second outliers appear at 23:17 and 08:48 on runs with
+  **100% empty responses and zero competition** — 1306ms and 3433ms. Nothing
+  upstream explains a 3.4s reply to an empty query at 8:48am. That is CFS
+  throttling on 0.1 vCPU.
+
+The discriminator run is `5bde9d0084d2` (08-29 **19:01**, peak load, 55% empty
+polls): **p50 of 104ms** — the fastest median in the table, at the busiest
+moment. ForeUp answers cheap queries fast even at peak.
+
+But the upgrade's value collapsed anyway: Future Sight fires pre-built payloads
+with almost no parsing, and v1.07 means a slow poll no longer costs the win.
+On 09-19 the poll took 3.9s and we won regardless. **Do not spend money here**
+unless the poll path becomes load-bearing again.
+
+**Throttle instrumentation** (sampling `/sys/fs/cgroup/cpu.stat` into
+`race.timing`) was designed to settle the above with a number. It is pure
+logging, zero hot-path cost, and `timing` is jsonb so it needs no migration.
+Deliberately not built — it answers a question already decided.
+
+**Detection evasion** (proxy/IP rotation, TLS fingerprint spoofing,
+human-mimicking timing) is out of scope and was declined. Not revisitable.
+
+---
+
+## Things that will mislead you
+
+Written because each one cost real time this session.
+
+- **`prestage` empty does NOT mean Future Sight wasn't selected.** It means no
+  holds *fired*. On 08-31 it was armed and disarmed itself at arm time, and the
+  reason lived only in the browser event log. That is now persisted to
+  `races.prestage_decision` — **read it before concluding anything** about why a
+  race went the way it did.
+- **`mode` only ever holds `sniper` / `snipe_now`.** It does not record whether
+  Future Sight was on. Don't infer strategy from it.
+- **Don't compare mid-day runs to release runs** to isolate a variable. They
+  differ in payload size *and* upstream load simultaneously. Find a run that
+  separates them (see `5bde9d0084d2` above).
+- **A booking fee is not knowable from `booking_fee_required`.** Bethpage
+  charges $5 and reports the flag; Montauk's slots report `false` throughout,
+  and its one clean booking read *"Original amount due at course: $69.00"*. The
+  payment path is therefore **reactive on ForeUp's error text**, not on the
+  flag. Keep it that way.
+- **PostgREST rejects the ENTIRE insert on one unmapped key.** Run
+  `python3 scripts/check_schema_drift.py` after touching `RaceRecorder.as_dict`
+  or `supabase/schema.sql`. The sink now drops the offending column and retries
+  (logging `GOLFBOT_RACE_SINK_DRIFT`), but that is a safety net, not a licence.
+- **A trigger in `schema.sql` is a file, not an applied migration.** The
+  `course_grids.updated_at` trigger sat in the file for weeks while the live DB
+  had `trigger_count: 0`, so `updated_at` recorded insert time and never
+  changed. Applied 09-01. Verify live state; don't trust the file.
+
+---
+
+## Checking on things
+
+Data lives in Supabase project `mdbxvrxzilxkasznhzqv`, tables `races` and
+`course_grids`. Render service `srv-d8176p3rjlhs73au3sc0` (`Golfbot-2`,
+free tier), deploys from `main` on commit. `/health` reports `APP_VERSION`.
+
+```sql
+-- how did the last few races go, and did Future Sight fire?
+select left(run_id,12) run,
+       to_char(created_at at time zone 'America/New_York','MM-DD HH24:MI') et,
+       mode, outcome,
+       timing->>'first_poll_offset_ms' first_ms,
+       jsonb_array_length(coalesce(prestage,'[]'::jsonb)) fires,
+       jsonb_array_length(coalesce(prestage_decision,'[]'::jsonb)) decisions
+from races order by created_at desc limit 10;
+
+-- WHY did Future Sight arm or stand down on a given run?
+select d->>'stage', left(d->>'detail',300)
+from races r, lateral jsonb_array_elements(r.prestage_decision) d
+where left(r.run_id,12) = '<run>';
+
+-- which course/day pairs can Future Sight aim at with real observations?
+-- (trustworthy = covers the window, OR seen >= 20 and span >= 240 min)
+select course_id, day_of_week, interval_minutes, anchor_phase,
+       first_time, last_time, observed_count, source_date, updated_at
+from course_grids order by course_id, day_of_week;
+```
+
+Unobserved (course, weekday) pairs do not block a race: since v1.06 the grid is
+inferred from the same course's other days, because interval and phase belong to
+the **course**, not the day — true across all 27 rows, zero counterexamples.
+Note 2437 runs phase `:06` where its neighbours run `:03`, so inference is
+per-course and never global.
+
+---
+
+## Running the tests
+
+No pytest; each file is standalone and self-reporting. A fresh container needs
+`pip install -r requirements.txt` first.
+
+```bash
+python3 tests/test_prestage_concurrency.py   # ~3 min: aligns to minute boundaries
+python3 tests/test_grid_inference.py
+python3 tests/test_grid_no_downgrade.py
+python3 tests/test_sink_drift.py
+python3 scripts/check_schema_drift.py
+```
+
+`test_prestage_concurrency.py` drives the real `_sniper_worker_main` with fake
+ForeUp clients and covers the four properties that each cost a race: targets
+fire together, polling isn't delayed by the burst, extra holds are released, and
+a hold won mid-poll is taken before the poll path can submit against it.
+
+**Verify a regression test actually fails without its fix.** The v1.07 test was
+confirmed that way — remove the check and the prestaged hold never gets booked
+at all.

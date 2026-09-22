@@ -4,6 +4,18 @@ See `README.md` for setup, architecture, and how the bot works. This file is
 about working in this specific repo, where multiple Claude Code sessions
 operate independently and push straight to `main` without coordinating first.
 
+## Start with STATE.md
+
+`STATE.md` is the operational handoff: what currently works and the run that
+proves it, how a race actually executes (the burst and the poll run
+CONCURRENTLY — get this wrong and you will reintroduce a lost race), what is
+open, what has already been ruled out and why, and the specific things in this
+codebase that will mislead you if you reason from them naively. Read it before
+diagnosing a losing race or proposing an optimisation — several conclusions in
+there were reached the expensive way.
+
+`CHANGELOG.md` says what shipped. `STATE.md` says what is true.
+
 ## Check state before assuming it
 
 Don't assume the version, a table, or an endpoint you're about to add doesn't
