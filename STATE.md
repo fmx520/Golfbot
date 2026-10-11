@@ -141,6 +141,23 @@ human-mimicking timing) is out of scope and was declined. Not revisitable.
 
 Written because each one cost real time this session.
 
+- **There are two ways to win a hold, and both must be finished the same way.**
+  Polling wins it in `book_slot`; Future Sight wins it in the burst and finishes
+  it in `complete_prestaged_hold`. Until v1.08 the booking-fee recovery lived
+  only inside `book_slot`, so it had only ever been exercised through polling
+  (the three 08-31 `awaiting_payment` runs). On **10-10, Bethpage 2432**, Future
+  Sight won 08:36, 08:45 and 08:27 at T+2s, met "A booking fee is required",
+  had no recovery, and gave the race away — recorded as `lost_at_submit`, which
+  it was not. Both paths now go through `_finish_hold` in the client and
+  `_enter_awaiting_payment` in the worker. **Anything that changes what happens
+  after a hold is won goes there, not into one path.**
+- **The payment-hold keepalive never ran before v1.08.** It was a daemon thread
+  started just before the worker returned, and a `Process` exits when its target
+  returns, killing daemon threads — zero refreshes were ever sent while a user
+  paid. The hold was only kept alive during the 2FA code wait. The worker now
+  stays up refreshing until refreshes stop being accepted (paid or gone), a stop
+  request, or `PAYMENT_HOLD_SECONDS` (600).
+
 - **`prestage` empty does NOT mean Future Sight wasn't selected.** It means no
   holds *fired*. On 08-31 it was armed and disarmed itself at arm time, and the
   reason lived only in the browser event log. That is now persisted to
@@ -210,6 +227,7 @@ No pytest; each file is standalone and self-reporting. A fresh container needs
 
 ```bash
 python3 tests/test_prestage_concurrency.py   # ~3 min: aligns to minute boundaries
+python3 tests/test_fee_recovery_paths.py   # both ways of winning a hold reach the payment link
 python3 tests/test_grid_inference.py
 python3 tests/test_grid_no_downgrade.py
 python3 tests/test_sink_drift.py

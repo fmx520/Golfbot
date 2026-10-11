@@ -242,100 +242,128 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
                     f"pending_reservation did not return a reservation_id: {pending_response}"
                 )
 
-            # ---- Step 2a: courses that charge a booking fee cannot be
-            # committed by us at all. On those, users/reservations only
-            # validates -- a captured browser checkout sends validate_only and
-            # gets {"valid":true} -- and the reservation is created when the
-            # payment processor calls back. So take the browser's route: get
-            # the code, validate with it, then ask for the hosted payment page
-            # and hand its URL back. The hold stays ours until it is paid. ----
-            # A true flag lets us skip a commit that would only be refused. A
-            # false one proves nothing -- see the recovery below.
-            if _pick("booking_fee_required") and request_code_callback and customer_id:
-                fee_result = self._hold_and_request_payment(
-                    slot=slot, raw=raw, schedule_id=schedule_id,
-                    course_id=course_id or schedule_id,
-                    players=players, holes=holes,
-                    pending_reservation_id=pending_reservation_id,
-                    captcha_token=captcha_token, customer_id=customer_id,
-                    request_code_callback=request_code_callback,
-                    request_id=req_id, emit=_emit,
-                )
-                self._mark_idempotent_complete(idempotency_key)
-                total_ms = round((time.perf_counter() - flow_started) * 1000, 2)
-                self._log_flow(req_id, flow_started, total_ms, stage_latencies, "awaiting_payment")
-                return fee_result, BookingLatency(
-                    request_id=req_id, total_ms=total_ms, stages=stage_latencies
-                )
-
-            # ---- Step 2b: submit reservations; if course requires booking
-            # code, ForeUp returns a 400 with that exact message — recover by
-            # calling request_booking_code, waiting for the user to enter the
-            # emailed code, and retrying the same submission with the code. ----
-            response: dict[str, Any] = {}
-            code_used: list[str] = []
-            fee_blocked: list[str] = []
-
-            def _do_submit() -> None:
-                try:
-                    response.update(self._submit_with_2fa_recovery(
-                        slot=slot, raw=raw,
-                        schedule_id=schedule_id, course_id=course_id or schedule_id,
-                        players=players, holes=holes,
-                        pending_reservation_id=pending_reservation_id,
-                        captcha_token=captcha_token,
-                        customer_id=customer_id,
-                        request_code_callback=request_code_callback,
-                        request_id=req_id, emit=_emit,
-                        code_sink=code_used,
-                    ))
-                except ForeUpError as exc:
-                    # The slot's booking_fee_required flag is not trustworthy --
-                    # Montauk reports false and still charges -- so the fee path
-                    # cannot be gated on it. ForeUp saying so IS the signal.
-                    # We already hold the slot, so recover into the payment flow
-                    # rather than losing a race we had won.
-                    if "booking fee" not in str(exc).lower():
-                        raise
-                    fee_blocked.append(str(exc))
-
-            stage_latencies["reservation_submit"] = self._timed_stage(
-                "reservation_submit",
-                _do_submit,
+            response = self._finish_hold(
+                slot=slot, raw=raw,
+                schedule_id=schedule_id, course_id=course_id or schedule_id,
+                players=players, holes=holes,
+                pending_reservation_id=pending_reservation_id,
+                captcha_token=captcha_token,
+                customer_id=customer_id,
+                request_code_callback=request_code_callback,
+                request_id=req_id, emit=_emit,
+                stage_latencies=stage_latencies,
             )
-
-            if fee_blocked:
-                if not (request_code_callback and customer_id):
-                    raise ForeUpError(
-                        f"This course charges a booking fee and there is no way to "
-                        f"collect it here: {fee_blocked[0]}"
-                    )
-                _emit("booking_fee_detected", {"error": fee_blocked[0]})
-                fee_result = self._hold_and_request_payment(
-                    slot=slot, raw=raw, schedule_id=schedule_id,
-                    course_id=course_id or schedule_id,
-                    players=players, holes=holes,
-                    pending_reservation_id=pending_reservation_id,
-                    captcha_token=captcha_token, customer_id=customer_id,
-                    request_code_callback=request_code_callback,
-                    request_id=req_id, emit=_emit,
-                    existing_code=code_used[0] if code_used else "",
-                )
-                self._mark_idempotent_complete(idempotency_key)
-                total_ms = round((time.perf_counter() - flow_started) * 1000, 2)
-                self._log_flow(req_id, flow_started, total_ms, stage_latencies, "awaiting_payment")
-                return fee_result, BookingLatency(
-                    request_id=req_id, total_ms=total_ms, stages=stage_latencies
-                )
 
             self._mark_idempotent_complete(idempotency_key)
             total_ms = round((time.perf_counter() - flow_started) * 1000, 2)
-            self._log_flow(req_id, flow_started, total_ms, stage_latencies, "ok")
+            self._log_flow(req_id, flow_started, total_ms, stage_latencies,
+                           "awaiting_payment" if response.get("awaiting_payment") else "ok")
             return response, BookingLatency(request_id=req_id, total_ms=total_ms, stages=stage_latencies)
         except (RetryableHttpError, ForeUpError):
             self._release_idempotency_key(idempotency_key)
             self._log_flow(req_id, flow_started, None, stage_latencies, "error")
             raise
+
+    def _finish_hold(
+        self,
+        *,
+        slot: dict[str, Any],
+        raw: dict[str, Any],
+        schedule_id: str,
+        course_id: str,
+        players: int,
+        holes: int,
+        pending_reservation_id: str,
+        captcha_token: Optional[str],
+        customer_id: Optional[str],
+        request_code_callback: Optional[Callable[[str], str]],
+        request_id: str,
+        emit: Callable[[str, dict[str, Any]], None],
+        stage_latencies: Optional[dict[str, float]] = None,
+    ) -> dict[str, Any]:
+        """Turn a hold we already own into a booking -- or, on a course that
+        charges a booking fee, into a payment link.
+
+        There are two ways to win a hold: the polled path (`book_slot`) and a
+        pre-staged fire (`complete_prestaged_hold`). This is the ONE place that
+        finishes either. The fee recovery used to live inline in `book_slot`
+        only, so on 2026-10-10 Future Sight won three Bethpage holds, met "A
+        booking fee is required", had no recovery, and gave the race away. The
+        fee path had only ever been exercised through polling.
+
+        Returns the reservation response, or a dict with awaiting_payment=True
+        and the hosted payment URL.
+        """
+        def _pick(key: str, default: Any = "") -> Any:
+            val = raw.get(key, slot.get(key, default))
+            return default if val is None else val
+
+        common = dict(
+            slot=slot, raw=raw, schedule_id=schedule_id, course_id=course_id,
+            players=players, holes=holes,
+            pending_reservation_id=pending_reservation_id,
+            captcha_token=captcha_token, request_id=request_id, emit=emit,
+        )
+
+        # ---- Courses that charge a booking fee cannot be committed by us at
+        # all. On those, users/reservations only validates -- a captured browser
+        # checkout sends validate_only and gets {"valid":true} -- and the
+        # reservation is created when the payment processor calls back. So take
+        # the browser's route: get the code, validate with it, then ask for the
+        # hosted payment page and hand its URL back. The hold stays ours until
+        # it is paid. ----
+        # A true flag lets us skip a commit that would only be refused. A false
+        # one proves nothing -- see the recovery below.
+        if _pick("booking_fee_required") and request_code_callback and customer_id:
+            return self._hold_and_request_payment(
+                **common, customer_id=customer_id,
+                request_code_callback=request_code_callback,
+            )
+
+        # ---- Submit the reservation; if the course requires a booking code,
+        # ForeUp returns a 400 with that exact message -- recover by calling
+        # request_booking_code, waiting for the user to enter the emailed code,
+        # and retrying the same submission with the code. ----
+        response: dict[str, Any] = {}
+        code_used: list[str] = []
+        fee_blocked: list[str] = []
+
+        def _do_submit() -> None:
+            try:
+                response.update(self._submit_with_2fa_recovery(
+                    **common,
+                    customer_id=customer_id,
+                    request_code_callback=request_code_callback,
+                    code_sink=code_used,
+                ))
+            except ForeUpError as exc:
+                # The slot's booking_fee_required flag is not trustworthy --
+                # Montauk reports false and still charges -- so the fee path
+                # cannot be gated on it. ForeUp saying so IS the signal.
+                # We already hold the slot, so recover into the payment flow
+                # rather than losing a race we had won.
+                if "booking fee" not in str(exc).lower():
+                    raise
+                fee_blocked.append(str(exc))
+
+        submit_ms = self._timed_stage("reservation_submit", _do_submit)
+        if stage_latencies is not None:
+            stage_latencies["reservation_submit"] = submit_ms
+
+        if not fee_blocked:
+            return response
+
+        if not (request_code_callback and customer_id):
+            raise ForeUpError(
+                f"This course charges a booking fee and there is no way to "
+                f"collect it here: {fee_blocked[0]}"
+            )
+        emit("booking_fee_detected", {"error": fee_blocked[0]})
+        return self._hold_and_request_payment(
+            **common, customer_id=customer_id,
+            request_code_callback=request_code_callback,
+            existing_code=code_used[0] if code_used else "",
+        )
 
     def _hold_and_request_payment(
         self,
@@ -552,11 +580,12 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
     ) -> dict[str, Any]:
         """Finish the booking for a hold created by a pre-staged fire.
 
-        The hold already exists, so this runs only the reservation submit —
-        through the same shared path as a polled booking, 2FA recovery included.
-        `template` carries the per-course fields (side id, fees, booking class)
-        cached from a reference teesheet, standing in for the slot data a poll
-        would normally supply.
+        The hold already exists, so this runs only what follows it — through
+        `_finish_hold`, the same path a polled booking takes, so 2FA recovery
+        and booking-fee recovery behave identically on both. `template` carries
+        the per-course fields (side id, fees, booking class) cached from a
+        reference teesheet, standing in for the slot data a poll would supply.
+        Returns either the reservation response or an awaiting_payment dict.
         """
         req_id = request_id or str(uuid.uuid4())
 
@@ -570,7 +599,7 @@ class ForeUpBookingClient(ForeUpDiscoveryClient):
         synthetic_slot = {"time": target_time, "raw_time": target_time, "raw": template}
         self._acquire_idempotency_key(idempotency_key)
         try:
-            response = self._submit_with_2fa_recovery(
+            response = self._finish_hold(
                 slot=synthetic_slot, raw=template,
                 schedule_id=schedule_id, course_id=course_id or schedule_id,
                 players=players, holes=holes,

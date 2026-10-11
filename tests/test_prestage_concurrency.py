@@ -9,6 +9,8 @@ below were each bought with a lost race:
   (2026-08-30: T+0.000, T+0.568, T+2.443, T+4.204)
 * holds we win but do not book must go back to the sheet, not be squatted
 * exactly one booking may ever be completed
+* a won hold on a fee-charging course must end in a payment link, not be
+  given away (2026-10-10: three Bethpage holds won, all thrown back)
 """
 from __future__ import annotations
 
@@ -75,6 +77,7 @@ POLL_BOOKS: list[str] = []
 FIRES: list[tuple[str, float]] = []
 RELEASED: list[str] = []
 COMPLETED: list[str] = []
+REFRESHED: list[str] = []
 
 
 class FakeBooking:
@@ -99,8 +102,16 @@ class FakeBooking:
         RELEASED.append(pending_reservation_id)
         return True
 
-    def complete_prestaged_hold(self, *, target_time, **kw):
+    # What completing a pre-staged hold returns. None = a normal booking;
+    # a dict = that response (e.g. awaiting_payment on a fee-charging course).
+    COMPLETE_RESPONSE: dict | None = None
+    # Refresh results in order; once exhausted, refreshes keep succeeding.
+    REFRESH_RESULTS: list = []
+
+    def complete_prestaged_hold(self, *, target_time, pending_reservation_id="", **kw):
         COMPLETED.append(target_time)
+        if self.COMPLETE_RESPONSE is not None:
+            return {**self.COMPLETE_RESPONSE, "pending_reservation_id": pending_reservation_id}
         return {"success": True, "reservation_id": "R1", "TTID": "T1"}
 
     def book_slot(self, *, slot=None, **kw):
@@ -108,8 +119,9 @@ class FakeBooking:
         raise RuntimeError('{"success":false,"message":"Sorry, that tee time is '
                            'no longer available."}')
 
-    def refresh_pending_reservation(self, **kw):
-        return None
+    def refresh_pending_reservation(self, *, pending_reservation_id="", **kw):
+        REFRESHED.append(pending_reservation_id)
+        return FakeBooking.REFRESH_RESULTS.pop(0) if FakeBooking.REFRESH_RESULTS else None
 
 
 def _align_to_release(lead_s: float = 4.0) -> str:
@@ -131,9 +143,12 @@ def _align_to_release(lead_s: float = 4.0) -> str:
 
 def _run(accept: set[str], timeout_s: float = 30.0, preserve_fakes: bool = False) -> dict:
     POLLS.clear(); FIRES.clear(); RELEASED.clear(); COMPLETED.clear(); POLL_BOOKS.clear()
+    REFRESHED.clear()
     if not preserve_fakes:
         FakeDiscovery.SLOW_POLL_S = 0.05
         FakeDiscovery.POLL_SLOTS = []
+        FakeBooking.COMPLETE_RESPONSE = None
+        FakeBooking.REFRESH_RESULTS = []
     FakeBooking.ACCEPT = set(accept)
 
     app.ForeUpDiscoveryClient = FakeDiscovery
@@ -251,12 +266,66 @@ def test_win_landing_mid_poll_beats_the_poll_path():
     print("  ok: won hold taken before the poll path could submit")
 
 
+def test_fee_course_prestaged_win_ends_in_payment_link():
+    """A won pre-staged hold on a fee-charging course must hand back the link.
+
+    2026-10-10, Bethpage 2432: the burst won 08:36, 08:45 and 08:27 at T+2s.
+    The pre-staged completion had no booking-fee recovery (it only ever lived
+    in the poll path's book_slot), so "A booking fee is required" ended it, the
+    hold was abandoned, and the race was recorded as lost. The poll path would
+    have produced a $5 payment link -- as it did three times on 08-31.
+
+    The hold must then be kept alive while the user pays. That keepalive used
+    to be a daemon thread started just before the worker returned, so it died
+    with the process and never sent a refresh.
+    """
+    FakeBooking.COMPLETE_RESPONSE = {
+        "awaiting_payment": True,
+        "payment_url": "https://hostedpayments.example/pay?TransactionSetupID=abc",
+        "booking_fee_total": 5, "players": 1, "slot_time": "08:50",
+    }
+    # Two refreshes land, then the hold stops refreshing (paid or gone):
+    # the keepalive must notice and end on its own.
+    FakeBooking.REFRESH_RESULTS = [None, None, "400 gone", "400 gone", "400 gone"]
+    app.PAYMENT_HOLD_REFRESH_S = 0.2
+    try:
+        out = _run(accept={"08:50"}, preserve_fakes=True)
+    finally:
+        app.PAYMENT_HOLD_REFRESH_S = 8.0
+        FakeBooking.COMPLETE_RESPONSE = None
+        FakeBooking.REFRESH_RESULTS = []
+    events = out["events"]
+    if out["alive"]:
+        return _fail("worker never finished -- keepalive did not stop on failed refreshes")
+    if len(COMPLETED) != 1 or not COMPLETED[0].endswith("08:50"):
+        return _fail(f"expected the 08:50 hold to be completed once, got {COMPLETED}")
+    pay = [e for e in events if e.get("type") == "event" and e.get("stage") == "awaiting_payment"]
+    if not pay or not pay[0].get("payment_url"):
+        return _fail("no awaiting_payment event with a payment_url was emitted")
+    statuses = [e.get("status") for e in events if e.get("type") == "status"]
+    if "awaiting_payment" not in statuses or "succeeded" in statuses or "failed" in statuses:
+        return _fail(f"expected to end awaiting_payment, statuses were {statuses}")
+    if "TTID_0850" in RELEASED:
+        return _fail("the held tee time was released instead of kept for payment")
+    if POLL_BOOKS:
+        return _fail(f"poll path kept racing after the hold was won: {POLL_BOOKS}")
+    summary = [e for e in events if e.get("type") == "event" and e.get("stage") == "race_summary"]
+    outcome = (summary[0].get("race") or {}).get("outcome") if summary else None
+    if outcome != "awaiting_payment":
+        return _fail(f"race recorded as {outcome!r}, expected 'awaiting_payment'")
+    if REFRESHED.count("TTID_0850") < 3:
+        return _fail(f"hold was not kept alive after the race: refreshes={REFRESHED}")
+    print(f"  ok: payment link handed back, hold kept ({len(REFRESHED)} refreshes), "
+          f"race recorded as {outcome}")
+
+
 if __name__ == "__main__":
     os.environ["SNIPER_RACE_TIMEOUT_SECONDS"] = "4"
     os.environ["SNIPER_PRESTAGE_BURST_SECONDS"] = "2"
     for fn in (test_targets_fire_in_parallel, test_polling_runs_during_the_burst,
                test_extra_holds_are_released, test_single_win_books_once,
-               test_win_landing_mid_poll_beats_the_poll_path):
+               test_win_landing_mid_poll_beats_the_poll_path,
+               test_fee_course_prestaged_win_ends_in_payment_link):
         print(f"\n{fn.__name__}")
         try:
             fn()

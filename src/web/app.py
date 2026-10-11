@@ -156,6 +156,10 @@ class JobState:
 # A job stops competing once it reaches one of these.
 FINISHED_STATUSES = {"succeeded", "failed", "cancelled", "awaiting_payment"}
 
+# How often a fee-course hold is refreshed while the user pays. The browser's
+# own checkout refreshes about every 10s.
+PAYMENT_HOLD_REFRESH_S = 8.0
+
 
 def _racing_key(payload: dict[str, Any]) -> tuple:
     """Identity of the race a job is entering.
@@ -1719,6 +1723,88 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     break
                 prestage_stop.wait(0.25)
 
+        # The hold a fee-charging course left us holding, for the post-race
+        # keepalive. Set by _enter_awaiting_payment; read once the loop exits.
+        payment_hold: dict[str, str] = {}
+
+        def _enter_awaiting_payment(slot_time: str, slot: dict[str, Any],
+                                    response: dict[str, Any], submit_ms: float) -> None:
+            """A won hold on a course that charges a booking fee: surface the link.
+
+            Shared by the polled path and the pre-staged path. Until 1.08 this
+            lived inline in the poll loop only, so a pre-staged win that came
+            back awaiting_payment had nowhere to go.
+            """
+            ttid = str(response.get("pending_reservation_id", ""))
+            total = response.get("booking_fee_total", 0)
+            race.record_attempt(slot_time, "awaiting_payment",
+                                latency_ms=submit_ms, response=response)
+            race.awaiting_payment = True
+            payment_hold["ttid"] = ttid
+            _emit_event(
+                queue, phase="checkout", stage="awaiting_payment",
+                message=(
+                    f"SLOT HELD at {slot_time} — one step left. "
+                    f"This course charges a ${total} booking fee, and ForeUp only "
+                    f"creates the reservation once it is paid. Open the link below "
+                    f"and pay now; the tee time stays held for you until you do. "
+                    f"Nothing is booked until that payment goes through."
+                ),
+                terminal="awaiting_payment",
+                payment_url=response.get("payment_url", ""),
+                booking_fee_total=total,
+                reservation_id=ttid,
+                slot=slot,
+            )
+            queue.put({"type": "status", "status": "awaiting_payment"})
+
+        def _keep_payment_hold_alive(ttid: str) -> None:
+            """Refresh the held tee time while the user pays, like the browser does.
+
+            This used to be a daemon thread started just before the worker
+            returned -- and a Process exits the moment its target returns,
+            taking daemon threads with it, so it never sent a single refresh.
+            The hold was only ever kept alive during the 2FA code wait. Now the
+            worker itself stays up, after the race record is already flushed.
+
+            Stops on the first of: three refreshes in a row failing (the hold
+            was paid and converted, or is gone), a stop request, or
+            PAYMENT_HOLD_SECONDS (default 600).
+            """
+            hold_seconds = float(os.getenv("PAYMENT_HOLD_SECONDS", "600"))
+            if booking is None or not ttid or hold_seconds <= 0:
+                return
+            log = _logging.getLogger("src.web.sniper")
+            deadline = time.monotonic() + hold_seconds
+            ok = failures = 0
+            reason = "time limit reached"
+            while time.monotonic() < deadline:
+                if cmd_queue is not None:
+                    try:
+                        msg = cmd_queue.get(timeout=PAYMENT_HOLD_REFRESH_S)
+                        if isinstance(msg, dict) and msg.get("type") == "cancel":
+                            reason = "stopped by user"
+                            break
+                    except Empty:
+                        pass
+                else:
+                    time.sleep(PAYMENT_HOLD_REFRESH_S)
+                err = booking.refresh_pending_reservation(
+                    pending_reservation_id=ttid, request_id=request_id)
+                if err:
+                    failures += 1
+                    if failures >= 3:
+                        reason = f"refresh no longer accepted ({err[:200]})"
+                        break
+                else:
+                    failures = 0
+                    ok += 1
+            log.info("payment_hold_keepalive_ended",
+                     extra={"ttid": ttid, "refresh_ok": ok, "reason": reason})
+            _emit_event(queue, phase="checkout", stage="payment_hold_ended",
+                        message=f"Stopped keeping the {ttid} hold alive after {ok} "
+                                f"refresh(es): {reason}.")
+
         def _complete_prestage_win(ps_time: str, hold: dict[str, Any]) -> bool:
             """Turn a won hold into a booking. Main thread only."""
             nonlocal booked, booking_response, selected
@@ -1745,9 +1831,19 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     debug_callback=_sniper_debug,
                 )
                 submit_ms = round((time.perf_counter() - submit_started) * 1000, 2)
+                race.submit_to_confirm_ms = submit_ms
+                held_slot = {"time": ps_time, "available_spots": payload["players"],
+                             "green_fee": tmpl.get("green_fee", "?"), "raw": tmpl}
+                # A fee-charging course: the hold is ours but only a payment
+                # turns it into a tee time. Same hand-off as the poll path.
+                if prestage_response.get("awaiting_payment"):
+                    _enter_awaiting_payment(ps_time, held_slot, prestage_response, submit_ms)
+                    booked = True
+                    booking_response = prestage_response
+                    selected = held_slot
+                    return True
                 confirmed, reason = classify_reservation_response(prestage_response)
                 race.booking_confirmed = confirmed
-                race.submit_to_confirm_ms = submit_ms
                 race.record_attempt(
                     ps_time,
                     "confirmed" if confirmed else ("failed" if confirmed is False else "unconfirmed"),
@@ -1758,8 +1854,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 race.booked = True
                 booked = True
                 booking_response = prestage_response
-                selected = {"time": ps_time, "available_spots": payload["players"],
-                            "green_fee": tmpl.get("green_fee", "?"), "raw": tmpl}
+                selected = held_slot
                 if confirmed:
                     _emit_event(queue, phase="checkout", stage="booking_submit",
                                 message=f"Booking confirmed via pre-staged hold at {ps_time}",
@@ -1931,45 +2026,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     # needs a human. Keep refreshing the hold so it survives
                     # however long that takes.
                     if booking_response.get("awaiting_payment"):
-                        ttid = str(booking_response.get("pending_reservation_id", ""))
-                        total = booking_response.get("booking_fee_total", 0)
-                        race.record_attempt(
-                            candidate.get("time", "?"), "awaiting_payment",
-                            latency_ms=submit_ms, response=booking_response,
-                        )
-                        race.awaiting_payment = True
-                        _emit_event(
-                            queue, phase="checkout", stage="awaiting_payment",
-                            message=(
-                                f"SLOT HELD at {candidate.get('time','?')} — one step left. "
-                                f"This course charges a ${total} booking fee, and ForeUp only "
-                                f"creates the reservation once it is paid. Open the link below "
-                                f"and pay now; the tee time stays held for you until you do. "
-                                f"Nothing is booked until that payment goes through."
-                            ),
-                            terminal="awaiting_payment",
-                            payment_url=booking_response.get("payment_url", ""),
-                            booking_fee_total=total,
-                            reservation_id=ttid,
-                            slot=candidate,
-                        )
-                        queue.put({"type": "status", "status": "awaiting_payment"})
-
-                        # The browser refreshes its hold every ~10s; do the same
-                        # so a slow payment does not lose the slot we just won.
-                        stop_hold = Event()
-
-                        def _keep_hold_alive() -> None:
-                            while not stop_hold.wait(8.0):
-                                err = booking.refresh_pending_reservation(
-                                    pending_reservation_id=ttid, request_id=request_id
-                                )
-                                if err:
-                                    race.hold_refresh_failed += 1
-                                else:
-                                    race.hold_refresh_ok += 1
-
-                        Thread(target=_keep_hold_alive, daemon=True).start()
+                        _enter_awaiting_payment(candidate.get("time", "?"), candidate,
+                                                booking_response, submit_ms)
                         booked = True
                         selected = candidate
                         break
@@ -2102,6 +2160,7 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         if booked and race.awaiting_payment:
             _flush_race()
             queue.put({"type": "status", "status": "awaiting_payment"})
+            _keep_payment_hold_alive(payment_hold.get("ttid", ""))
             _finalize_worker()
             return
 
@@ -2304,7 +2363,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.07"
+APP_VERSION = "1.08"
 
 @app.get("/health")
 def health() -> dict[str, str]:
