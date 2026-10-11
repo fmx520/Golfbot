@@ -17,6 +17,7 @@ the subject: `git log --oneline --grep='(v0\.' -i`.
 
 | Version | Date | Summary | Commit |
 |---|---|---|---|
+| 1.10 | 2026-10-11 | Disagreeing grids split Future Sight's targets; no fake grids from two intervals meeting; harvest workflow exit fix | `dc1fbb7` |
 | 1.09 | 2026-10-11 | Log whether the CPU quota throttles us during a race (`timing.cpu_throttle`); logging only | `7d86abc` |
 | 1.08 | 2026-10-11 | A Future Sight hold on a fee course now ends in a payment link (fee recovery was poll-path only); payment hold keepalive actually runs | `adad13f` |
 | 1.07 | 2026-09-20 | Take a hold won mid-poll before the poll path submits against it | `7a58f50` |
