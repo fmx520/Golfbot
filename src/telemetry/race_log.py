@@ -104,6 +104,93 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Where the container's CPU-throttling counters live. cgroup v2 first (one
+# unified cpu.stat), then the v1 layouts. The container's counters cover every
+# process in it -- the web server and the race worker together, which is what
+# shares the CPU quota.
+_CGROUP_V2_STAT = "/sys/fs/cgroup/cpu.stat"
+_CGROUP_V1_STATS = ("/sys/fs/cgroup/cpu/cpu.stat", "/sys/fs/cgroup/cpu,cpuacct/cpu.stat")
+_CGROUP_V1_USAGE = ("/sys/fs/cgroup/cpuacct/cpuacct.usage", "/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage")
+
+
+def _read_kv(path: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    with open(path) as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+                out[parts[0]] = int(parts[1])
+    return out
+
+
+def read_cpu_throttle(
+    v2_stat: str = _CGROUP_V2_STAT,
+    v1_stats: tuple[str, ...] = _CGROUP_V1_STATS,
+    v1_usage: tuple[str, ...] = _CGROUP_V1_USAGE,
+) -> Optional[dict[str, int]]:
+    """Snapshot the kernel's CPU-throttle counters for this container.
+
+    Returns {periods, throttled_periods, throttled_usec, usage_usec} -- usage
+    may be absent -- or None where the counters cannot be read (a laptop, a
+    non-Linux host). Never raises: this is measurement, and a race must not
+    depend on it.
+
+    Why it exists: STATE.md has argued both ways about whether our 0.15-CPU
+    plan slows the release instant down. Render's metrics average over 30s,
+    which hides a sub-second burst. These counters do not: the kernel bumps
+    throttled_periods every 100ms window in which we hit the quota and had to
+    wait. Zero across a race settles it.
+    """
+    try:
+        if os.path.exists(v2_stat):
+            kv = _read_kv(v2_stat)
+            if "nr_periods" in kv:
+                snap = {
+                    "periods": kv.get("nr_periods", 0),
+                    "throttled_periods": kv.get("nr_throttled", 0),
+                    "throttled_usec": kv.get("throttled_usec", 0),
+                }
+                if "usage_usec" in kv:
+                    snap["usage_usec"] = kv["usage_usec"]
+                return snap
+        for path in v1_stats:
+            if not os.path.exists(path):
+                continue
+            kv = _read_kv(path)
+            snap = {
+                "periods": kv.get("nr_periods", 0),
+                "throttled_periods": kv.get("nr_throttled", 0),
+                # v1 reports nanoseconds.
+                "throttled_usec": kv.get("throttled_time", 0) // 1000,
+            }
+            for upath in v1_usage:
+                if os.path.exists(upath):
+                    with open(upath) as fh:
+                        snap["usage_usec"] = int(fh.read().strip() or 0) // 1000
+                    break
+            return snap
+    except Exception:  # noqa: BLE001 -- measurement must never break a race
+        return None
+    return None
+
+
+def cpu_throttle_delta(before: Optional[dict[str, int]],
+                       after: Optional[dict[str, int]],
+                       seconds: float) -> Optional[dict[str, Any]]:
+    """What happened to our CPU between two snapshots, in readable units."""
+    if not before or not after:
+        return None
+    out: dict[str, Any] = {
+        "seconds": round(seconds, 2),
+        "periods": after["periods"] - before["periods"],
+        "throttled_periods": after["throttled_periods"] - before["throttled_periods"],
+        "throttled_ms": round((after["throttled_usec"] - before["throttled_usec"]) / 1000, 1),
+    }
+    if "usage_usec" in before and "usage_usec" in after:
+        out["cpu_used_ms"] = round((after["usage_usec"] - before["usage_usec"]) / 1000, 1)
+    return out
+
+
 def _sink_headers() -> dict[str, str]:
     """Build sink headers from env.
 
@@ -310,6 +397,12 @@ class RaceRecorder:
     captcha_refreshes: int = 0
     captcha_stale_at_submit: bool = False
 
+    # Did the container hit its CPU quota during the race? Windows measured from
+    # a baseline taken before the release: "release" ends at T+5s (where races
+    # are decided), "race" at the end. None where the counters are unreadable.
+    # Lives inside timing (jsonb), so it needs no column.
+    cpu_throttle: Optional[dict[str, Any]] = None
+
     booked: bool = False
     # None until a booking is attempted; False when ForeUp answered 200 without
     # anything identifying a reservation.
@@ -320,6 +413,8 @@ class RaceRecorder:
 
     _started: float = field(default_factory=time.perf_counter)
     _release_monotonic: Optional[float] = None
+    _cpu_baseline: Optional[dict[str, int]] = None
+    _cpu_baseline_at: float = 0.0
 
     # ------------------------------------------------------------------
     # recording
@@ -327,6 +422,23 @@ class RaceRecorder:
     def mark_release_instant(self, release_monotonic: float) -> None:
         """Anchor the release moment on the monotonic clock for offset math."""
         self._release_monotonic = release_monotonic
+
+    def mark_cpu_baseline(self) -> None:
+        """Snapshot the CPU-throttle counters. Call while idle, before T+0."""
+        self._cpu_baseline = read_cpu_throttle()
+        self._cpu_baseline_at = time.perf_counter()
+
+    def record_cpu_window(self, name: str) -> None:
+        """Record throttling since the baseline under `name`. Never raises."""
+        try:
+            delta = cpu_throttle_delta(self._cpu_baseline, read_cpu_throttle(),
+                                       time.perf_counter() - self._cpu_baseline_at)
+            if delta is not None:
+                if self.cpu_throttle is None:
+                    self.cpu_throttle = {}
+                self.cpu_throttle[name] = delta
+        except Exception:  # noqa: BLE001 -- measurement must never break a race
+            pass
 
     def record_rewarm(self, duration_ms: float, overran: bool) -> None:
         self.rewarm_ms = round(duration_ms, 2)
@@ -505,6 +617,7 @@ class RaceRecorder:
                 "detect_to_submit_ms": self.detect_to_submit_ms,
                 "submit_to_confirm_ms": self.submit_to_confirm_ms,
                 "total_race_ms": self.total_race_ms,
+                "cpu_throttle": self.cpu_throttle,
             },
             "polls": self.polls.as_dict(),
             "attempts": self.attempts,

@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import Process, Queue
 from pathlib import Path
 from queue import Empty
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, Timer
 from typing import Any
 from urllib.parse import urlparse
 
@@ -996,12 +996,20 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         except Exception:  # noqa: BLE001 — the registry must never affect a race
             pass
 
+    # The T+5s CPU-throttle reading, armed just before the release. Held here so
+    # a race that ends early can cancel it.
+    cpu_window_timer: list[Any] = []
+
     def _flush_race() -> None:
         """Emit the race record and surface the one-line verdict in the UI."""
         # Every terminal path funnels through here, so this is the one place
         # that guarantees a race's grid observation is banked exactly once. It
         # no-ops on the arming-failure paths, where nothing was polled yet.
         _learn_grid_from_race()
+        for t in cpu_window_timer:
+            t.cancel()
+        if race._cpu_baseline is not None:
+            race.record_cpu_window("race")
         try:
             record = race.flush()
             _emit_event(queue, phase="confirm", stage="race_summary",
@@ -1463,6 +1471,14 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             return
 
         remaining = release_monotonic - time.perf_counter()
+        # CPU-throttle measurement (logging only). The baseline is read here,
+        # while we are only waiting for the release; the T+5s reading runs on
+        # its own timer thread, never the race's. See STATE.md.
+        race.mark_cpu_baseline()
+        cpu_timer = Timer(max(0.0, remaining) + 5.0, race.record_cpu_window, args=("release",))
+        cpu_timer.daemon = True
+        cpu_timer.start()
+        cpu_window_timer.append(cpu_timer)
         if remaining > 0:
             time.sleep(remaining)
 
@@ -2363,7 +2379,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.08"
+APP_VERSION = "1.09"
 
 @app.get("/health")
 def health() -> dict[str, str]:

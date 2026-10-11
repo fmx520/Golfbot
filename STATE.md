@@ -127,10 +127,24 @@ with almost no parsing, and v1.07 means a slow poll no longer costs the win.
 On 09-19 the poll took 3.9s and we won regardless. **Do not spend money here**
 unless the poll path becomes load-bearing again.
 
-**Throttle instrumentation** (sampling `/sys/fs/cgroup/cpu.stat` into
-`race.timing`) was designed to settle the above with a number. It is pure
-logging, zero hot-path cost, and `timing` is jsonb so it needs no migration.
-Deliberately not built — it answers a question already decided.
+**Throttle instrumentation — built in v1.09.** The question came back once the
+cost that matters moved from the poll to the T+0 holds (0.9–2.2s each on 10-10,
+against 247–309ms for the same race's requests at T+4–8s). Render's CPU metrics
+for both Future Sight releases peak at ~7–9% of the 0.15 limit, but they are
+30s averages and can hide a sub-second burst; the kernel counters cannot.
+
+Every race now records `timing.cpu_throttle`, from a baseline read just before
+the release: `release` (to T+5s, where races are decided) and `race` (to the
+end). `throttled_periods` counts 100ms windows in which we hit the quota and
+waited; `throttled_ms` is the total wait. **Zero in `release` across a few races
+means CPU is not slowing the holds — stop spending thought on a bigger plan.**
+Non-zero there is the first real evidence for one. `periods: 0` means no quota
+was enforced at all. Logging only: reads happen before T+0 and on a timer thread.
+
+```sql
+select left(run_id,12) run, timing->'cpu_throttle'->'release' release_window
+from races where timing ? 'cpu_throttle' order by recorded_at desc;
+```
 
 **Detection evasion** (proxy/IP rotation, TLS fingerprint spoofing,
 human-mimicking timing) is out of scope and was declined. Not revisitable.
@@ -228,6 +242,7 @@ No pytest; each file is standalone and self-reporting. A fresh container needs
 ```bash
 python3 tests/test_prestage_concurrency.py   # ~3 min: aligns to minute boundaries
 python3 tests/test_fee_recovery_paths.py   # both ways of winning a hold reach the payment link
+python3 tests/test_cpu_throttle.py        # CPU-throttle logging reads cgroup v1/v2, never raises
 python3 tests/test_grid_inference.py
 python3 tests/test_grid_no_downgrade.py
 python3 tests/test_sink_drift.py
