@@ -28,6 +28,14 @@ from typing import Any, Iterable, Optional
 # very fast sheet.
 MIN_PLAUSIBLE_INTERVAL_MIN = 5
 
+# A common divisor this small is only believed when two open times are actually
+# that far apart. Otherwise it is usually two real intervals meeting -- a
+# 10-minute day running into a 15-minute twilight has GCD 5, and calling that a
+# consistent 5-minute grid would aim half of Future Sight's holds at times that
+# do not exist. Real 9/10-minute sheets clear this bar on the GCD alone, even
+# when only every second or third slot is open (gaps 18 and 27 give 9).
+MIN_UNOBSERVED_INTERVAL_MIN = 7
+
 
 def _to_minutes(value: str) -> Optional[int]:
     """Parse 'HH:MM', 'YYYY-MM-DD HH:MM' or 'HH:MM:SS' into minutes past midnight."""
@@ -143,9 +151,19 @@ def analyze_teesheet_grid(times: Iterable[str]) -> TeeGrid:
     for d in deltas:
         common = gcd(common, d)
 
-    if common >= MIN_PLAUSIBLE_INTERVAL_MIN:
+    if common >= MIN_PLAUSIBLE_INTERVAL_MIN and (
+        common >= MIN_UNOBSERVED_INTERVAL_MIN or common in deltas
+    ):
         interval = common
         shares_common_grid = True
+    elif common >= MIN_PLAUSIBLE_INTERVAL_MIN:
+        interval = common
+        shares_common_grid = False
+        grid.notes.append(
+            f"Gaps ({sorted(set(deltas))}min) only share a {common}min divisor, and no two "
+            f"open times are actually {common}min apart — this looks like two different "
+            f"intervals meeting, not a {common}-minute sheet."
+        )
     else:
         interval = smallest
         shares_common_grid = False

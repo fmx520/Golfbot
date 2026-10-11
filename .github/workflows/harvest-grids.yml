@@ -38,8 +38,12 @@ jobs:
           RACE_LOG_WEBHOOK_URL: ${{ secrets.RACE_LOG_WEBHOOK_URL }}
           RACE_LOG_WEBHOOK_TOKEN: ${{ secrets.RACE_LOG_WEBHOOK_TOKEN }}
         run: |
-          python3 scripts/harvest_grids.py
-          code=$?
+          # Actions runs this step under `bash -e`, so a bare non-zero exit
+          # ends the step right here -- before `code=$?` ever runs -- and the
+          # "partial coverage is fine" handling below never happened. Capture
+          # the code without letting -e see a failure.
+          code=0
+          python3 scripts/harvest_grids.py || code=$?
           # Exit 1 means partial coverage -- some dates were booked solid or
           # a teesheet was unreadable, which is normal week to week and gets
           # picked up on a later run. That is not a workflow failure. Exit 2

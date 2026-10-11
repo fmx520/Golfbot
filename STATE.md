@@ -86,6 +86,12 @@ That is why nearly every `course_grids` row still reads `updated_at 09-01 09:57`
 `github.com/fmx520/Golfbot/settings/secrets/actions`; the same values are
 already Render env vars.
 
+Even with the secrets set, the workflow would have kept failing until v1.10:
+Actions runs `run:` steps under `bash -e`, so the harvester's normal "partial
+coverage" exit 1 ended the step before `code=$?` ran. Fixed (`|| code=$?`). As
+of 10-11 the only fresh grids are the ones races learn (2432 Sat, 2436 Sat);
+everything else dates from 08-30–09-01.
+
 **Rotate the Supabase service key before copying it there** — it was pasted into
 a chat transcript and is considered exposed. The DB password from that same
 transcript also still needs rotating.
@@ -165,6 +171,30 @@ Written because each one cost real time this session.
   it was not. Both paths now go through `_finish_hold` in the client and
   `_enter_awaiting_payment` in the worker. **Anything that changes what happens
   after a hold is won goes there, not into one path.**
+- **Grid choice never looks at age — so disagreeing grids now split the shots
+  (v1.10).** Arming ranks the live reference read and the stored grid by
+  window coverage, then trustworthiness, then times seen. Tonight's live read
+  is usually a thin evening sample, so a weeks-old stored grid that covers the
+  morning beats it every time. If a course changes its sheet, all six holds
+  would go to times that no longer exist (polling still runs, so this costs
+  the head start, not the race). When a second grid with ≥5 observations
+  would aim at different times, targets are now interleaved between the two
+  and a `prestage_grid` decision says so. A coarser view of the same sheet (an
+  18-minute read of a 9-minute grid) does not count as disagreeing.
+- **`grid.py` used to read two intervals meeting as one fake grid.** A
+  10-minute day into a 15-minute twilight has GCD 5 and was reported as a
+  *consistent* 5-minute sheet. A divisor under 7 is now believed only if two
+  open times are actually that far apart. 9/10-minute sheets are unaffected.
+- **"Bethpage Red runs 10 minutes in the morning" (in `_sample_covers`'
+  docstring) is contradicted by October data**: holds accepted at 08:27–08:45
+  on 10-10 and the 10-17 release sheet itself both put Red mornings on the
+  same 9-minute @ :03 grid as its afternoons. Either the sheet changed with the
+  season or the original diagnosis was the booking-class problem v0.97 fixed.
+  Sheets are not fixed facts — which is why the split above exists.
+- **The live reference read is stored under the play date's weekday**, even
+  when it came from tomorrow's sheet (1 row today: 2436 "Monday" learned from
+  Tuesday 09-01). Harmless for targeting — interval and phase are per-course —
+  but that row's template (class, fee) is the wrong day's. Not yet fixed.
 - **The payment-hold keepalive never ran before v1.08.** It was a daemon thread
   started just before the worker returned, and a `Process` exits when its target
   returns, killing daemon threads — zero refreshes were ever sent while a user
@@ -243,6 +273,7 @@ No pytest; each file is standalone and self-reporting. A fresh container needs
 python3 tests/test_prestage_concurrency.py   # ~3 min: aligns to minute boundaries
 python3 tests/test_fee_recovery_paths.py   # both ways of winning a hold reach the payment link
 python3 tests/test_cpu_throttle.py        # CPU-throttle logging reads cgroup v1/v2, never raises
+python3 tests/test_grid_targeting.py      # no fake grids from two intervals; disagreeing grids both get shots
 python3 tests/test_grid_inference.py
 python3 tests/test_grid_no_downgrade.py
 python3 tests/test_sink_drift.py

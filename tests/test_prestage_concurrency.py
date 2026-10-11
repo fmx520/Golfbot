@@ -11,6 +11,8 @@ below were each bought with a lost race:
 * exactly one booking may ever be completed
 * a won hold on a fee-charging course must end in a payment link, not be
   given away (2026-10-10: three Bethpage holds won, all thrown back)
+* when a stored grid and tonight's sheet disagree, both get shots -- a stale
+  grid must not quietly aim every hold at times that no longer exist
 """
 from __future__ import annotations
 
@@ -51,14 +53,16 @@ class FakeDiscovery:
     def resolve_booking_class(self, teesheet_id, requested=""):
         return requested or "50294"
 
+    # Reference sheet for grid learning: a thin evening sample, which is
+    # exactly the shape that used to disarm Future Sight.
+    REF_TIMES = [(16, 20), (16, 30), (16, 40), (16, 50)]
+
     def lookup_availability(self, **kw):
-        # Reference sheet for grid learning: a thin evening sample, which is
-        # exactly the shape that used to disarm Future Sight.
         return [
             {"time": f"2026-09-07 {h:02d}:{m:02d}", "raw": {"booking_class_id": "50294",
                                                             "teesheet_side_id": "1014",
                                                             "green_fee": 80}}
-            for h, m in [(16, 20), (16, 30), (16, 40), (16, 50)]
+            for h, m in FakeDiscovery.REF_TIMES
         ]
 
     def lookup_availability_fast(self, **kw):
@@ -141,7 +145,8 @@ def _align_to_release(lead_s: float = 4.0) -> str:
     return (datetime.fromtimestamp(nxt, app.EAST_COAST_TZ)).strftime("%H:%M")
 
 
-def _run(accept: set[str], timeout_s: float = 30.0, preserve_fakes: bool = False) -> dict:
+def _run(accept: set[str], timeout_s: float = 30.0, preserve_fakes: bool = False,
+         payload_overrides: dict | None = None) -> dict:
     POLLS.clear(); FIRES.clear(); RELEASED.clear(); COMPLETED.clear(); POLL_BOOKS.clear()
     REFRESHED.clear()
     if not preserve_fakes:
@@ -167,6 +172,11 @@ def _run(accept: set[str], timeout_s: float = 30.0, preserve_fakes: bool = False
         "username": "u", "password": "p",
         "timeout_seconds": 6,
     }
+    for k, v in (payload_overrides or {}).items():
+        if v is None:
+            payload.pop(k, None)
+        else:
+            payload[k] = v
     q: Queue = Queue()
     cq: Queue = Queue()
     t = threading.Thread(target=app._sniper_worker_main,
@@ -319,13 +329,51 @@ def test_fee_course_prestaged_win_ends_in_payment_link():
           f"race recorded as {outcome}")
 
 
+def test_disagreeing_grids_split_the_targets():
+    """A stale stored grid must not silently take every shot.
+
+    The ranking prefers a grid that covers the window and has been seen more,
+    and never looks at age -- so a six-week-old 9-minute grid beats tonight's
+    live 10-minute read every time. If the course changed its sheet, all six
+    holds would go to times that no longer exist. Both grids must get shots.
+    """
+    from src.telemetry import grid_store
+    stored = {"interval_minutes": 9, "anchor_phase": 3, "first_time": "07:00",
+              "last_time": "17:00", "observed_count": 40, "source_date": "2026-09-01",
+              "template": {"booking_class_id": "50294", "teesheet_side_id": "1014",
+                           "green_fee": 80}}
+    real_fetch = grid_store.fetch_grid
+    grid_store.fetch_grid = lambda **kw: dict(stored)
+    FakeDiscovery.REF_TIMES = [(16, 10), (16, 20), (16, 30), (16, 40), (16, 50), (17, 0)]
+    try:
+        out = _run(accept=set(), payload_overrides={
+            "prestage_times": None, "time_start": "08:00", "time_end": "09:00"})
+    finally:
+        grid_store.fetch_grid = real_fetch
+        FakeDiscovery.REF_TIMES = [(16, 20), (16, 30), (16, 40), (16, 50)]
+    fired = sorted({t for t, _ in FIRES})
+    nine_only = [t for t in fired if int(t[3:]) % 10 != 0]       # 08:09, 08:18, 08:27 ...
+    ten_only = [t for t in fired if int(t[:2]) * 60 + int(t[3:]) not in
+                {480 + 9 * k for k in range(8)}]                   # 08:10, 08:20 ...
+    if not fired:
+        return _fail("no pre-staged holds fired at all")
+    if not nine_only or not ten_only:
+        return _fail(f"targets {fired} come from one grid only -- the other got no shots")
+    split = [e for e in out["events"] if e.get("type") == "event"
+             and e.get("stage") == "prestage_grid" and "disagree" in str(e.get("message"))]
+    if not split:
+        return _fail("no prestage_grid event explaining the split")
+    print(f"  ok: fired {fired} -- stored 9-min grid got {nine_only}, live 10-min grid got {ten_only}")
+
+
 if __name__ == "__main__":
     os.environ["SNIPER_RACE_TIMEOUT_SECONDS"] = "4"
     os.environ["SNIPER_PRESTAGE_BURST_SECONDS"] = "2"
     for fn in (test_targets_fire_in_parallel, test_polling_runs_during_the_burst,
                test_extra_holds_are_released, test_single_win_books_once,
                test_win_landing_mid_poll_beats_the_poll_path,
-               test_fee_course_prestaged_win_ends_in_payment_link):
+               test_fee_course_prestaged_win_ends_in_payment_link,
+               test_disagreeing_grids_split_the_targets):
         print(f"\n{fn.__name__}")
         try:
             fn()

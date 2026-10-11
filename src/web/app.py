@@ -156,6 +156,11 @@ class JobState:
 # A job stops competing once it reaches one of these.
 FINISHED_STATUSES = {"succeeded", "failed", "cancelled", "awaiting_payment"}
 
+# A grid needs at least this many observed times before it can claim half of
+# Future Sight's targets from the grid the ranking chose. Below it, a sample is
+# too thin to be evidence the chosen grid is wrong.
+GRID_RIVAL_MIN_SEEN = 5
+
 # How often a fee-course hold is refreshed while the user pays. The browser's
 # own checkout refreshes about every 10s.
 PAYMENT_HOLD_REFRESH_S = 8.0
@@ -227,6 +232,31 @@ def _sample_covers(first: str, last: str, start: str, end: str) -> bool:
     if None in (lo, hi, ws, we):
         return False
     return lo <= we and ws <= hi
+
+
+def _grids_disagree(interval_a: int, phase_a: int, interval_b: int, phase_b: int) -> bool:
+    """Would these two grids aim at different tee times?
+
+    Not when they are the same rhythm, and not when one is a coarser view of
+    the other -- an 18-minute grid learned from two open times sits entirely on
+    the 9-minute grid with the same phase, it is just sparser.
+    """
+    a = (int(interval_a), int(phase_a) % int(interval_a))
+    b = (int(interval_b), int(phase_b) % int(interval_b))
+    if a == b:
+        return False
+    (fine_i, fine_p), (coarse_i, coarse_p) = sorted([a, b])
+    return not (coarse_i % fine_i == 0 and coarse_p % fine_i == fine_p)
+
+
+def _interleave_targets(first: list[str], second: list[str], cap: int) -> list[str]:
+    """Alternate two target lists, earliest of each first, no repeats."""
+    out: list[str] = []
+    for i in range(max(len(first), len(second))):
+        for src in (first, second):
+            if i < len(src) and src[i] not in out:
+                out.append(src[i])
+    return out[:cap]
 
 
 def _template_near(slots: list[dict[str, Any]], when: str) -> dict[str, Any]:
@@ -1281,15 +1311,44 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
 
             if chosen:
                 template = chosen["template"]
+                user_targets = bool(raw_targets)
                 if fs_enabled and not raw_targets:
                     raw_targets = _gen_targets(chosen["interval"], chosen["phase"])
+                    # Two credible grids that would aim at different times: the
+                    # ranking above prefers coverage and observation count and
+                    # never looks at age, so a stale stored grid beats tonight's
+                    # live read every time. If a course changed its sheet, every
+                    # hold would go to a time that no longer exists. The burst is
+                    # parallel and a rejection holds nothing, so do not bet the
+                    # race on the ranking -- aim half the shots at each.
+                    rival = next(
+                        (c for c in cands
+                         if c is not chosen and c["seen"] >= GRID_RIVAL_MIN_SEEN
+                         and _grids_disagree(chosen["interval"], chosen["phase"],
+                                             c["interval"], c["phase"])),
+                        None,
+                    )
+                    if rival and raw_targets:
+                        rival_targets = _gen_targets(rival["interval"], rival["phase"], cap=999)
+                        if rival_targets:
+                            raw_targets = _interleave_targets(raw_targets, rival_targets, 6)
+                            _emit_event(queue, phase="sniper", stage="prestage_grid",
+                                        message=f"Future Sight: two grids disagree about this course — "
+                                                f"{chosen['label']} ({chosen['seen']} times) and "
+                                                f"{rival['label']} ({rival['seen']} times). One of them may "
+                                                f"be out of date, so targets are split between both: "
+                                                f"{', '.join(raw_targets)}.")
                     if not raw_targets:
                         _emit_event(queue, phase="sniper", stage="prestage_window",
                                     message=f"Future Sight: no tee times on {chosen['label']} fall inside "
                                             f"your {win_start}–{win_end} window — widen it. Falling back "
                                             f"to pure polling.")
+                # Only targets a person typed are checked against the grid;
+                # generated ones are on a grid by construction (and when split,
+                # deliberately on two).
                 off = [t for t in raw_targets
-                       if (_hhmm_to_min(t) or 0) % chosen["interval"] != chosen["phase"] % chosen["interval"]]
+                       if (_hhmm_to_min(t) or 0) % chosen["interval"] != chosen["phase"] % chosen["interval"]
+                       ] if user_targets else []
                 if off:
                     _emit_event(queue, phase="confirm", stage="terminal",
                                 message=f"Future Sight: {', '.join(off)} are not on {chosen['label']}. "
@@ -2379,7 +2438,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.09"
+APP_VERSION = "1.10"
 
 @app.get("/health")
 def health() -> dict[str, str]:
