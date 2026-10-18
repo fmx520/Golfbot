@@ -171,6 +171,39 @@ Written because each one cost real time this session.
   it was not. Both paths now go through `_finish_hold` in the client and
   `_enter_awaiting_payment` in the worker. **Anything that changes what happens
   after a hold is won goes there, not into one path.**
+- **A course's rhythm does not say where its bookable sheet starts (v1.11).**
+  Targets used to be the earliest six grid times in the user's window. On
+  **10-17** the window opened at 07:00: Future Sight fired 48 holds at Red
+  07:06–07:51 and Black 07:00–07:50, every one "Time not available" (some in
+  ~220ms, so not slowness), while the fullest sheet seen at that release
+  started at **08:18 (Red) and 09:00 (Black)**. 10-10 agrees: Red 08:00/08:09
+  refused, 08:27–08:45 won. Whether earlier times are not bookable online for
+  the class or are gone before any hold lands, aiming there wins nothing. Now
+  `grid_store.release_floor` takes the earliest time seen open on a sheet read
+  *at a release* (play date ≥7 days after the read, in New York time; ≥20 times
+  seen — a 4-time Black Sunday read once said 16:20) for the same weekday, and
+  targets start there; a `prestage_grid` decision says so. Polling still covers
+  the whole window. Trade-off: if a release read caught the sheet after its
+  first times went, the floor is late — it costs earliness, not the win, and a
+  wider read at a later release replaces it.
+- **Firing six holds at once over one HTTP/2 connection is not fully
+  thread-safe.** 10-17, Red: one first-round shot (07:15) never left —
+  `deque mutated during iteration` from HPACK header encoding in h2, two burst
+  threads encoding headers on the shared connection at once. First occurrence
+  in any race; cost nothing that night (the time was unbookable) but can cost a
+  real shot. Not changed — the connection layer is load-bearing and the user
+  has asked not to touch it without evidence. This is the first such evidence.
+- **First CPU-throttle numbers (v1.09 logging), 10-17:** in the 15s release
+  window, 3 throttled 100ms periods totalling ~290ms, with two races running at
+  once. Not zero — the first evidence CPU can add delay at the release — but the
+  window is 15s wide, so it does not show whether those landed at T+0. Both
+  races report identical numbers because the counters are container-wide.
+- **Grid rows older than 45 days can now be overwritten by thin reads.** That is
+  the designed staleness rule; the 08-30–09-01 rows crossed it 10-15. Rows that
+  races refresh (the Saturdays) stay protected. The harvest secrets (open item
+  1) would keep the rest fresh. `test_grid_no_downgrade.py` hard-coded an 08-31
+  fixture and started failing on 10-15 for the same reason — its dates are now
+  relative to today.
 - **Grid choice never looks at age — so disagreeing grids now split the shots
   (v1.10).** Arming ranks the live reference read and the stored grid by
   window coverage, then trustworthiness, then times seen. Tonight's live read

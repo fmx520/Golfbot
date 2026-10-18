@@ -322,6 +322,53 @@ def infer_grid(*, course_id: str, day_of_week: int) -> Optional[dict[str, Any]]:
     }
 
 
+# Where Future Sight should start aiming. The rhythm (interval + phase) belongs
+# to the course, but the first time that is actually bookable online does not
+# show up in it: on 2026-10-17 Future Sight fired 48 holds at Red 07:06-07:51
+# and Black 07:00-07:50, every one refused, while the fullest sheet seen at that
+# release started at 08:18 (Red) and 09:00 (Black) -- and on 10-10 Red's 08:00
+# and 08:09 were refused while 08:27-08:45 were won. Times earlier than that are
+# either not bookable online for the class or gone before any hold can land;
+# either way a shot there wins nothing.
+#
+# Only a sheet read AT a release says where bookable times start: a harvest or
+# reference read days later has had its mornings booked away. Release reads are
+# recognised by date -- the race banks the play date's sheet the evening it
+# opens, a week ahead -- and need enough times seen to describe the sheet: a
+# 4-time read once recorded Black's Sunday as starting at 16:20, which as a
+# floor would quietly push every target out of a morning window.
+RELEASE_READ_MIN_DAYS_AHEAD = 7
+RELEASE_FLOOR_MIN_SEEN = 20
+
+
+def release_floor(row: Optional[dict[str, Any]]) -> Optional[str]:
+    """Earliest time seen open on a release-day sheet, as 'HH:MM', or None."""
+    if not row:
+        return None
+    first = str(row.get("first_time") or "")
+    if _hhmm_minutes(first) is None:
+        return None
+    if int(row.get("observed_count") or 0) < RELEASE_FLOOR_MIN_SEEN:
+        return None
+    try:
+        from datetime import date as _date, datetime as _dt
+        from zoneinfo import ZoneInfo
+        y, m, d = (int(x) for x in str(row.get("source_date") or "").split("-")[:3])
+        played = _date(y, m, d)
+        stamp = str(row.get("updated_at") or "").replace(" ", "T").replace("Z", "+00:00")
+        # Postgres renders "+00"; fromisoformat wants "+00:00".
+        if re.search(r"[+-]\d{2}$", stamp):
+            stamp += ":00"
+        # The release is an evening in New York; reading the date in UTC would
+        # roll an 8pm EST release into the next day and miss it.
+        read_on = _dt.fromisoformat(stamp).astimezone(ZoneInfo("America/New_York")).date()
+    except (ValueError, TypeError):
+        return None
+    if (played - read_on).days < RELEASE_READ_MIN_DAYS_AHEAD:
+        return None
+    return first
+
+
 def matches_stored_grid(time_str: str, stored: dict[str, Any]) -> Optional[bool]:
     """Validate a target against a stored grid row. None when the row is unusable."""
     interval = stored.get("interval_minutes")

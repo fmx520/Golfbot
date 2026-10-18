@@ -13,6 +13,8 @@ below were each bought with a lost race:
   given away (2026-10-10: three Bethpage holds won, all thrown back)
 * when a stored grid and tonight's sheet disagree, both get shots -- a stale
   grid must not quietly aim every hold at times that no longer exist
+* holds aim no earlier than the first time a release has shown bookable
+  (2026-10-17: 48 holds at 07:00-07:51 refused; the sheet opened 08:18/09:00)
 """
 from __future__ import annotations
 
@@ -366,6 +368,40 @@ def test_disagreeing_grids_split_the_targets():
     print(f"  ok: fired {fired} -- stored 9-min grid got {nine_only}, live 10-min grid got {ten_only}")
 
 
+def test_holds_start_at_the_release_floor():
+    """Holds aim from where bookable times start, not from the window start.
+
+    2026-10-17: the window opened at 07:00, so all six targets went to 07:00-07:51
+    on Black and 07:06-07:51 on Red -- 48 holds, every one refused -- while the
+    fullest sheet seen at that release started at 09:00 and 08:18.
+    """
+    from src.telemetry import grid_store
+    stored = {"interval_minutes": 10, "anchor_phase": 0, "first_time": "08:20",
+              "last_time": "16:00", "observed_count": 30, "confidence": "high",
+              # Read at a release: the play date is a week after the read.
+              "source_date": "2026-09-07", "updated_at": "2026-08-31T23:00:30+00:00",
+              "template": {"booking_class_id": "50294", "teesheet_side_id": "1014",
+                           "green_fee": 80}}
+    real_fetch = grid_store.fetch_grid
+    grid_store.fetch_grid = lambda **kw: dict(stored)
+    try:
+        out = _run(accept=set(), payload_overrides={
+            "prestage_times": None, "time_start": "08:00", "time_end": "09:00"})
+    finally:
+        grid_store.fetch_grid = real_fetch
+    fired = sorted({t for t, _ in FIRES})
+    if not fired:
+        return _fail("no pre-staged holds fired at all")
+    early = [t for t in fired if t < "08:20"]
+    if early:
+        return _fail(f"fired before the release floor 08:20: {early} (all fired: {fired})")
+    told = [e for e in out["events"] if e.get("type") == "event"
+            and e.get("stage") == "prestage_grid" and "earliest open time" in str(e.get("message"))]
+    if not told:
+        return _fail("no prestage_grid decision explaining the floor")
+    print(f"  ok: window 08:00-09:00, floor 08:20 -> fired {fired}")
+
+
 if __name__ == "__main__":
     os.environ["SNIPER_RACE_TIMEOUT_SECONDS"] = "4"
     os.environ["SNIPER_PRESTAGE_BURST_SECONDS"] = "2"
@@ -373,7 +409,8 @@ if __name__ == "__main__":
                test_extra_holds_are_released, test_single_win_books_once,
                test_win_landing_mid_poll_beats_the_poll_path,
                test_fee_course_prestaged_win_ends_in_payment_link,
-               test_disagreeing_grids_split_the_targets):
+               test_disagreeing_grids_split_the_targets,
+               test_holds_start_at_the_release_floor):
         print(f"\n{fn.__name__}")
         try:
             fn()

@@ -1125,17 +1125,21 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                                 f"rejection costs ~0.5s, so a long list just delays the poll fallback.")
             raw_targets = raw_targets[:4]
 
-        def _gen_targets(interval: int, phase: int, cap: int = 6) -> list[str]:
+        def _gen_targets(interval: int, phase: int, cap: int = 6,
+                         floor: str | None = None) -> list[str]:
             """Every real tee time inside the user's window, earliest first.
 
             The user sets a window; the course sets the grid. The intersection
             is the target list — nobody has to know that Red runs a 9-minute
-            sheet anchored at :03.
+            sheet anchored at :03. `floor` lifts the start to the earliest time
+            ever seen bookable at a release (grid_store.release_floor).
             """
             def _mins(t: str) -> int:
                 hh, mm = t.split(":")[:2]
                 return int(hh) * 60 + int(mm)
             start, end = _mins(payload["time_start"]), _mins(payload["time_end"])
+            if floor:
+                start = max(start, _mins(floor))
             first = start + ((phase - start) % interval)
             out = [f"{m // 60:02d}:{m % 60:02d}" for m in range(first, end + 1, interval)]
             if len(out) > cap:
@@ -1206,6 +1210,21 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                                        source_date=ref_date)
 
             stored = grid_store.fetch_grid(course_id=str(ps_course), day_of_week=play_dow)
+
+            # Where bookable times actually start on this weekday, learned at a
+            # past release. Aiming earlier wins nothing (10-17: 48 holds at
+            # 07:00-07:51 all refused while the sheet opened at 08:18/09:00).
+            # Polling still covers the whole window, so nothing is given up.
+            target_floor = grid_store.release_floor(stored)
+            if target_floor and (_hhmm_to_min(target_floor) or 0) <= (_hhmm_to_min(payload["time_start"]) or 0):
+                target_floor = None
+            if target_floor:
+                _emit_event(queue, phase="sniper", stage="prestage_grid",
+                            message=f"Future Sight: at the {stored.get('source_date')} release the "
+                                    f"earliest open time on this course was {target_floor} — earlier "
+                                    f"times were never seen bookable, so pre-staged holds start at "
+                                    f"{target_floor} rather than {payload['time_start']}. Polling "
+                                    f"still covers your whole window.")
 
             # ---- Pick which grid to aim with. ----
             # The live read used to win unconditionally, so an 8-slot twilight
@@ -1313,7 +1332,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 template = chosen["template"]
                 user_targets = bool(raw_targets)
                 if fs_enabled and not raw_targets:
-                    raw_targets = _gen_targets(chosen["interval"], chosen["phase"])
+                    raw_targets = _gen_targets(chosen["interval"], chosen["phase"],
+                                               floor=target_floor)
                     # Two credible grids that would aim at different times: the
                     # ranking above prefers coverage and observation count and
                     # never looks at age, so a stale stored grid beats tonight's
@@ -1329,7 +1349,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                         None,
                     )
                     if rival and raw_targets:
-                        rival_targets = _gen_targets(rival["interval"], rival["phase"], cap=999)
+                        rival_targets = _gen_targets(rival["interval"], rival["phase"], cap=999,
+                                                     floor=target_floor)
                         if rival_targets:
                             raw_targets = _interleave_targets(raw_targets, rival_targets, 6)
                             _emit_event(queue, phase="sniper", stage="prestage_grid",
@@ -2438,7 +2459,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.10"
+APP_VERSION = "1.11"
 
 @app.get("/health")
 def health() -> dict[str, str]:

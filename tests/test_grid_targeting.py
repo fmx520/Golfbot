@@ -2,14 +2,17 @@
 
 A grid mistake does not lose a race polling would have won -- polling runs
 alongside the burst -- but it throws away the head start that has been
-winning. These pin the two ways the targeting could aim at times that do not
+winning. These pin the ways the targeting could aim at times that do not
 exist:
 
 * two intervals meeting (10-minute day, 15-minute twilight) read as one
   "consistent" 5-minute grid, so half the targets are fake times;
 * a stale stored grid and tonight's live read disagreeing, with the ranking
   silently picking the stale one (handled in app.py by splitting targets --
-  the race-level check lives in test_prestage_concurrency.py).
+  the race-level check lives in test_prestage_concurrency.py);
+* aiming before the first time a course's sheet is bookable at all
+  (2026-10-17: 48 holds at 07:00-07:51, all refused, while the sheet seen at
+  release opened at 08:18 / 09:00).
 """
 from __future__ import annotations
 
@@ -21,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("GOLFBOT_LOG_DIR", "/tmp/golfbot-test-logs")
 
 from src.discovery.grid import analyze_teesheet_grid  # noqa: E402
+from src.telemetry.grid_store import release_floor  # noqa: E402
 import src.web.app as app  # noqa: E402
 
 FAILURES = 0
@@ -83,9 +87,43 @@ def test_interleave_targets() -> None:
     print(f"  ok: interleaved, de-duplicated, capped: {got}")
 
 
+def test_release_floor() -> None:
+    """Only a well-observed sheet read at a release sets where aiming starts.
+
+    Rows are the real course_grids rows as of 2026-10-17, as PostgREST sends them.
+    """
+    cases = [
+        ("Red Sat, read at the 10-17 release",
+         {"source_date": "2026-10-24", "updated_at": "2026-10-17T23:00:49.33744+00:00",
+          "first_time": "08:18", "observed_count": 43}, "08:18"),
+        ("Black Sat, read at the 10-17 release",
+         {"source_date": "2026-10-24", "updated_at": "2026-10-17T23:01:10.097735+00:00",
+          "first_time": "09:00", "observed_count": 32}, "09:00"),
+        ("Black Sun: a 4-time read must not floor a morning window at 16:20",
+         {"source_date": "2026-09-06", "updated_at": "2026-08-30T23:01:30.469433+00:00",
+          "first_time": "16:20", "observed_count": 4}, None),
+        ("harvest read 4 days ahead: mornings already booked away",
+         {"source_date": "2026-09-05", "updated_at": "2026-09-01T13:57:02.222289+00:00",
+          "first_time": "16:42", "observed_count": 30}, None),
+        ("7pm EST release is 00:00 UTC the next day",
+         {"source_date": "2026-11-14", "updated_at": "2026-11-08T00:00:40+00:00",
+          "first_time": "08:30", "observed_count": 30}, "08:30"),
+        ("Postgres '+00' offset", {"source_date": "2026-10-24",
+          "updated_at": "2026-10-17 23:00:49.33744+00", "first_time": "08:18",
+          "observed_count": 43}, "08:18"),
+        ("no row", None, None),
+    ]
+    for label, row, want in cases:
+        got = release_floor(row)
+        if got != want:
+            _fail(f"{label}: floor {got!r}, wanted {want!r}")
+        else:
+            print(f"  ok: {label} -> {got}")
+
+
 if __name__ == "__main__":
     for fn in (test_two_intervals_meeting_are_not_a_5_minute_grid, test_real_sheets_still_read_correctly,
-               test_grids_disagree, test_interleave_targets):
+               test_grids_disagree, test_interleave_targets, test_release_floor):
         print(f"\n{fn.__name__}")
         fn()
     print(f"\n{'PASS' if FAILURES == 0 else str(FAILURES) + ' FAILURE(S)'}")

@@ -21,10 +21,17 @@ os.environ["RACE_LOG_WEBHOOK_URL"] = "https://example.invalid/rest/v1/races"
 import src.telemetry.grid_store as gs  # noqa: E402
 
 FAILURES = 0
+# A good, FRESH stored grid. Its dates are relative to today on purpose: with
+# the fixed 2026-08-31 it once had, the row aged past GRID_STALE_DAYS on
+# 2026-10-15 and the code -- correctly -- let thin reads replace it, so these
+# tests started failing on their own with nothing in the code changed.
+from datetime import date as _date, timedelta as _timedelta  # noqa: E402
+_GOOD_READ = _date.today() - _timedelta(days=3)  # sheet date lands in the future, not today
 GOOD = {"course_id": "2431", "day_of_week": 0, "interval_minutes": 10,
         "anchor_phase": 0, "first_time": "08:30", "last_time": "17:00",
-        "observed_count": 39, "confidence": "high", "source_date": "2026-09-07",
-        "updated_at": "2026-08-31 23:01:30+00"}
+        "observed_count": 39, "confidence": "high",
+        "source_date": (_GOOD_READ + _timedelta(days=7)).isoformat(),
+        "updated_at": f"{_GOOD_READ.isoformat()} 23:01:30+00"}
 
 
 def _harness(existing, new_grid, source_date):
