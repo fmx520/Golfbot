@@ -234,6 +234,12 @@ Written because each one cost real time this session.
   paid. The hold was only kept alive during the 2FA code wait. The worker now
   stays up refreshing until refreshes stop being accepted (paid or gone), a stop
   request, or `PAYMENT_HOLD_SECONDS` (600).
+  **First live run, 10-17 (Red 12:12, $20): booking paid and confirmed by the
+  user.** The keepalive sent 74 refreshes, all accepted, and ended on the time
+  limit — it never saw a refresh fail. Either ForeUp keeps accepting refreshes
+  after the fee is paid, or the payment landed late in the 10 minutes; the user
+  did not say when they paid. Do not rely on "refresh fails once paid" to end
+  the loop early. Harmless either way: the loop never releases, it only holds.
 
 - **`prestage` empty does NOT mean Future Sight wasn't selected.** It means no
   holds *fired*. On 08-31 it was armed and disarmed itself at arm time, and the
