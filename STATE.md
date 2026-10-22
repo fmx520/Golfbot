@@ -186,13 +186,30 @@ Written because each one cost real time this session.
   the whole window. Trade-off: if a release read caught the sheet after its
   first times went, the floor is late — it costs earliness, not the win, and a
   wider read at a later release replaces it.
-- **Firing six holds at once over one HTTP/2 connection is not fully
-  thread-safe.** 10-17, Red: one first-round shot (07:15) never left —
-  `deque mutated during iteration` from HPACK header encoding in h2, two burst
-  threads encoding headers on the shared connection at once. First occurrence
-  in any race; cost nothing that night (the time was unbookable) but can cost a
-  real shot. Not changed — the connection layer is load-bearing and the user
-  has asked not to touch it without evidence. This is the first such evidence.
+- **One HTTP/2 connection shared by the burst threads was not thread-safe —
+  guarded since v1.12.** The burst and polling share one connection, and
+  httpcore's sync HTTP/2 code leaves the shared `H2Connection` unguarded (only
+  socket reads/writes are locked). Two production hits:
+  **10-17** `deque mutated during iteration` (HPACK table) — a hold never left;
+  **10-21** `ConnectionTerminated(error_code=1)` at T+1.35s — ForeUp killed the
+  connection and six in-flight holds died "Broken pipe". The winning poll hold
+  had landed at T+0.55s; had the kill come first, it would have died too.
+  A local reproduction (`tests/test_h2_concurrency.py`: 12 threads, one
+  connection, a strict h2 server) found four races — header compression,
+  unguarded state changes, two threads taking the same stream id ("pseudo-header
+  in trailer"), and a stream answered and closed by the server before its own
+  setup finished — plus requests that *arrived* carrying another request's
+  headers. Unguarded: ~10% of requests survive. `src/discovery/h2_guard.py`
+  (installed when `foreup_client` imports) puts every call on the shared h2
+  state under one per-connection lock and makes "take stream id → send headers
+  → open its window" one step; socket I/O stays outside the lock. Guarded:
+  360/360 GETs and hold-style POSTs, zero kills, zero garbled; six 300ms
+  requests still finish in ~0.7s, so parallelism is intact. Same connection,
+  same protocol, same requests on the wire. It patches httpcore internals, so
+  the HTTP stack is **pinned** in `requirements.txt` (httpx 0.28.1, httpcore
+  1.0.9, h2 4.4.1 — what Render was already installing) and `/health` reports
+  `"h2_guard": true`. If it ever reads false, the installed httpcore no longer
+  matches and the burst is unsafe again.
 - **First CPU-throttle numbers (v1.09 logging), 10-17:** in the 15s release
   window, 3 throttled 100ms periods totalling ~290ms, with two races running at
   once. Not zero — the first evidence CPU can add delay at the release — but the
@@ -313,6 +330,7 @@ python3 tests/test_prestage_concurrency.py   # ~3 min: aligns to minute boundari
 python3 tests/test_fee_recovery_paths.py   # both ways of winning a hold reach the payment link
 python3 tests/test_cpu_throttle.py        # CPU-throttle logging reads cgroup v1/v2, never raises
 python3 tests/test_grid_targeting.py      # no fake grids from two intervals; disagreeing grids both get shots
+python3 tests/test_h2_concurrency.py      # ~1 min: many threads on one HTTP/2 connection never scramble requests
 python3 tests/test_grid_inference.py
 python3 tests/test_grid_no_downgrade.py
 python3 tests/test_sink_drift.py

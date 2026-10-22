@@ -14,8 +14,15 @@ import json as _json
 
 import httpx
 
+from src.discovery import h2_guard
+
 
 logger = logging.getLogger(__name__)
+
+# The burst fires holds from several threads over one shared HTTP/2
+# connection; httpcore cannot do that safely on its own. Must run before the
+# first connection is created. See h2_guard for the races and the evidence.
+h2_guard.install()
 
 FOREUP_API_KEY = "no_limits"
 FOREUP_LOGIN_PATH = "/index.php/api/booking/users/login"

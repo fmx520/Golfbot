@@ -41,7 +41,7 @@ from src.booking.foreup_client import ForeUpBookingClient, classify_reservation_
 from src.config import load_config
 from src.courses import COURSE_CATALOG, cached_preflight, run_preflight
 from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
-from src.discovery import checkout_scan
+from src.discovery import checkout_scan, h2_guard
 from src.discovery.grid import analyze_teesheet_grid
 from src.telemetry import grid_harvest, grid_store
 from src.telemetry.race_log import RaceRecorder
@@ -2459,11 +2459,14 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.11"
+APP_VERSION = "1.12"
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "version": APP_VERSION}
+def health() -> dict[str, Any]:
+    # h2_guard: whether the HTTP/2 thread-safety guard is active. False means
+    # the installed httpcore is not the shape it was written for, and the burst
+    # is back to sharing an unsafe connection -- see src/discovery/h2_guard.py.
+    return {"status": "ok", "version": APP_VERSION, "h2_guard": h2_guard.installed()}
 
 
 def _warm_course_preflight() -> None:

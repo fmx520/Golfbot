@@ -1,4 +1,14 @@
-httpx[http2]>=0.24.0
+# The HTTP stack is pinned: src/discovery/h2_guard.py patches httpcore's sync
+# HTTP/2 internals to make one connection safe to share between the Future
+# Sight burst threads, and was verified against exactly these versions
+# (tests/test_h2_concurrency.py). Render installs fresh on every deploy, so an
+# unpinned upgrade could change those internals with no code change here.
+# Bump deliberately, and re-run that test when you do.
+httpx[http2]==0.28.1
+httpcore==1.0.9
+h2==4.4.1
+hpack==4.2.0
+hyperframe==6.1.0
 fastapi>=0.100.0
 uvicorn>=0.22.0
 pydantic>=2.0.0
