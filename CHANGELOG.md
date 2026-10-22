@@ -17,6 +17,7 @@ the subject: `git log --oneline --grep='(v0\.' -i`.
 
 | Version | Date | Summary | Commit |
 |---|---|---|---|
+| 1.12 | 2026-10-22 | HTTP/2 connection made safe to share between burst threads (10-17 / 10-21 failures); HTTP stack pinned; /health reports h2_guard | `671b6dd` |
 | 1.11 | 2026-10-18 | Future Sight aims from the earliest time seen bookable at a release, not the window start | `a1660d1` |
 | 1.10 | 2026-10-11 | Disagreeing grids split Future Sight's targets; no fake grids from two intervals meeting; harvest workflow exit fix | `dc1fbb7` |
 | 1.09 | 2026-10-11 | Log whether the CPU quota throttles us during a race (`timing.cpu_throttle`); logging only | `7d86abc` |
