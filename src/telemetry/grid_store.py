@@ -369,6 +369,42 @@ def release_floor(row: Optional[dict[str, Any]]) -> Optional[str]:
     return first
 
 
+def sibling_release_floor(*, course_id: str, day_of_week: int,
+                          rows: Optional[list[dict[str, Any]]] = None) -> Optional[dict[str, Any]]:
+    """Borrow a release floor from the same course's other days of the same type.
+
+    10-25, Black Sunday: the only Sunday row was a 4-time read, release_floor
+    rightly refused it, so there was no floor -- Future Sight fired 30 holds at
+    08:00-08:50, all refused, while Black's Saturday release opened at 09:00 and
+    polling's first sight in that window was 09:30. Where a bookable sheet
+    starts is set by the course and differs between weekends and weekdays
+    (early-weekend tee times, resident hours), so only days of the same type
+    count. When several qualify the EARLIEST wins: it never skips a time some
+    day has shown bookable, and polling covers the window regardless.
+
+    Returns {"floor", "day_of_week", "source_date"} or None. `rows` is for
+    tests; otherwise the course's stored rows are fetched.
+    """
+    if rows is None:
+        rows = fetch_course_grids(course_id=str(course_id))
+    want_weekend = int(day_of_week) >= 5
+    best: Optional[dict[str, Any]] = None
+    for row in rows or []:
+        try:
+            dow = int(row.get("day_of_week", -1))
+        except (TypeError, ValueError):
+            continue
+        if dow == int(day_of_week) or (dow >= 5) != want_weekend:
+            continue
+        floor = release_floor(row)
+        if not floor:
+            continue
+        if best is None or (_hhmm_minutes(floor) or 0) < (_hhmm_minutes(best["floor"]) or 0):
+            best = {"floor": floor, "day_of_week": dow,
+                    "source_date": str(row.get("source_date") or "")}
+    return best
+
+
 def matches_stored_grid(time_str: str, stored: dict[str, Any]) -> Optional[bool]:
     """Validate a target against a stored grid row. None when the row is unusable."""
     interval = stored.get("interval_minutes")

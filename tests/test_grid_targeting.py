@@ -12,7 +12,8 @@ exist:
   the race-level check lives in test_prestage_concurrency.py);
 * aiming before the first time a course's sheet is bookable at all
   (2026-10-17: 48 holds at 07:00-07:51, all refused, while the sheet seen at
-  release opened at 08:18 / 09:00).
+  release opened at 08:18 / 09:00) -- including on a weekday with no good
+  release read of its own (2026-10-25, Black Sunday: 30 holds at 08:00-08:50).
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("GOLFBOT_LOG_DIR", "/tmp/golfbot-test-logs")
 
 from src.discovery.grid import analyze_teesheet_grid  # noqa: E402
-from src.telemetry.grid_store import release_floor  # noqa: E402
+from src.telemetry.grid_store import release_floor, sibling_release_floor  # noqa: E402
 import src.web.app as app  # noqa: E402
 
 FAILURES = 0
@@ -121,9 +122,60 @@ def test_release_floor() -> None:
             print(f"  ok: {label} -> {got}")
 
 
+# Black (2431) as stored when the 10-25 race armed. Sunday's only row was the
+# 4-time 08-30 read, which release_floor rightly refuses.
+BLACK_AT_10_25 = [
+    {"day_of_week": 0, "source_date": "2026-09-07", "updated_at": "2026-08-31 23:01:30.602061+00",
+     "first_time": "08:30", "observed_count": 39},
+    {"day_of_week": 2, "source_date": "2026-10-28", "updated_at": "2026-10-21 23:00:25.369726+00",
+     "first_time": "09:30", "observed_count": 29},
+    {"day_of_week": 5, "source_date": "2026-10-24", "updated_at": "2026-10-17 23:01:10.097735+00",
+     "first_time": "09:00", "observed_count": 32},
+    {"day_of_week": 6, "source_date": "2026-09-06", "updated_at": "2026-08-30 23:01:30.469433+00",
+     "first_time": "16:20", "observed_count": 4},
+]
+# Red (2432) after 10-25: weekday rows are thin harvest reads; Sunday is a
+# 12-time read from a snipe-now two minutes after the release.
+RED_AT_10_25 = [
+    {"day_of_week": 1, "source_date": "2026-09-01", "updated_at": "2026-08-31 22:28:43.978375+00",
+     "first_time": "17:09", "observed_count": 6},
+    {"day_of_week": 3, "source_date": "2026-09-03", "updated_at": "2026-08-31 15:21:48.646687+00",
+     "first_time": "15:30", "observed_count": 11},
+    {"day_of_week": 5, "source_date": "2026-10-24", "updated_at": "2026-10-17 23:00:49.33744+00",
+     "first_time": "08:18", "observed_count": 43},
+    {"day_of_week": 6, "source_date": "2026-11-01", "updated_at": "2026-10-25 23:03:29.700182+00",
+     "first_time": "11:54", "observed_count": 12},
+]
+
+
+def test_sibling_release_floor() -> None:
+    """A weekday with no good release read borrows from its own day type only."""
+    def got(rows, dow):
+        b = sibling_release_floor(course_id="x", day_of_week=dow, rows=rows)
+        return (b["floor"], b["day_of_week"]) if b else None
+
+    cases = [
+        ("Black Sunday borrows Saturday (10-25's race)", BLACK_AT_10_25, 6, ("09:00", 5)),
+        ("Black Thursday borrows the EARLIEST weekday (Mon 08:30, not Wed 09:30)",
+         BLACK_AT_10_25, 3, ("08:30", 0)),
+        ("Black Saturday never borrows its own row, nor a weekday's",
+         [r for r in BLACK_AT_10_25 if r["day_of_week"] != 6], 5, None),
+        ("Red Sunday borrows Saturday 08:18", RED_AT_10_25, 6, ("08:18", 5)),
+        ("Red Tuesday: weekday rows too thin, nothing to borrow", RED_AT_10_25, 1, None),
+        ("no rows", [], 6, None),
+    ]
+    for label, rows, dow, want in cases:
+        g = got(rows, dow)
+        if g != want:
+            _fail(f"{label}: got {g}, wanted {want}")
+        else:
+            print(f"  ok: {label} -> {g}")
+
+
 if __name__ == "__main__":
     for fn in (test_two_intervals_meeting_are_not_a_5_minute_grid, test_real_sheets_still_read_correctly,
-               test_grids_disagree, test_interleave_targets, test_release_floor):
+               test_grids_disagree, test_interleave_targets, test_release_floor,
+               test_sibling_release_floor):
         print(f"\n{fn.__name__}")
         fn()
     print(f"\n{'PASS' if FAILURES == 0 else str(FAILURES) + ' FAILURE(S)'}")

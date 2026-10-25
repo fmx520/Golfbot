@@ -186,6 +186,21 @@ Written because each one cost real time this session.
   the whole window. Trade-off: if a release read caught the sheet after its
   first times went, the floor is late — it costs earliness, not the win, and a
   wider read at a later release replaces it.
+  **v1.13 — a weekday with no good read borrows one.** 10-25, Black Sunday:
+  the only Sunday row was the 4-time 08-30 read, so `release_floor` (rightly)
+  gave nothing and Future Sight fired 30 holds at 08:00–08:50, all refused.
+  Polling first saw 09:30 at T+1.14s, its hold took 2.07s, and it lost; the
+  window then sold out (255 of 283 polls empty). `sibling_release_floor` now
+  lends the same course's floor from days of the same type (weekend↔weekend,
+  weekday↔weekday), earliest wins — replayed, that night fires 09:00–09:50.
+  That race also banked a real Black Sunday read (09:30, 20 seen).
+- **Arming after the release time silently targets tomorrow.** 10-25: a Red job
+  armed at 19:01:34 for a 19:00 release was scheduled for 10-26 19:00 (the
+  worker rolls a passed release to the next day). It was cancelled and a
+  snipe-now at 19:01:56 found nothing in 07:00–10:00 for 90s. Arm before 7pm.
+- **First live race with the HTTP/2 guard (v1.12), 10-25:** all 30 burst holds
+  got clean ForeUp answers — no Broken pipe, no ConnectionTerminated, no deque
+  error. CPU throttling in the release window: zero.
 - **One HTTP/2 connection shared by the burst threads was not thread-safe —
   guarded since v1.12.** The burst and polling share one connection, and
   httpcore's sync HTTP/2 code leaves the shared `H2Connection` unguarded (only

@@ -402,6 +402,47 @@ def test_holds_start_at_the_release_floor():
     print(f"  ok: window 08:00-09:00, floor 08:20 -> fired {fired}")
 
 
+def test_weekday_without_a_floor_borrows_one():
+    """10-25, Black Sunday: no trustworthy Sunday release read, so no floor --
+    30 holds at 08:00-08:50, all refused, while Black's Saturday release opened
+    at 09:00 and polling's first sight in the window was 09:30. The same
+    course's Saturday floor must apply."""
+    from src.telemetry import grid_store
+    sunday_4_time_read = {"interval_minutes": 10, "anchor_phase": 0, "first_time": "16:20",
+                          "last_time": "17:00", "observed_count": 4, "confidence": "low",
+                          "source_date": "2026-09-06", "updated_at": "2026-08-30 23:01:30.469433+00",
+                          "template": {"booking_class_id": "50294", "teesheet_side_id": "1014",
+                                       "green_fee": 80}}
+    black_rows = [
+        {"day_of_week": 0, "interval_minutes": 10, "anchor_phase": 0, "source_date": "2026-09-07",
+         "updated_at": "2026-08-31 23:01:30.602061+00", "first_time": "08:30", "observed_count": 39},
+        {"day_of_week": 5, "interval_minutes": 10, "anchor_phase": 0, "source_date": "2026-10-24",
+         "updated_at": "2026-10-17 23:01:10.097735+00", "first_time": "09:00", "observed_count": 32},
+        dict(sunday_4_time_read, day_of_week=6),
+    ]
+    real_fetch, real_course = grid_store.fetch_grid, grid_store.fetch_course_grids
+    grid_store.fetch_grid = lambda **kw: dict(sunday_4_time_read)
+    grid_store.fetch_course_grids = lambda **kw: [dict(r) for r in black_rows]
+    try:
+        # 2026-11-01 is a Sunday, like the 10-25 race's play date.
+        out = _run(accept=set(), payload_overrides={
+            "prestage_times": None, "time_start": "08:00", "time_end": "10:00",
+            "play_date": "2026-11-01"})
+    finally:
+        grid_store.fetch_grid, grid_store.fetch_course_grids = real_fetch, real_course
+    fired = sorted({t for t, _ in FIRES})
+    if not fired:
+        return _fail("no pre-staged holds fired at all")
+    early = [t for t in fired if t < "09:00"]
+    if early:
+        return _fail(f"fired before Saturday's 09:00 floor: {early} (all fired: {fired})")
+    told = [e for e in out["events"] if e.get("type") == "event" and e.get("stage") == "prestage_grid"
+            and "Saturdays" in str(e.get("message"))]
+    if not told:
+        return _fail("no prestage_grid decision saying the floor was borrowed from Saturday")
+    print(f"  ok: Sunday, no floor of its own -> Saturday's 09:00 -> fired {fired}")
+
+
 if __name__ == "__main__":
     os.environ["SNIPER_RACE_TIMEOUT_SECONDS"] = "4"
     os.environ["SNIPER_PRESTAGE_BURST_SECONDS"] = "2"
@@ -410,7 +451,8 @@ if __name__ == "__main__":
                test_win_landing_mid_poll_beats_the_poll_path,
                test_fee_course_prestaged_win_ends_in_payment_link,
                test_disagreeing_grids_split_the_targets,
-               test_holds_start_at_the_release_floor):
+               test_holds_start_at_the_release_floor,
+               test_weekday_without_a_floor_borrows_one):
         print(f"\n{fn.__name__}")
         try:
             fn()

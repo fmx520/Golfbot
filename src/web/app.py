@@ -1216,15 +1216,28 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             # 07:00-07:51 all refused while the sheet opened at 08:18/09:00).
             # Polling still covers the whole window, so nothing is given up.
             target_floor = grid_store.release_floor(stored)
+            floor_source = (f"at the {stored.get('source_date')} release"
+                            if target_floor and stored else "")
+            if not target_floor:
+                # No trustworthy release read for this weekday (10-25: Black's
+                # only Sunday row was a 4-time read). Borrow from the same
+                # course's days of the same type -- weekend from weekend.
+                borrowed = grid_store.sibling_release_floor(course_id=str(ps_course),
+                                                            day_of_week=play_dow)
+                if borrowed:
+                    target_floor = borrowed["floor"]
+                    floor_source = (f"on {_DOW_NAMES[borrowed['day_of_week']]}s (the "
+                                    f"{borrowed['source_date']} release — no "
+                                    f"{_DOW_NAMES[play_dow]} release has been read well enough yet)")
             if target_floor and (_hhmm_to_min(target_floor) or 0) <= (_hhmm_to_min(payload["time_start"]) or 0):
                 target_floor = None
             if target_floor:
                 _emit_event(queue, phase="sniper", stage="prestage_grid",
-                            message=f"Future Sight: at the {stored.get('source_date')} release the "
-                                    f"earliest open time on this course was {target_floor} — earlier "
-                                    f"times were never seen bookable, so pre-staged holds start at "
-                                    f"{target_floor} rather than {payload['time_start']}. Polling "
-                                    f"still covers your whole window.")
+                            message=f"Future Sight: {floor_source} the earliest open time on this "
+                                    f"course was {target_floor} — earlier times were never seen "
+                                    f"bookable, so pre-staged holds start at {target_floor} rather "
+                                    f"than {payload['time_start']}. Polling still covers your whole "
+                                    f"window.")
 
             # ---- Pick which grid to aim with. ----
             # The live read used to win unconditionally, so an 8-slot twilight
@@ -2459,7 +2472,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.12"
+APP_VERSION = "1.13"
 
 @app.get("/health")
 def health() -> dict[str, Any]:
