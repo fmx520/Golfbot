@@ -481,16 +481,42 @@ class RaceRecorder:
             {"stage": stage, "detail": detail[:600], "at": _now_iso()}
         )
 
-    def record_prestage(self, target_time: str, result: str, latency_ms: Optional[float] = None, error: str = "") -> None:
-        self.prestage.append(
-            {
-                "time": target_time,
-                "result": result,
-                "latency_ms": round(latency_ms, 2) if latency_ms is not None else None,
-                "error": error[:600],
-                "at": _now_iso(),
-            }
-        )
+    def record_prestage(self, target_time: str, result: str, latency_ms: Optional[float] = None,
+                        error: str = "", payload_sent: Any = None) -> None:
+        entry: dict[str, Any] = {
+            "time": target_time,
+            "result": result,
+            "latency_ms": round(latency_ms, 2) if latency_ms is not None else None,
+            "error": error[:600],
+            "at": _now_iso(),
+        }
+        # The burst builds its payload from a stored template rather than a
+        # live slot, so when ForeUp refuses, what we SENT is the only evidence
+        # of why. probe_cold_hold hands it back; keep it.
+        trimmed = self._trim(payload_sent, self.PAYLOAD_FORENSIC_KEYS)
+        if trimmed:
+            entry["payload_sent"] = trimmed
+        self.prestage.append(entry)
+
+    # What a slot and a hold payload must agree about for ForeUp to accept.
+    # Kept small on purpose: a full teesheet row is ~60 keys of noise, and the
+    # point is a diff a human can read at a glance.
+    SLOT_FORENSIC_KEYS = (
+        "time", "available_spots", "available_spots_18", "booking_class_id",
+        "teesheet_side_id", "schedule_id", "course_id", "green_fee",
+        "minimum_players", "maximum_players_per_booking", "allowed_group_sizes",
+        "booking_fee_required", "require_credit_card",
+    )
+    PAYLOAD_FORENSIC_KEYS = (
+        "time", "players", "holes", "schedule_id", "course_id",
+        "booking_class_id", "teesheet_side_id", "green_fee",
+    )
+
+    @staticmethod
+    def _trim(src: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+        if not isinstance(src, dict):
+            return {}
+        return {k: src[k] for k in keys if k in src}
 
     def record_attempt(
         self,
@@ -499,6 +525,8 @@ class RaceRecorder:
         error: str = "",
         latency_ms: Optional[float] = None,
         response: Any = None,
+        slot_polled: Any = None,
+        payload_sent: Any = None,
     ) -> None:
         """Record one booking attempt.
 
@@ -515,6 +543,25 @@ class RaceRecorder:
             "latency_ms": round(latency_ms, 2) if latency_ms is not None else None,
             "at": _now_iso(),
         }
+        # On 2026-11-04 ForeUp refused three times its own availability API had
+        # just listed as open, with the same six-word error it uses for times
+        # that do not exist. With only that string there is nothing to reason
+        # from. These two carry the slot AS ADVERTISED next to the payload we
+        # actually sent, so the next refusal is a diff rather than a theory.
+        slot_t = self._trim(
+            (slot_polled or {}).get("raw") if isinstance(slot_polled, dict) and "raw" in slot_polled
+            else slot_polled, self.SLOT_FORENSIC_KEYS)
+        if isinstance(slot_polled, dict):
+            for k in ("time", "available_spots", "green_fee"):
+                if k in slot_polled and k not in slot_t:
+                    slot_t[k] = slot_polled[k]
+        if slot_t:
+            entry["slot_polled"] = slot_t
+        payload_t = self._trim(payload_sent, self.PAYLOAD_FORENSIC_KEYS)
+        if payload_t:
+            entry["payload_sent"] = payload_t
+        if slot_t and payload_t:
+            entry["mismatch"] = self._mismatch(slot_t, payload_t)
         if response is not None:
             entry["response"] = str(response)[:2000]
         self.attempts.append(entry)
@@ -545,6 +592,40 @@ class RaceRecorder:
     # targeting failure, and no amount of speed fixes it.
     OFF_SHEET_MARKERS = ("time not available",)
     TAKEN_MARKERS = ("no longer available",)
+
+    @staticmethod
+    def _mismatch(slot: dict[str, Any], sent: dict[str, Any]) -> list[str]:
+        """Name every way the payload disagrees with the slot as advertised."""
+        out: list[str] = []
+
+        def _s(v: Any) -> str:
+            return str(v).strip() if v is not None else ""
+
+        for key in ("booking_class_id", "teesheet_side_id", "schedule_id", "course_id"):
+            if key in slot and key in sent and _s(slot[key]) != _s(sent[key]):
+                out.append(f"{key}: slot={_s(slot[key])} sent={_s(sent[key])}")
+
+        spots = slot.get("available_spots_18", slot.get("available_spots"))
+        try:
+            if spots is not None and sent.get("players") is not None \
+                    and int(sent["players"]) > int(spots):
+                out.append(f"players: asked {sent['players']} but slot had {spots} spot(s)")
+        except (TypeError, ValueError):
+            pass
+
+        allowed = slot.get("allowed_group_sizes")
+        if isinstance(allowed, list) and sent.get("players") is not None:
+            if _s(sent["players"]) not in {_s(a) for a in allowed}:
+                out.append(f"players: {sent['players']} not in allowed_group_sizes {allowed}")
+
+        try:
+            minimum = slot.get("minimum_players")
+            if minimum is not None and sent.get("players") is not None \
+                    and int(sent["players"]) < int(minimum):
+                out.append(f"players: {sent['players']} below minimum_players {minimum}")
+        except (TypeError, ValueError):
+            pass
+        return out
 
     def record_warning(self, code: str, detail: str) -> None:
         """Flag something that compromised this race. Safe to call repeatedly."""

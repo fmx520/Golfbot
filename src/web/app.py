@@ -1746,7 +1746,17 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
 
         request_code_callback = _sniper_wait_for_code if (customer_id and cmd_queue is not None) else None
 
+        # book_slot already emits the exact pending_reservation payload it sends;
+        # it just went to the browser and died there. Keep the last one so a
+        # refusal can be diffed against the slot that was advertised.
+        last_pending_payload: dict[str, Any] = {}
+
         def _sniper_debug(event: str, data: dict[str, Any]) -> None:
+            if event == "pending_payload" and isinstance(data, dict):
+                p = data.get("payload")
+                if isinstance(p, dict):
+                    last_pending_payload.clear()
+                    last_pending_payload.update(p)
             _emit_event(queue, phase="checkout", stage=f"debug_{event}",
                         message=f"{event}: {data}")
 
@@ -1899,7 +1909,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                             _claim_or_release(ps_time, hold)
                             continue
                         err = str(hold.get("error") or hold.get("response") or "")[:600]
-                        race.record_prestage(ps_time, "rejected", hold_ms, error=err)
+                        race.record_prestage(ps_time, "rejected", hold_ms, error=err,
+                                             payload_sent=hold.get("payload_sent"))
                         if burst_pass == 1:
                             _emit_event(queue, phase="sniper", stage="prestage_miss",
                                         message=f"Pre-staged {ps_time}: rejected in "
@@ -2257,6 +2268,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     race.record_attempt(
                         candidate.get("time", "?"), "failed", error=str(exc),
                         latency_ms=round((time.perf_counter() - submit_started) * 1000, 2),
+                        slot_polled=candidate,
+                        payload_sent=dict(last_pending_payload),
                     )
                     msg = str(exc).lower()
                     # 2FA-related failures: stop. The user wasn't able to enter
@@ -2556,7 +2569,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.15"
+APP_VERSION = "1.16"
 
 @app.get("/health")
 def health() -> dict[str, Any]:

@@ -215,6 +215,43 @@ available."* when somebody took it. Losing to a competitor is a race; firing at
 times that do not exist is a targeting failure no amount of speed fixes. Only
 the second, with zero accepts, raises the flag. Keep that distinction.
 
+## The open question: refusals on times the sheet advertised (v1.16)
+
+On 2026-11-04 the availability API listed 09:50, 11:00 and 11:10 as open and
+`pending_reservation` refused all three with **"Time not available."** — the
+same string it uses for times that are not on the sheet at all. Only 09:30 came
+back "no longer available" (genuinely taken).
+
+**This is unexplained and may be the common thread under several lost weeks.**
+It is NOT a targeting failure: those were real, on-grid, currently-listed times.
+
+It also means `aimed_off_sheet` (v1.15) is a heuristic, not a proof. "Time not
+available" has now been observed meaning both "this time does not exist" and
+something else on a time that plainly did.
+
+v1.16 stops the guessing. Every failed hold now records, inside `attempts`:
+
+- `slot_polled` — the slot AS ADVERTISED (spots, booking class, side id,
+  schedule/course id, group sizes, minimum players)
+- `payload_sent` — what we actually POSTed
+- `mismatch` — the disagreements, named: wrong booking class, wrong side id,
+  more players than spots, a group size the slot does not allow, below
+  `minimum_players`
+
+The burst records `payload_sent` too; it builds from a stored template rather
+than a live slot, so what we sent is the only evidence there is.
+
+**Next time this happens, read `attempts[].mismatch` first.** If it is empty and
+ForeUp still refused, the disagreement is in a field not yet captured — widen
+`SLOT_FORENSIC_KEYS` / `PAYLOAD_FORENSIC_KEYS` rather than theorising.
+
+```sql
+select a->>'slot_time', a->>'error', a->'mismatch',
+       a->'slot_polled', a->'payload_sent'
+from races r, lateral jsonb_array_elements(r.attempts) a
+where left(r.run_id,12) = '<run>';
+```
+
 ## Things that will mislead you
 
 Written because each one cost real time this session.
