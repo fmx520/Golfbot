@@ -17,7 +17,7 @@ the subject: `git log --oneline --grep='(v0\.' -i`.
 
 | Version | Date | Summary | Commit |
 |---|---|---|---|
-| 1.17 | 2026-11-04 | The burst re-aims at times polling actually sees, instead of re-firing a wrong floor for 5s | `pending` |
+| 1.17 | 2026-11-04 | The burst re-aims at times polling actually sees, instead of re-firing a wrong floor for 5s | `b48e71f` |
 | 1.16 | 2026-11-04 | Failed holds record the slot as advertised vs the payload sent, and name the mismatch | `eb227e4` |
 | 1.15 | 2026-11-04 | A compromised race flags itself in its own summary (`races.warnings`) instead of waiting to be excavated | `e179184` |
 | 1.14 | 2026-11-04 | A failed grid read no longer reads as "never seen" — retry, and never infer a grid or floor from a failed lookup | `a40c431` |
