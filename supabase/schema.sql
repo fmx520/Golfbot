@@ -40,6 +40,7 @@ create table if not exists races (
     captcha          jsonb,
     prestage         jsonb,         -- Future Sight: one entry per hold fired
     prestage_decision jsonb,        -- why Future Sight armed or stood down
+    warnings         jsonb,        -- what compromised this race (see race_log)
     two_factor       jsonb,         -- booking-code path + hold keepalive
     peers            jsonb,         -- our own concurrent jobs on this race
 
@@ -66,6 +67,11 @@ alter table races add column if not exists peers      jsonb;
 -- disarmed it silently and the reason lived only in the browser event log, so
 -- three days of losing races were indistinguishable in this table.
 alter table races add column if not exists prestage_decision jsonb;
+
+-- v1.15: what compromised a race. Every failure this bot has had was visible
+-- in the data at the time and nobody saw it, so a doomed race now says so in
+-- its own summary line rather than waiting to be excavated.
+alter table races add column if not exists warnings jsonb;
 
 -- Guard against this recurring: scripts/check_schema_drift.py compares the
 -- record's top-level keys against the columns above and fails on any gap.

@@ -187,6 +187,34 @@ read `throttled_ms: 0` for this race, so CPU had nothing to do with it.
 nothing there" must not return the same value.** Anywhere else that pattern
 exists here, treat it as a bug.
 
+## Races flag themselves now (v1.15)
+
+Every failure this bot has had was visible in the data at the time and nobody
+saw it. So a compromised race says so in its own `summary`, at the front, where
+the UI and any Supabase query already look:
+
+```
+!! BORROWED_FLOOR !! AIMED_OFF_SHEET — No Wednesday release has been read for
+this course, so holds start from Monday's floor (08:30, read 2026-09-07,
+58 days ago). || ABORTED: ... [95 polls | pre-staged 24 (0 accepted)]
+```
+
+`races.warnings` carries them as rows. Current codes:
+
+| code | means |
+|---|---|
+| `aimed_off_sheet` | every pre-staged hold refused as "Time not available" — fired at times the sheet does not offer. **Derived at flush**, so it needs no foresight |
+| `grid_unreadable` | the registry did not answer at arming; Future Sight stood down |
+| `stale_grid` | aiming with a grid older than `GRID_STALE_WARN_DAYS` (21) |
+| `borrowed_floor` | this weekday has no release read; the floor came from another day |
+| `inferred_grid` | no teesheet ever read for this weekday; rhythm inferred |
+
+**The distinction that makes `aimed_off_sheet` work:** ForeUp says
+*"Time not available."* when a time is not on the sheet, and *"...no longer
+available."* when somebody took it. Losing to a competitor is a race; firing at
+times that do not exist is a targeting failure no amount of speed fixes. Only
+the second, with zero accepts, raises the flag. Keep that distinction.
+
 ## Things that will mislead you
 
 Written because each one cost real time this session.

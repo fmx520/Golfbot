@@ -371,6 +371,13 @@ class RaceRecorder:
     # whether we pre-staged at all -- on 2026-08-31 the grid gate disarmed it
     # silently and three days of races looked identical in the database.
     prestage_decision: list[dict[str, Any]] = field(default_factory=list)
+    # Things that compromised this race, or would have. These exist because
+    # every failure this bot has had was visible in the data at the time and
+    # nobody saw it: a workflow failing weekly into an empty room, a registry
+    # timeout logged to stdout, a decision line confidently asserting something
+    # false. A race that was doomed before it started should SAY SO, in the
+    # summary, where a human already looks -- not wait to be excavated.
+    warnings: list[dict[str, Any]] = field(default_factory=list)
 
     # 2FA / hold-keepalive evidence. Populated only when the booking-code path
     # fires. hold_refresh_failed distinguishes "the hold died while the user
@@ -531,6 +538,39 @@ class RaceRecorder:
             for a in failed
         )
 
+    # ForeUp distinguishes these, and the difference is the whole diagnosis.
+    # "Time not available."            -> that time is not on the sheet at all
+    # "...no longer available."        -> it was, and somebody else took it
+    # Losing to a competitor is a race. Firing at times that do not exist is a
+    # targeting failure, and no amount of speed fixes it.
+    OFF_SHEET_MARKERS = ("time not available",)
+    TAKEN_MARKERS = ("no longer available",)
+
+    def record_warning(self, code: str, detail: str) -> None:
+        """Flag something that compromised this race. Safe to call repeatedly."""
+        if any(w.get("code") == code for w in self.warnings):
+            return
+        self.warnings.append({"code": code, "detail": detail[:400], "at": _now_iso()})
+
+    def _derive_warnings(self) -> None:
+        """Warnings the data itself proves, computed at flush."""
+        fires = self.prestage or []
+        if fires and not any(p.get("result") == "hold_accepted" for p in fires):
+            rejected = [p for p in fires if p.get("result") == "rejected"]
+            off_sheet = [
+                p for p in rejected
+                if any(m in str(p.get("error", "")).lower() for m in self.OFF_SHEET_MARKERS)
+            ]
+            if rejected and len(off_sheet) == len(rejected):
+                times = sorted({str(p.get("time")) for p in fires})
+                self.record_warning(
+                    "aimed_off_sheet",
+                    f"All {len(fires)} pre-staged holds were refused as "
+                    f"\"Time not available\" — not lost to a competitor, but fired at "
+                    f"times this sheet does not offer ({', '.join(times)}). The grid or "
+                    f"release floor we aimed with is wrong or stale for this date.",
+                )
+
     def classify(self) -> str:
         if self.awaiting_payment:
             return OUTCOME_AWAITING_PAYMENT
@@ -582,7 +622,14 @@ class RaceRecorder:
                 f"{self.hold_refresh_failed + self.hold_refresh_ok}"
             )
         detail = " | ".join(bits)
-        return f"{outcome.upper()}: {reason}" + (f" [{detail}]" if detail else "")
+        line = f"{outcome.upper()}: {reason}" + (f" [{detail}]" if detail else "")
+        if self.warnings:
+            # Front of the line, not a footnote: this is the part that explains
+            # why an otherwise ordinary-looking loss was never winnable.
+            flags = " ".join(f"!! {w['code'].upper()}" for w in self.warnings)
+            first = self.warnings[0].get("detail", "")
+            line = f"{flags} — {first} || {line}"
+        return line
 
     # ------------------------------------------------------------------
     # output
@@ -623,6 +670,7 @@ class RaceRecorder:
             "attempts": self.attempts,
             "prestage": self.prestage,
             "prestage_decision": self.prestage_decision,
+            "warnings": self.warnings,
             "two_factor": {
                 "triggered": self.two_factor_triggered,
                 "code_wait_ms": self.code_wait_ms,
@@ -647,6 +695,11 @@ class RaceRecorder:
         """Emit the race record. Never raises — telemetry must not kill a run."""
         if self.total_race_ms is None:
             self.total_race_ms = round((time.perf_counter() - self._started) * 1000, 2)
+        # Before the record is built, so the summary line carries them.
+        try:
+            self._derive_warnings()
+        except Exception:  # noqa: BLE001 — a warning must never cost the record
+            pass
         record = self.as_dict()
 
         line = json.dumps(record, default=str)

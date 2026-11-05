@@ -17,7 +17,7 @@ import sys as _sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date as date_cls_, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # All courses we target are East Coast — anchor sniper timing to NY tz so the
@@ -323,6 +323,25 @@ _race_for_decisions: list[Any] = []
 
 _DOW_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
               "Friday", "Saturday", "Sunday"]
+
+# Tee sheets slide with the season, so a grid's age matters even when its
+# interval is still right. Three weeks is roughly where Bethpage's start time
+# moved between the September and October reads.
+GRID_STALE_WARN_DAYS = 21
+
+
+def _age_days(source_date: str) -> int | None:
+    try:
+        y, m, d = (int(x) for x in str(source_date).split("-")[:3])
+        return (datetime.now(EAST_COAST_TZ).date() - date_cls_(y, m, d)).days
+    except (ValueError, TypeError):
+        return None
+
+
+def _grid_age_days(row: dict[str, Any] | None) -> int | None:
+    if not row:
+        return None
+    return _age_days(str(row.get("source_date") or ""))
 
 _PERSISTED_EVENT_STAGES = frozenset({
     "prestage_disabled", "prestage_grid", "prestage_window", "prestage_capped",
@@ -1218,6 +1237,11 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                 # see it, inferred the rhythm from other days, borrowed a floor
                 # from a Monday read two months old (08:30), and all 24
                 # pre-staged holds came back "Time not available."
+                race.record_warning(
+                    "grid_unreadable",
+                    f"The stored tee grid for {_DOW_NAMES[play_dow]} on course {ps_course} "
+                    f"could not be read at arming, so Future Sight stood down and this ran "
+                    f"as polling only. The grid most likely exists — we just could not see it.")
                 _emit_event(queue, phase="sniper", stage="prestage_grid_unreadable",
                             message=f"Future Sight: could not read the stored grid for "
                                     f"{_DOW_NAMES[play_dow]} on course {ps_course} — the registry "
@@ -1248,6 +1272,15 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                                                             day_of_week=play_dow)
                 if borrowed:
                     target_floor = borrowed["floor"]
+                    b_age = _age_days(str(borrowed.get("source_date") or ""))
+                    race.record_warning(
+                        "borrowed_floor",
+                        f"No {_DOW_NAMES[play_dow]} release has been read for this course, so "
+                        f"holds start from {_DOW_NAMES[borrowed['day_of_week']]}'s floor "
+                        f"({borrowed['floor']}, read {borrowed.get('source_date')}"
+                        + (f", {b_age} days ago" if b_age is not None else "") + "). "
+                        f"A borrowed floor from a different season is how 24 holds fired an "
+                        f"hour below the sheet on 2026-11-04.")
                     floor_source = (f"on {_DOW_NAMES[borrowed['day_of_week']]}s (the "
                                     f"{borrowed['source_date']} release — no "
                                     f"{_DOW_NAMES[play_dow]} release has been read well enough yet)")
@@ -1364,6 +1397,33 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                                     f"educated guess. Firing them anyway: the burst runs alongside "
                                     f"polling, so a wrong guess costs nothing and a right one wins. "
                                     f"Polling is unaffected either way.")
+
+            # A grid that is right about the rhythm can still be months wrong
+            # about where the sheet starts: tee sheets slide later as the season
+            # turns. Black's Monday row still said 08:30 from a September read
+            # while its October Wednesday row said 09:30. Say so at ARM time,
+            # while the user can still widen the window or refresh the grid.
+            if chosen and not chosen.get("inferred"):
+                age = _grid_age_days(stored)
+                if age is not None and age >= GRID_STALE_WARN_DAYS:
+                    race.record_warning(
+                        "stale_grid",
+                        f"Aiming with a {_DOW_NAMES[play_dow]} grid last read {age} days ago "
+                        f"({stored.get('source_date')}). Tee sheets move later in the season, "
+                        f"so the start time may no longer be right for {play_date}. If every "
+                        f"hold comes back \"Time not available\", this is why.")
+                    _emit_event(queue, phase="sniper", stage="prestage_grid",
+                                message=f"Future Sight: the {_DOW_NAMES[play_dow]} grid for this "
+                                        f"course was last read {age} days ago "
+                                        f"({stored.get('source_date')}). Courses move their first "
+                                        f"tee time as the season turns, so this may aim too early. "
+                                        f"Refreshing the grid for this course/day is worth doing.")
+            if chosen and chosen.get("inferred"):
+                race.record_warning(
+                    "inferred_grid",
+                    f"No teesheet has ever been read for this course on a "
+                    f"{_DOW_NAMES[play_dow]}; the rhythm was inferred from its other days. "
+                    f"The interval is reliable, the start time is not.")
 
             if chosen:
                 template = chosen["template"]
@@ -2496,7 +2556,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.14"
+APP_VERSION = "1.15"
 
 @app.get("/health")
 def health() -> dict[str, Any]:
