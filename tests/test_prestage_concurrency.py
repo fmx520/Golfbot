@@ -345,13 +345,18 @@ def test_disagreeing_grids_split_the_targets():
               "template": {"booking_class_id": "50294", "teesheet_side_id": "1014",
                            "green_fee": 80}}
     real_fetch = grid_store.fetch_grid
+    real_result = grid_store.fetch_grid_result
     grid_store.fetch_grid = lambda **kw: dict(stored)
+    # The arming path reads through fetch_grid_result, which also reports
+    # whether the READ succeeded -- stub both, with ok=True.
+    grid_store.fetch_grid_result = lambda **kw: (dict(stored), True)
     FakeDiscovery.REF_TIMES = [(16, 10), (16, 20), (16, 30), (16, 40), (16, 50), (17, 0)]
     try:
         out = _run(accept=set(), payload_overrides={
             "prestage_times": None, "time_start": "08:00", "time_end": "09:00"})
     finally:
         grid_store.fetch_grid = real_fetch
+        grid_store.fetch_grid_result = real_result
         FakeDiscovery.REF_TIMES = [(16, 20), (16, 30), (16, 40), (16, 50)]
     fired = sorted({t for t, _ in FIRES})
     nine_only = [t for t in fired if int(t[3:]) % 10 != 0]       # 08:09, 08:18, 08:27 ...
@@ -383,12 +388,17 @@ def test_holds_start_at_the_release_floor():
               "template": {"booking_class_id": "50294", "teesheet_side_id": "1014",
                            "green_fee": 80}}
     real_fetch = grid_store.fetch_grid
+    real_result = grid_store.fetch_grid_result
     grid_store.fetch_grid = lambda **kw: dict(stored)
+    # The arming path reads through fetch_grid_result, which also reports
+    # whether the READ succeeded -- stub both, with ok=True.
+    grid_store.fetch_grid_result = lambda **kw: (dict(stored), True)
     try:
         out = _run(accept=set(), payload_overrides={
             "prestage_times": None, "time_start": "08:00", "time_end": "09:00"})
     finally:
         grid_store.fetch_grid = real_fetch
+        grid_store.fetch_grid_result = real_result
     fired = sorted({t for t, _ in FIRES})
     if not fired:
         return _fail("no pre-staged holds fired at all")
@@ -421,7 +431,9 @@ def test_weekday_without_a_floor_borrows_one():
         dict(sunday_4_time_read, day_of_week=6),
     ]
     real_fetch, real_course = grid_store.fetch_grid, grid_store.fetch_course_grids
+    real_result = grid_store.fetch_grid_result
     grid_store.fetch_grid = lambda **kw: dict(sunday_4_time_read)
+    grid_store.fetch_grid_result = lambda **kw: (dict(sunday_4_time_read), True)
     grid_store.fetch_course_grids = lambda **kw: [dict(r) for r in black_rows]
     try:
         # 2026-11-01 is a Sunday, like the 10-25 race's play date.
@@ -430,6 +442,7 @@ def test_weekday_without_a_floor_borrows_one():
             "play_date": "2026-11-01"})
     finally:
         grid_store.fetch_grid, grid_store.fetch_course_grids = real_fetch, real_course
+        grid_store.fetch_grid_result = real_result
     fired = sorted({t for t, _ in FIRES})
     if not fired:
         return _fail("no pre-staged holds fired at all")

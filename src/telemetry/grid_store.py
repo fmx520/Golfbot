@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any, Optional
 
 from .race_log import _sink_headers
@@ -189,34 +190,78 @@ def upsert_grid(
         return False
 
 
-def fetch_grid(*, course_id: str, day_of_week: int) -> Optional[dict[str, Any]]:
-    """Read the stored grid for a course/day. Returns None when absent or on error."""
+# Reading the grid runs at ARM time, minutes before a release, never on the
+# race path -- so a transient failure has budget to be retried, and must be.
+FETCH_ATTEMPTS = 3
+FETCH_RETRY_DELAY_S = 0.6
+
+
+def fetch_grid_result(
+    *, course_id: str, day_of_week: int
+) -> tuple[Optional[dict[str, Any]], bool]:
+    """Read the stored grid. Returns (row_or_None, ok).
+
+    ``ok`` is False ONLY when the read itself failed. A successful read of a
+    course/day we have never seen returns (None, True).
+
+    That distinction is the whole point of this function. On 2026-11-04 a
+    single 5s ReadTimeout here made the Wednesday grid for Bethpage Black
+    invisible; the caller read None as "never seen", inferred the rhythm from
+    other weekdays, and borrowed a release floor from a Monday read taken two
+    months earlier (08:30). The real Wednesday sheet started at 09:30, so all
+    24 pre-staged holds came back "Time not available." The row was there the
+    entire time -- we just could not see it for five seconds, and never asked
+    again.
+    """
     url = _grids_url()
     if not url:
-        return None
-    try:
-        import httpx
+        return None, False
 
-        resp = httpx.get(
-            url,
-            params={
-                "course_id": f"eq.{course_id}",
-                "day_of_week": f"eq.{int(day_of_week)}",
-                "limit": "1",
-            },
-            headers=_sink_headers(),
-            timeout=TIMEOUT_SECONDS,
-        )
-        if resp.status_code >= 400:
-            _log(f"fetch failed {resp.status_code}: {resp.text[:200]}")
-            return None
-        rows = resp.json()
-        if isinstance(rows, list) and rows:
-            return rows[0]
-        return None
-    except Exception as exc:  # noqa: BLE001
-        _log(f"fetch error {type(exc).__name__}: {exc}")
-        return None
+    last_detail = ""
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            import httpx
+
+            resp = httpx.get(
+                url,
+                params={
+                    "course_id": f"eq.{course_id}",
+                    "day_of_week": f"eq.{int(day_of_week)}",
+                    "limit": "1",
+                },
+                headers=_sink_headers(),
+                timeout=TIMEOUT_SECONDS,
+            )
+            if resp.status_code >= 400:
+                last_detail = f"{resp.status_code}: {resp.text[:200]}"
+                _log(f"fetch failed (attempt {attempt}/{FETCH_ATTEMPTS}) {last_detail}")
+            else:
+                rows = resp.json()
+                if isinstance(rows, list) and rows:
+                    return rows[0], True
+                return None, True
+        except Exception as exc:  # noqa: BLE001 -- registry must never block a race
+            last_detail = f"{type(exc).__name__}: {exc}"
+            _log(f"fetch error (attempt {attempt}/{FETCH_ATTEMPTS}) {last_detail}")
+
+        if attempt < FETCH_ATTEMPTS:
+            time.sleep(FETCH_RETRY_DELAY_S)
+
+    _log(
+        f"fetch gave up for course {course_id} dow {day_of_week} after "
+        f"{FETCH_ATTEMPTS} attempts ({last_detail}) -- caller must NOT read this "
+        f"as 'no grid stored'"
+    )
+    return None, False
+
+
+def fetch_grid(*, course_id: str, day_of_week: int) -> Optional[dict[str, Any]]:
+    """Read the stored grid for a course/day. None when absent OR on error.
+
+    Prefer fetch_grid_result() where the difference matters.
+    """
+    row, _ok = fetch_grid_result(course_id=course_id, day_of_week=day_of_week)
+    return row
 
 
 # A tee sheet's interval and phase belong to the COURSE, not the day. Across

@@ -327,7 +327,7 @@ _DOW_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
 _PERSISTED_EVENT_STAGES = frozenset({
     "prestage_disabled", "prestage_grid", "prestage_window", "prestage_capped",
     "prestage_armed", "prestage_rotated", "prestage_fire", "prestage_exhausted",
-    "prestage_released", "multi_course",
+    "prestage_released", "multi_course", "prestage_grid_unreadable",
 })
 
 
@@ -1209,7 +1209,23 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                                        grid=ref_grid.as_dict(), template=template_seed,
                                        source_date=ref_date)
 
-            stored = grid_store.fetch_grid(course_id=str(ps_course), day_of_week=play_dow)
+            stored, grid_read_ok = grid_store.fetch_grid_result(
+                course_id=str(ps_course), day_of_week=play_dow)
+            if not grid_read_ok:
+                # A failed read is NOT "we have never seen this weekday". On
+                # 2026-11-04 one 5s ReadTimeout here cost the whole race: the
+                # Wednesday grid said the sheet starts at 09:30, we could not
+                # see it, inferred the rhythm from other days, borrowed a floor
+                # from a Monday read two months old (08:30), and all 24
+                # pre-staged holds came back "Time not available."
+                _emit_event(queue, phase="sniper", stage="prestage_grid_unreadable",
+                            message=f"Future Sight: could not read the stored grid for "
+                                    f"{_DOW_NAMES[play_dow]} on course {ps_course} — the registry "
+                                    f"did not answer. This is NOT the same as having no grid, so "
+                                    f"targets will not be inferred from other weekdays: a borrowed "
+                                    f"floor can be months stale and every hold then fires at a time "
+                                    f"the sheet does not offer. Running as Sniper (polling) instead, "
+                                    f"which reads the real sheet at the release.")
 
             # Where bookable times actually start on this weekday, learned at a
             # past release. Aiming earlier wins nothing (10-17: 48 holds at
@@ -1218,10 +1234,16 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             target_floor = grid_store.release_floor(stored)
             floor_source = (f"at the {stored.get('source_date')} release"
                             if target_floor and stored else "")
-            if not target_floor:
+            if not target_floor and grid_read_ok:
                 # No trustworthy release read for this weekday (10-25: Black's
                 # only Sunday row was a 4-time read). Borrow from the same
                 # course's days of the same type -- weekend from weekend.
+                #
+                # Gated on grid_read_ok for the same reason as the inference
+                # below: if the registry did not answer, "this weekday has no
+                # floor" is not something we know. Borrowing one anyway is what
+                # put 24 holds at 08:30-09:20 on 2026-11-04 against a sheet
+                # that started at 09:30.
                 borrowed = grid_store.sibling_release_floor(course_id=str(ps_course),
                                                             day_of_week=play_dow)
                 if borrowed:
@@ -1274,7 +1296,9 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             #
             # first/last stay blank on purpose. We know the rhythm, not the
             # operating window, and _gen_targets only needs the rhythm.
-            if not cands or not any(c.get("seen") for c in cands):
+            # Only infer when we KNOW nothing is stored. If the registry simply
+            # did not answer, inferring invents confidence we have not got.
+            if grid_read_ok and (not cands or not any(c.get("seen") for c in cands)):
                 guess = grid_store.infer_grid(course_id=str(ps_course), day_of_week=play_dow)
                 if guess:
                     src = ", ".join(_DOW_NAMES[d] for d in guess["inferred_from"])
@@ -2472,7 +2496,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.13"
+APP_VERSION = "1.14"
 
 @app.get("/health")
 def health() -> dict[str, Any]:

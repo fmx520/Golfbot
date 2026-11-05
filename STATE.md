@@ -157,6 +157,36 @@ human-mimicking timing) is out of scope and was declined. Not revisitable.
 
 ---
 
+## A failed read is not an absent row (2026-11-04)
+
+The whole race was lost to one 5-second timeout. Bethpage Black, play date
+Wednesday 2026-11-11:
+
+```
+23:56:18  GOLFBOT_GRID_STORE fetch error ReadTimeout: The read operation timed out
+23:56:20  "no teesheet has ever been read for this course on a Wednesday"
+          -> inferred rhythm from Mon/Sat/Sun; floor borrowed from Monday's
+             2026-09-07 release: 08:30
+00:00:00  24 holds fired at 08:30-09:20  ->  all "Time not available."
+00:00:43  "kept existing grid for course 2431 dow 2: stored 09:30-16:00, 29 slots"
+```
+
+The Wednesday row was in the table the whole time saying the sheet starts at
+**09:30**. `fetch_grid` returned `None` for a read failure exactly as it does
+for a row that does not exist, so the caller concluded we had never seen a
+Wednesday, inferred from other weekdays, and borrowed a floor from a read two
+months stale. Every hold then fired an hour below the real sheet. Exactly one
+such timeout appears in 30 days of logs — it just landed at arming.
+
+Fixed in v1.14: `fetch_grid_result()` retries three times and returns
+`(row, ok)`, and arming will no longer infer a grid *or* borrow a sibling floor
+when `ok` is False — it says so and runs as Sniper instead. `timing.cpu_throttle`
+read `throttled_ms: 0` for this race, so CPU had nothing to do with it.
+
+**The general rule: when a lookup can fail, "I could not read it" and "there is
+nothing there" must not return the same value.** Anywhere else that pattern
+exists here, treat it as a bug.
+
 ## Things that will mislead you
 
 Written because each one cost real time this session.
@@ -338,7 +368,16 @@ per-course and never global.
 ## Running the tests
 
 No pytest; each file is standalone and self-reporting. A fresh container needs
-`pip install -r requirements.txt` first.
+dependencies installed first — and **use `python3 -m pip`, not `pip`**: in this
+image `pip` belongs to Python 3.13 while `python3` is 3.11, so plain `pip
+install` reports success and leaves `import fastapi` failing.
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+If a test fails right after you edited a module and the edit looks correct, drop
+stale bytecode before believing it: `find . -name __pycache__ -exec rm -rf {} +`.
 
 ```bash
 python3 tests/test_prestage_concurrency.py   # ~3 min: aligns to minute boundaries
