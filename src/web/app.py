@@ -329,6 +329,9 @@ _DOW_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
 # moved between the September and October reads.
 GRID_STALE_WARN_DAYS = 21
 
+# How many targets one burst pass fires at once.
+PRESTAGE_MAX_TARGETS = 6
+
 
 def _age_days(source_date: str) -> int | None:
     try:
@@ -1830,6 +1833,23 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         # The thread only ACQUIRES holds. Completing one (2FA, payment) stays
         # on the main thread, so there is exactly one booking path and no way
         # to double-book or race two code prompts against each other.
+        # What the POLL has actually seen on the sheet. The burst re-aims at
+        # this the moment it exists.
+        #
+        # Across seven Bethpage Future Sight races, 186 pre-staged holds were
+        # fired and 3 were accepted. The reason is in run 9621586f744b: the
+        # burst fired 66 holds at 07:00-07:50 while the sheet started at 09:30,
+        # and the poll won 09:30 on its first attempt. Bethpage sells out too
+        # fast for the harvester to ever learn a floor, so without one the
+        # targets start at the user's window start -- two and a half hours
+        # below reality -- and the burst then re-fires those same dead times
+        # for the whole five-second window.
+        #
+        # The poll knows the truth within a second. Re-aiming at it turns the
+        # remaining passes from guesses into shots at real tee times.
+        observed_times: list[str] = []
+        observed_lock = Lock()
+
         prestage_win: dict[str, Any] = {}
         prestage_win_lock = Lock()
         prestage_stop = Event()
@@ -1888,12 +1908,37 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             # the main thread can steal the 2FA code mid-booking. The burst
             # window is seconds, and the main loop sets prestage_stop the
             # moment it sees a cancel.
+            tried: set[str] = set()
+            reaimed = False
+
             while not prestage_stop.is_set():
                 burst_pass += 1
                 # A ForeUp release is not atomic at T+0.000 -- the sheet can
                 # publish a beat late -- so the whole target list re-fires in
                 # passes until the burst window closes. Rejections cost nothing
                 # and hold nothing.
+                #
+                # But re-firing the SAME times is only right while we still
+                # believe them. Once the poll has seen the sheet, it is the
+                # only authority on what exists, so aim there instead.
+                with observed_lock:
+                    seen = list(observed_times)
+                fresh = [t for t in seen if t not in tried]
+                if fresh:
+                    times = fresh[:PRESTAGE_MAX_TARGETS]
+                    if not reaimed:
+                        reaimed = True
+                        _emit_event(queue, phase="sniper", stage="prestage_reaimed",
+                                    message=f"Future Sight: re-aiming at what the sheet actually "
+                                            f"shows — {', '.join(times)}. The pre-staged targets "
+                                            f"were refused as times this sheet does not offer, and "
+                                            f"polling has since seen the real ones.")
+                        race.record_warning(
+                            "reaimed_from_poll",
+                            f"Pre-staged targets were off the sheet; the burst re-aimed at times "
+                            f"polling actually saw ({', '.join(times)}). The stored release floor "
+                            f"for this course/weekday is wrong or missing.")
+                tried.update(times)
                 race.record_first_poll(time.perf_counter())
                 with ThreadPoolExecutor(max_workers=max(1, len(times))) as pool:
                     futures = [pool.submit(_fire, t) for t in times]
@@ -2164,6 +2209,24 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
 
             loop_ms = round((time.perf_counter() - loop_start) * 1000, 1)
             race.record_poll(loop_ms, len(slots), poll_result)
+
+            # Hand the burst the truth. It is firing at a stored floor that may
+            # be hours wrong; these are times ForeUp just said exist.
+            if slots and prestage_thread is not None and prestage_thread.is_alive():
+                win_lo = _hhmm_to_min(payload["time_start"]) or 0
+                win_hi = _hhmm_to_min(payload["time_end"]) or 24 * 60
+                fresh: list[str] = []
+                for sl in slots:
+                    raw_t = str(sl.get("time", ""))
+                    hhmm = raw_t.split(" ", 1)[1][:5] if " " in raw_t else raw_t[:5]
+                    mins = _hhmm_to_min(hhmm)
+                    if mins is not None and win_lo <= mins <= win_hi:
+                        fresh.append(hhmm)
+                if fresh:
+                    with observed_lock:
+                        for t in sorted(set(fresh)):
+                            if t not in observed_times:
+                                observed_times.append(t)
 
             # A pre-staged hold that landed DURING this poll beats anything the
             # poll just found -- we already own that time, nobody can take it.
@@ -2569,7 +2632,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.16"
+APP_VERSION = "1.17"
 
 @app.get("/health")
 def health() -> dict[str, Any]:

@@ -32,6 +32,7 @@ os.environ.pop("SUPABASE_URL", None)
 os.environ.pop("SUPABASE_SERVICE_KEY", None)
 
 import src.web.app as app  # noqa: E402
+from src.discovery.foreup_client import ForeUpError  # noqa: E402
 
 
 class FakeDiscovery:
@@ -122,8 +123,10 @@ class FakeBooking:
 
     def book_slot(self, *, slot=None, **kw):
         POLL_BOOKS.append((slot or {}).get("time", "?"))
-        raise RuntimeError('{"success":false,"message":"Sorry, that tee time is '
-                           'no longer available."}')
+        # ForeUpError, not RuntimeError: the poll path only catches the former,
+        # so anything else kills the worker and the burst never gets a 2nd pass.
+        raise ForeUpError('Client error 400 | Body: {"success":false,'
+                          '"message":"Sorry, that tee time is no longer available."}')
 
     def refresh_pending_reservation(self, *, pending_reservation_id="", **kw):
         REFRESHED.append(pending_reservation_id)
@@ -454,6 +457,34 @@ def test_weekday_without_a_floor_borrows_one():
     if not told:
         return _fail("no prestage_grid decision saying the floor was borrowed from Saturday")
     print(f"  ok: Sunday, no floor of its own -> Saturday's 09:00 -> fired {fired}")
+
+
+def test_burst_reaims_at_what_the_poll_sees():
+    """The Bethpage pattern: pre-staged targets below the sheet, poll knows better.
+
+    Run 9621586f744b (2026-10-21, Bethpage Black): the burst fired 66 holds at
+    07:00-07:50 while the sheet started at 09:30, and the poll won 09:30 on its
+    first attempt. Across seven Bethpage races the burst fired 186 holds for 3
+    accepts. Re-firing dead times for five seconds is the whole loss.
+    """
+    # Nothing below 09:30 exists; the burst's stored floor aims at 08:30.
+    FakeDiscovery.SLOW_POLL_S = 0.15
+    FakeDiscovery.POLL_SLOTS = [
+        {"time": f"2026-09-07 {t}", "available_spots": 4, "green_fee": 80,
+         "raw": {"schedule_id": "2431", "course_id": "2431"}}
+        for t in ("09:30", "09:40", "09:50")
+    ]
+    FakeBooking.HOLD_LATENCY = 0.1
+    _run(accept={"09:40"}, preserve_fakes=True, payload_overrides={
+        "prestage_times": ["08:30", "08:50", "09:10", "09:20"],
+        "time_start": "08:00", "time_end": "10:00"})
+    fired = {t for t, _ in FIRES}
+    reaimed = fired & {"09:30", "09:40", "09:50"}
+    if not reaimed:
+        return _fail(f"burst never re-aimed; it only ever fired {sorted(fired)}")
+    if not COMPLETED:
+        return _fail(f"re-aimed to {sorted(reaimed)} but booked nothing")
+    print(f"  ok: burst re-aimed onto {sorted(reaimed)} and booked {COMPLETED[0]}")
 
 
 if __name__ == "__main__":

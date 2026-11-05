@@ -252,6 +252,47 @@ from races r, lateral jsonb_array_elements(r.attempts) a
 where left(r.run_id,12) = '<run>';
 ```
 
+## Why Bethpage kept losing, and what fixed it (v1.17)
+
+Across seven Bethpage Future Sight races the burst fired **186 pre-staged holds
+and 3 were accepted**. Montauk, same code, same night: 5 of 6. It was never a
+Black-only problem and it was never speed.
+
+Run `9621586f744b` (2026-10-21, Black) is the clean proof:
+
+```
+BURST fired:     07:00, 07:10, 07:20, 07:30, 07:40, 07:50   (66 holds, 0 accepted)
+POLL attempted:  09:30                                       -> WON
+```
+
+The sheet started at 09:30. The burst spent the whole window two and a half
+hours below it. Tonight (11-04) the same thing an hour below: 08:30-09:20
+against a 09:30 sheet.
+
+**The chain:** Bethpage sells out faster than the harvester can ever read it
+(Black shows 0-1 open slots on every day of the visible window), so there is no
+trustworthy release floor. Without a floor, targets start at the user's
+`time_start` — often 07:00. The burst then re-fires those dead times for the
+full five seconds while the poll, within one second, is looking at the real
+sheet.
+
+**v1.17:** the poll publishes every in-window time it sees into `observed_times`,
+and each burst pass after the first re-aims at them. Guesses at T+0, reality as
+soon as reality is known. A re-aim records the `reaimed_from_poll` warning, which
+also marks that course/weekday's stored floor as wrong.
+
+This is the first change in this file that should convert races rather than
+explain losses. If Bethpage still loses after it, compare what the burst fired
+against what the poll saw — that query is two rows and settles it:
+
+```sql
+select 'burst' src, string_agg(distinct p->>'time', ', ' order by p->>'time') times
+from races r, lateral jsonb_array_elements(r.prestage) p where left(r.run_id,12)='<run>'
+union all
+select 'poll', string_agg(a->>'slot_time', ', ' order by a->>'slot_time')
+from races r, lateral jsonb_array_elements(r.attempts) a where left(r.run_id,12)='<run>';
+```
+
 ## Things that will mislead you
 
 Written because each one cost real time this session.
