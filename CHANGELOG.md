@@ -17,7 +17,7 @@ the subject: `git log --oneline --grep='(v0\.' -i`.
 
 | Version | Date | Summary | Commit |
 |---|---|---|---|
-| 1.14 | 2026-11-04 | A failed grid read no longer reads as "never seen" — retry, and never infer a grid or floor from a failed lookup | `pending` |
+| 1.14 | 2026-11-04 | A failed grid read no longer reads as "never seen" — retry, and never infer a grid or floor from a failed lookup | `a40c431` |
 | 1.13 | 2026-10-25 | A weekday with no good release read borrows its floor from the course's same-type days | `422b1d9` |
 | 1.12 | 2026-10-22 | HTTP/2 connection made safe to share between burst threads (10-17 / 10-21 failures); HTTP stack pinned; /health reports h2_guard | `671b6dd` |
 | 1.11 | 2026-10-18 | Future Sight aims from the earliest time seen bookable at a release, not the window start | `a1660d1` |
