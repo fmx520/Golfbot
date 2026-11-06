@@ -293,6 +293,38 @@ select 'poll', string_agg(a->>'slot_time', ', ' order by a->>'slot_time')
 from races r, lateral jsonb_array_elements(r.attempts) a where left(r.run_id,12)='<run>';
 ```
 
+## What a lost race records (v1.18)
+
+A race now leaves behind enough to diagnose it without another week of waiting:
+
+| where | what |
+|---|---|
+| `summary` | leads with `!! CODE — detail` when anything compromised the race |
+| `warnings` | `aimed_off_sheet`, `grid_unreadable`, `stale_grid`, `borrowed_floor`, `inferred_grid`, `reaimed_from_poll` |
+| `prestage[]` | every hold fired: time, result, latency, error, `payload_sent` |
+| `attempts[]` | every submit: `slot_polled` (as advertised), `payload_sent`, `mismatch` |
+| `polls.observed[]` | **every in-window time the sheet actually showed, with ms from release** |
+| `prestage_decision[]` | the whole arming story, keyed to the run |
+| `timing.cpu_throttle` | whether the CPU quota stalled us (so far: never) |
+
+`polls.observed` is the one that answers the question that took a month to ask:
+**did we aim at times that existed?** Counts could not. Compare it against what
+the burst fired:
+
+```sql
+select
+  (select string_agg(distinct p->>'time', ', ' order by p->>'time')
+     from jsonb_array_elements(r.prestage) p)            as burst_fired,
+  (select string_agg(o->>'time', ', ' order by o->>'time')
+     from jsonb_array_elements(r.polls->'observed') o)   as sheet_showed,
+  r.warnings
+from races r where left(r.run_id,12) = '<run>';
+```
+
+If `burst_fired` and `sheet_showed` do not overlap, the release floor for that
+course/weekday is wrong — that is the Bethpage failure, and it is now visible
+in one row instead of inferred from an error string.
+
 ## Things that will mislead you
 
 Written because each one cost real time this session.

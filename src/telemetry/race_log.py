@@ -316,6 +316,9 @@ def _percentile_ms(values: list[float], pct: float) -> Optional[float]:
     return round(ordered[max(0, min(rank, len(ordered)) - 1)], 2)
 
 
+OBSERVED_CAP = 60
+
+
 @dataclass
 class PollStats:
     count: int = 0
@@ -323,6 +326,12 @@ class PollStats:
     antibot: int = 0
     error: int = 0
     latencies_ms: list[float] = field(default_factory=list)
+    # Every in-window time the sheet actually showed, and when it was first
+    # seen. Counts alone cannot answer the question that matters after a loss:
+    # did we aim at times that existed? Run 9621586f744b fired 66 holds at
+    # 07:00-07:50 against a sheet starting at 09:30, and the only reason we
+    # know is that the poll happened to attempt one of the real ones.
+    observed: dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -333,6 +342,13 @@ class PollStats:
             "p50_ms": _percentile_ms(self.latencies_ms, 50),
             "p95_ms": _percentile_ms(self.latencies_ms, 95),
             "max_ms": round(max(self.latencies_ms), 2) if self.latencies_ms else None,
+            # Capped: a freshly released sheet can carry a hundred times and
+            # the earliest are the ones a race is decided on.
+            "observed_count": len(self.observed),
+            "observed": [
+                {"time": t, "first_seen_ms": round(ms, 1)}
+                for t, ms in sorted(self.observed.items())[:OBSERVED_CAP]
+            ],
         }
 
 
@@ -455,6 +471,15 @@ class RaceRecorder:
         if self.first_poll_offset_ms is not None or self._release_monotonic is None:
             return
         self.first_poll_offset_ms = round((at_monotonic - self._release_monotonic) * 1000, 2)
+
+    def record_observed(self, hhmm: str) -> None:
+        """Note a time the sheet showed, with its offset from the release."""
+        if hhmm in self.polls.observed:
+            return
+        off = None
+        if self._release_monotonic is not None:
+            off = (time.perf_counter() - self._release_monotonic) * 1000
+        self.polls.observed[hhmm] = off if off is not None else -1.0
 
     def record_poll(self, latency_ms: float, slot_count: int, result: str = "ok") -> None:
         self.polls.count += 1

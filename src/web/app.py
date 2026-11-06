@@ -2227,6 +2227,9 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                         for t in sorted(set(fresh)):
                             if t not in observed_times:
                                 observed_times.append(t)
+                                # Persist it too: after a loss, "what did the
+                                # sheet actually show" is the first question.
+                                race.record_observed(t)
 
             # A pre-staged hold that landed DURING this poll beats anything the
             # poll just found -- we already own that time, nobody can take it.
@@ -2632,7 +2635,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.17"
+APP_VERSION = "1.18"
 
 @app.get("/health")
 def health() -> dict[str, Any]:

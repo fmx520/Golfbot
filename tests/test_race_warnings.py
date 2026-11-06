@@ -97,13 +97,45 @@ def test_no_warnings_leaves_the_summary_alone():
     check("clean races read as before", not line.startswith("!!"), line[:70])
 
 
+def test_sheet_times_are_recorded_for_the_postmortem():
+    """What the sheet SHOWED, not just what we attempted.
+
+    Run 9621586f744b fired 66 holds at 07:00-07:50 against a sheet starting at
+    09:30, and we only know because the poll happened to attempt one real time.
+    Counts cannot answer "did we aim at times that existed".
+    """
+    import time as _t
+    r = _rec()
+    r.mark_release_instant(_t.perf_counter())
+    for t in ("09:30", "09:40", "09:50"):
+        r.record_observed(t)
+    r.record_observed("09:30")                      # duplicate
+    d = r.as_dict()["polls"]
+    check("counted distinct times", d["observed_count"] == 3, d)
+    check("kept the times themselves",
+          [o["time"] for o in d["observed"]] == ["09:30", "09:40", "09:50"], d)
+    check("stamped when each was first seen",
+          all(o["first_seen_ms"] >= 0 for o in d["observed"]), d)
+
+
+def test_observed_is_capped():
+    r = _rec()
+    for m in range(400, 400 + 90):
+        r.record_observed(f"{m // 60:02d}:{m % 60:02d}")
+    d = r.as_dict()["polls"]
+    check("full count kept", d["observed_count"] == 90, d["observed_count"])
+    check("list capped", len(d["observed"]) == 60, len(d["observed"]))
+
+
 if __name__ == "__main__":
     for fn in (test_the_2026_11_04_race_now_flags_itself,
                test_losing_to_a_competitor_is_not_flagged,
                test_a_won_hold_is_never_flagged,
                test_mixed_rejections_are_not_flagged,
                test_arm_time_warnings_survive_to_the_record,
-               test_no_warnings_leaves_the_summary_alone):
+               test_no_warnings_leaves_the_summary_alone,
+               test_sheet_times_are_recorded_for_the_postmortem,
+               test_observed_is_capped):
         print(f"\n{fn.__name__}")
         fn()
     print(f"\n{'PASS' if FAILURES == 0 else str(FAILURES) + ' FAILURE(S)'}")
