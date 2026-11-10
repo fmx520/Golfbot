@@ -33,12 +33,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from src.booking.foreup_client import ForeUpBookingClient, classify_reservation_response
-from src.config import load_config
 from src.courses import COURSE_CATALOG, cached_preflight, run_preflight
 from src.discovery.foreup_client import AntiBotDetectedError, ForeUpDiscoveryClient, ForeUpError, StaleSlotError
 from src.discovery import checkout_scan, h2_guard
@@ -304,7 +303,6 @@ JOB_LOCK = Lock()
 # is ~250ms, so this is many cycles of headroom; the only thing that legitimately
 # takes longer is an in-flight booking, which we want to let finish.
 CANCEL_GRACE_SECONDS = 10.0
-APP_CONFIG = load_config()
 
 
 def _event(job: JobState, stage: str, message: str, **extra: Any) -> None:
@@ -897,9 +895,9 @@ def _worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_queue: 
                 phase="verify",
                 stage="booking_code_required",
                 message=(
-                    "This course requires an email booking code (2FA). The bot does not yet "
-                    "implement the request-code endpoint for this course. The slot was held briefly "
-                    "but will be released. To finish booking, complete it manually on foreupsoftware.com."
+                    "This course requires an email booking code (2FA) and the booking did not "
+                    "complete — the code was not entered in time or ForeUp rejected it. The hold "
+                    "will lapse. To finish booking, complete it manually on foreupsoftware.com."
                 ),
                 terminal="failed",
                 provider_message=msg,
@@ -953,8 +951,6 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         queue.put({"type": "status", "status": "failed"})
         _finalize_worker()
         return
-
-    from datetime import date as date_cls
 
     now = datetime.now(EAST_COAST_TZ)
     if release_time_str:
@@ -1022,10 +1018,9 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         per = " per player" if raw.get("booking_fee_per_person") else ""
         cost = f"${price}{per}" if price else "a booking fee"
         _emit_event(queue, phase="sniper", stage="booking_fee_required",
-                    message=f"Heads up: this course charges {cost} at checkout. We can win the "
-                            f"hold, but the reservation we send carries no payment, so ForeUp "
-                            f"will refuse to convert it — the race is winnable and the booking "
-                            f"is not. Nothing here is a speed problem.")
+                    message=f"Heads up: this course charges {cost} at checkout. The bot never "
+                            f"handles card details, so when it wins a hold it will keep the hold "
+                            f"alive and hand you ForeUp's own payment link to finish there.")
 
     def _learn_grid_from_race() -> None:
         """Bank what this race saw about the course's grid. Never raises."""
@@ -1143,8 +1138,8 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         if len(raw_targets) > 4:
             _emit_event(queue, phase="sniper", stage="prestage_capped",
                         message=f"Future Sight: {len(raw_targets)} targets given, using the first 4 "
-                                f"({', '.join(raw_targets[:4])}). Holds fire one at a time and a "
-                                f"rejection costs ~0.5s, so a long list just delays the poll fallback.")
+                                f"({', '.join(raw_targets[:4])}). Explicit targets are capped so the "
+                                f"burst stays concentrated on the times you care most about.")
             raw_targets = raw_targets[:4]
 
         def _gen_targets(interval: int, phase: int, cap: int = 6,
@@ -1225,9 +1220,17 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             play_dow = play_dt.weekday()
             win_start, win_end = payload["time_start"], payload["time_end"]
 
-            # Bank a good live read whether or not we end up aiming with it.
-            if ref_grid.interval_minutes and ref_grid.consistent:
-                grid_store.upsert_grid(course_id=str(ps_course), day_of_week=play_dow,
+            # Bank a good live read whether or not we end up aiming with it --
+            # under the weekday it was READ FOR, not the play date's. The
+            # fallback reference is "tomorrow", which is usually a different
+            # weekday; filing its first/last times under the play weekday put a
+            # wrong operating window (and a wrong release floor) on that row.
+            if ref_grid.interval_minutes and ref_grid.consistent and ref_date:
+                try:
+                    ref_dow = datetime.strptime(ref_date, "%Y-%m-%d").date().weekday()
+                except ValueError:
+                    ref_dow = play_dow
+                grid_store.upsert_grid(course_id=str(ps_course), day_of_week=ref_dow,
                                        grid=ref_grid.as_dict(), template=template_seed,
                                        source_date=ref_date)
 
@@ -1740,6 +1743,11 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             stop_refresh.set()
             race.code_wait_ms = round((time.perf_counter() - code_wait_started) * 1000, 2)
             if isinstance(cmd, dict) and cmd.get("type") == "cancel":
+                # Hand the cancel back: the caller treats this error as a lost
+                # slot and resumes polling, and only _cancel_requested() ends
+                # the run. Swallowing it here meant the job polled on until the
+                # hard stop killed it, taking the race record with it.
+                cmd_queue.put(cmd)
                 raise ForeUpError("Stopped by user while awaiting the booking code")
             code = cmd.get("code", "")
             _emit_event(queue, phase="verify", stage="submitting_code",
@@ -2210,9 +2218,19 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
             loop_ms = round((time.perf_counter() - loop_start) * 1000, 1)
             race.record_poll(loop_ms, len(slots), poll_result)
 
-            # Hand the burst the truth. It is firing at a stored floor that may
-            # be hours wrong; these are times ForeUp just said exist.
-            if slots and prestage_thread is not None and prestage_thread.is_alive():
+            # Note what the sheet showed, and hand the burst the truth: it is
+            # firing at a stored floor that may be hours wrong, and these are
+            # times ForeUp just said exist.
+            #
+            # Recorded on EVERY poll, burst or no burst -- after a loss, "what
+            # did the sheet actually show" is the first question, and it used to
+            # go unanswered for any race without a live burst thread. Only the
+            # burst's own course is published to it: with several courses in
+            # rotation, another course's times would re-aim holds at a sheet
+            # they do not belong to.
+            if slots:
+                burst_course = str(prestage_plan["course"]) if prestage_plan else ""
+                primary = str(current_teesheet) == (burst_course or str(sniper_course_ids[0]))
                 win_lo = _hhmm_to_min(payload["time_start"]) or 0
                 win_hi = _hhmm_to_min(payload["time_end"]) or 24 * 60
                 fresh: list[str] = []
@@ -2222,14 +2240,14 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
                     mins = _hhmm_to_min(hhmm)
                     if mins is not None and win_lo <= mins <= win_hi:
                         fresh.append(hhmm)
-                if fresh:
+                for t in sorted(set(fresh)):
+                    race.record_observed(t if primary else f"{current_teesheet} {t}")
+                if (fresh and burst_course and str(current_teesheet) == burst_course
+                        and prestage_thread is not None and prestage_thread.is_alive()):
                     with observed_lock:
                         for t in sorted(set(fresh)):
                             if t not in observed_times:
                                 observed_times.append(t)
-                                # Persist it too: after a loss, "what did the
-                                # sheet actually show" is the first question.
-                                race.record_observed(t)
 
             # A pre-staged hold that landed DURING this poll beats anything the
             # poll just found -- we already own that time, nobody can take it.
@@ -2404,8 +2422,12 @@ def _sniper_worker_main(job_id: str, payload: dict[str, Any], queue: Queue, cmd_
         prestage_stop.set()
         if prestage_thread is not None:
             prestage_thread.join(timeout=10)
+        # _take_prestage_win() clears the win when the booking path uses it, so
+        # anything still here was NOT used -- even when the race was won by the
+        # poll path. It used to be released only on a loss, which left a second
+        # live hold squatting on the sheet after a poll-path win.
         leftover = _take_prestage_win()
-        if leftover and not booked:
+        if leftover:
             _release_hold(leftover[1])
             _emit_event(queue, phase="sniper", stage="prestage_released",
                         message=f"Released the unused pre-staged hold at {leftover[0]} "
@@ -2543,7 +2565,7 @@ def _run_playwright_fallback(
     password: str,
 ) -> None:
     try:
-        from src.booking.playwright_fallback import PlaywrightBookingClient, PlaywrightBookingError
+        from src.booking.playwright_fallback import PlaywrightBookingClient
 
         booking_url = payload.get("foreup_booking_url") or base_url
         pw_client = PlaywrightBookingClient()
@@ -2635,7 +2657,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.18"
+APP_VERSION = "1.19"
 
 @app.get("/health")
 def health() -> dict[str, Any]:
@@ -2732,6 +2754,17 @@ def connect(req: ConnectRequest) -> dict[str, Any]:
     }
 
 
+def _forked_worker_entry(worker_fn: Any, *args: Any) -> None:
+    """First thing a job process runs: stop sharing the web process's socket.
+
+    The worker is a fork, so it starts life holding the parent's ForeUp client
+    -- same connection, same cookies, same login header. Give it its own before
+    it makes a single request.
+    """
+    ForeUpDiscoveryClient.reset_shared_client()
+    worker_fn(*args)
+
+
 @app.post("/api/jobs")
 def start_job(req: StartJobRequest) -> dict[str, str]:
     job_id = uuid.uuid4().hex[:12]
@@ -2753,7 +2786,8 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
     cmd_queue: Queue = Queue()
     CMD_QUEUES[job_id] = cmd_queue
     worker_fn = _sniper_worker_main if full_payload.get("sniper_mode") else _worker_main
-    proc = Process(target=worker_fn, args=(job_id, full_payload, queue, cmd_queue), daemon=True)
+    proc = Process(target=_forked_worker_entry,
+                   args=(worker_fn, job_id, full_payload, queue, cmd_queue), daemon=True)
     proc.start()
     JOB_PROCS[job_id] = proc
 
@@ -3330,29 +3364,6 @@ def get_harvest(harvest_id: str) -> dict[str, Any]:
             "login_failures": list(job.login_failures),
             "error": job.error,
         }
-
-
-@app.get("/api/courses")
-def list_courses(q: str = "") -> dict[str, Any]:
-    query = q.strip().lower()
-    matches = []
-    for course_id, settings in APP_CONFIG.courses.items():
-        if query and query not in course_id.lower():
-            continue
-        matches.append(
-            {
-                "course_id": course_id,
-                "display_name": course_id.replace("_", " ").title(),
-                "default_players": settings.player_count,
-                "schedule_id": settings.schedule_id,
-                "foreup_course_id": settings.foreup_course_id,
-                "booking_url": settings.booking_url,
-                "holes": settings.holes,
-                "poll_interval_seconds": settings.poll_interval_seconds,
-                "target_windows": [{"start": w.start, "end": w.end} for w in settings.target_windows],
-            }
-        )
-    return {"source": "config/courses.yaml", "courses": matches}
 
 
 @app.get("/api/jobs/{job_id}")

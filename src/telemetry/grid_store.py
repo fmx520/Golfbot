@@ -22,7 +22,6 @@ registry failure must never block a race.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import sys
@@ -130,7 +129,14 @@ def upsert_grid(
     # (course_id, day_of_week) with merge-duplicates, i.e. a blind overwrite, so
     # this comparison is the only thing standing between a fully-booked
     # reference day and the grid Future Sight aims with.
-    existing = fetch_grid(course_id=str(course_id), day_of_week=int(day_of_week))
+    existing, read_ok = fetch_grid_result(course_id=str(course_id), day_of_week=int(day_of_week))
+    if not read_ok:
+        # Could not see what is stored, so cannot tell whether this write would
+        # be a downgrade. Skip it: a missed refresh costs nothing, a thin read
+        # overwriting a release-day grid costs a race.
+        _log(f"skipped upsert for course {course_id} dow {day_of_week}: "
+             f"could not read the stored row to compare against")
+        return False
     if existing:
         new_q = _grid_quality(first, last, observed)
         old_q = _grid_quality(

@@ -17,6 +17,7 @@ the subject: `git log --oneline --grep='(v0\.' -i`.
 
 | Version | Date | Summary | Commit |
 |---|---|---|---|
+| 1.19 | 2026-11-10 | Audit: always release an unused pre-staged hold; bank reference reads under their own weekday; re-aim only from the burst's course; cancel during the code wait ends the run; forked workers get their own HTTP client; removed dead scaffolding, `/api/courses`, `config/` | _this commit_ |
 | 1.18 | 2026-11-06 | Record every in-window time the sheet actually showed, so a loss can be diffed against reality | `99dd80d` |
 | 1.17 | 2026-11-04 | The burst re-aims at times polling actually sees, instead of re-firing a wrong floor for 5s | `b48e71f` |
 | 1.16 | 2026-11-04 | Failed holds record the slot as advertised vs the payload sent, and name the mismatch | `eb227e4` |

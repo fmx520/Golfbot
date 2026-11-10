@@ -140,7 +140,7 @@ def _align_to_release(lead_s: float = 4.0) -> str:
     parks just before a minute boundary rather than faking time -- this
     exercises the real countdown path.
     """
-    from datetime import datetime, timedelta
+    from datetime import datetime
     nxt = (int(time.time()) // 60 + 1) * 60
     while nxt - time.time() > lead_s:
         time.sleep(0.05)
@@ -256,7 +256,7 @@ def test_single_win_books_once() -> None:
         return _fail(f"expected one booking at 08:50, got {COMPLETED}")
     if RELEASED:
         return _fail(f"nothing should have been released, got {RELEASED}")
-    print(f"  ok: single hold booked once, nothing released")
+    print("  ok: single hold booked once, nothing released")
 
 
 def test_win_landing_mid_poll_beats_the_poll_path():
@@ -500,7 +500,7 @@ if __name__ == "__main__":
         print(f"\n{fn.__name__}")
         try:
             fn()
-        except Exception as exc:
+        except Exception:
             FAILURES += 1
             import traceback; traceback.print_exc()
     print(f"\n{'PASS' if FAILURES == 0 else str(FAILURES) + ' FAILURE(S)'}")

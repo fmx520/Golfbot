@@ -293,6 +293,21 @@ select 'poll', string_agg(a->>'slot_time', ', ' order by a->>'slot_time')
 from races r, lateral jsonb_array_elements(r.attempts) a where left(r.run_id,12)='<run>';
 ```
 
+## Audit fixes (v1.19)
+
+- An unused pre-staged hold is released however the race ended. It used to be
+  released only on a loss, so a poll-path win could leave a second hold on the sheet.
+- The arming reference read is banked under the weekday it was read for. The
+  fallback reference is "tomorrow"; it used to be filed under the play date's weekday.
+- `observed_times` (the burst's re-aim feed) only takes times from the burst's own
+  course. `polls.observed` is recorded on every poll, burst or not; other courses in
+  a rotation are keyed `"<teesheet> HH:MM"`.
+- `upsert_grid` skips the write when it cannot read the stored row to compare.
+- Job workers call `ForeUpDiscoveryClient.reset_shared_client()` first thing: they
+  are forks and were inheriting the web process's open HTTP/2 socket and login header.
+- Gone: `src/auth`, `src/scheduler`, `src/config.py`, `config/courses.yaml`,
+  `/api/courses`, the `interfaces.py`/`service.py`/`executor.py` stubs. Nothing imported them.
+
 ## What a lost race records (v1.18)
 
 A race now leaves behind enough to diagnose it without another week of waiting:

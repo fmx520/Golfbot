@@ -32,8 +32,7 @@ pick one — there is nothing to copy and paste:
 They live in [`src/courses.py`](src/courses.py), which is the single source of
 truth: every schedule and course ID the app uses is parsed out of these URLs, so
 fixing a link there fixes it in the picker, in jobs, in the sniper, and in the
-grid probe at once. (`config/courses.yaml` is a separate, CLI-oriented file for
-per-course polling and retry defaults — it does not feed the picker.)
+grid probe at once.
 
 ### The link precheck
 
@@ -293,14 +292,14 @@ normal partial week doesn't spam a "workflow failed" notification.
 
 ```
 src/
-  auth/          — Session token/cookie management interfaces
-  booking/       — ForeUp booking client, executor, Playwright fallback
-  discovery/     — ForeUp tee time discovery client
-  scheduler/     — High-frequency polling scheduler
-  telemetry/     — Latency measurement and metrics
-  web/           — FastAPI web server with inline UI
-  config.py      — YAML config loading, secret redaction
+  booking/       — ForeUp booking client, Playwright fallback
+  captcha/       — Optional AntiCaptcha solver
+  discovery/     — ForeUp discovery client, tee-grid inference, HTTP/2 thread guard
+  telemetry/     — Race records, the course_grids registry, the grid harvester
+  web/           — FastAPI server, job workers, the sniper race loop
   courses.py     — Supported-course catalog + the ForeUp link precheck
-config/
-  courses.yaml   — Per-course settings (schedule IDs, time windows, retry profiles)
+static/          — The UI (index.html, js/app.js, css/style.css)
+supabase/        — schema.sql for the races and course_grids tables
+scripts/         — Harvest, sink verification, schema-drift check, run analysis
+tests/           — Standalone scripts: python3 tests/<file>.py
 ```

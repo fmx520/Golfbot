@@ -69,7 +69,7 @@ def check(table: str, keys: set[str], ignore: set[str], kind: str) -> int:
         print("PostgREST will reject every write, not only the ones using them:\n")
         for name in missing:
             print(f"  - {name}")
-        print(f"\nAdd them to supabase/schema.sql and run against the live table:\n")
+        print("\nAdd them to supabase/schema.sql and run against the live table:\n")
         for name in missing:
             print(f"  alter table {table} add column if not exists {name} jsonb;")
         return 1
