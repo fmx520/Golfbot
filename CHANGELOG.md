@@ -17,7 +17,7 @@ the subject: `git log --oneline --grep='(v0\.' -i`.
 
 | Version | Date | Summary | Commit |
 |---|---|---|---|
-| 1.20 | 2026-11-10 | Revert v1.19's per-worker HTTP client — it changed how every race connects with no failure on record to justify it | _this commit_ |
+| 1.20 | 2026-11-10 | Revert v1.19's per-worker HTTP client — it changed how every race connects with no failure on record to justify it | `8626411` |
 | 1.19 | 2026-11-10 | Audit: always release an unused pre-staged hold; bank reference reads under their own weekday; re-aim only from the burst's course; cancel during the code wait ends the run; forked workers get their own HTTP client; removed dead scaffolding, `/api/courses`, `config/` | `a939cc9` |
 | 1.18 | 2026-11-06 | Record every in-window time the sheet actually showed, so a loss can be diffed against reality | `99dd80d` |
 | 1.17 | 2026-11-04 | The burst re-aims at times polling actually sees, instead of re-firing a wrong floor for 5s | `b48e71f` |
