@@ -165,19 +165,6 @@ class ForeUpDiscoveryClient:
                 )
         return cls._shared_client
 
-    @classmethod
-    def reset_shared_client(cls) -> None:
-        """Forget the shared client so the next instance opens its own.
-
-        Job workers are forked. Without this a child inherits the web process's
-        client object -- the same open HTTP/2 socket, the same cookie jar, and
-        whatever default headers the last login left on it -- and two processes
-        then write frames onto one TLS connection. The reference is dropped,
-        not closed: closing would shut down a socket the parent is still using.
-        """
-        cls._client_lock = Lock()
-        cls._shared_client = None
-
     def _init_session(self, schedule_id: str = "19765", teesheet_id: str = "") -> None:
         """Load the booking page to establish a PHPSESSID cookie and extract booking classes."""
         response = self.client.get(f"{self.base_url}/index.php/booking/{schedule_id}")

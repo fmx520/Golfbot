@@ -1,10 +1,9 @@
 """Regressions for the v1.19 audit fixes that can be checked without a race.
 
-1. upsert_grid must not write when it cannot read the stored row: the
+upsert_grid must not write when it cannot read the stored row: the
    no-downgrade comparison is the only guard against a thin read replacing a
    release-day grid, and a failed read used to skip that comparison and
    overwrite blind.
-2. A forked job worker must not keep the web process's shared HTTP client.
 """
 from __future__ import annotations
 
@@ -18,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["RACE_LOG_WEBHOOK_URL"] = "https://example.invalid/rest/v1/races"
 
 import src.telemetry.grid_store as gs  # noqa: E402
-from src.discovery.foreup_client import ForeUpDiscoveryClient  # noqa: E402
 
 FAILURES = 0
 
@@ -63,19 +61,8 @@ def test_upsert_skips_when_stored_row_is_unreadable():
     check("nothing was posted", not posted, f"posted {posted}")
 
 
-def test_reset_gives_the_worker_its_own_client():
-    parent = ForeUpDiscoveryClient(base_url="https://example.invalid").client
-    check("instances share one client before the reset",
-          ForeUpDiscoveryClient(base_url="https://example.invalid").client is parent)
-    ForeUpDiscoveryClient.reset_shared_client()
-    child = ForeUpDiscoveryClient(base_url="https://example.invalid").client
-    check("a new client is built after the reset", child is not parent)
-    check("the parent's client was left open, not closed", not parent.is_closed)
-
-
 if __name__ == "__main__":
-    for fn in (test_upsert_skips_when_stored_row_is_unreadable,
-               test_reset_gives_the_worker_its_own_client):
+    for fn in (test_upsert_skips_when_stored_row_is_unreadable,):
         print(f"\n{fn.__name__}")
         try:
             fn()

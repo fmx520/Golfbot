@@ -303,8 +303,8 @@ from races r, lateral jsonb_array_elements(r.attempts) a where left(r.run_id,12)
   course. `polls.observed` is recorded on every poll, burst or not; other courses in
   a rotation are keyed `"<teesheet> HH:MM"`.
 - `upsert_grid` skips the write when it cannot read the stored row to compare.
-- Job workers call `ForeUpDiscoveryClient.reset_shared_client()` first thing: they
-  are forks and were inheriting the web process's open HTTP/2 socket and login header.
+- v1.20 reverted v1.19's per-worker HTTP client: no race ever showed the shared
+  connection failing, so the proven behaviour stays until one does.
 - Gone: `src/auth`, `src/scheduler`, `src/config.py`, `config/courses.yaml`,
   `/api/courses`, the `interfaces.py`/`service.py`/`executor.py` stubs. Nothing imported them.
 

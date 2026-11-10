@@ -2657,7 +2657,7 @@ def _watch_worker(job_id: str, queue: Queue, process: Process, cleanup_id: str =
 
 # --- Routes ---
 
-APP_VERSION = "1.19"
+APP_VERSION = "1.20"
 
 @app.get("/health")
 def health() -> dict[str, Any]:
@@ -2754,17 +2754,6 @@ def connect(req: ConnectRequest) -> dict[str, Any]:
     }
 
 
-def _forked_worker_entry(worker_fn: Any, *args: Any) -> None:
-    """First thing a job process runs: stop sharing the web process's socket.
-
-    The worker is a fork, so it starts life holding the parent's ForeUp client
-    -- same connection, same cookies, same login header. Give it its own before
-    it makes a single request.
-    """
-    ForeUpDiscoveryClient.reset_shared_client()
-    worker_fn(*args)
-
-
 @app.post("/api/jobs")
 def start_job(req: StartJobRequest) -> dict[str, str]:
     job_id = uuid.uuid4().hex[:12]
@@ -2786,8 +2775,7 @@ def start_job(req: StartJobRequest) -> dict[str, str]:
     cmd_queue: Queue = Queue()
     CMD_QUEUES[job_id] = cmd_queue
     worker_fn = _sniper_worker_main if full_payload.get("sniper_mode") else _worker_main
-    proc = Process(target=_forked_worker_entry,
-                   args=(worker_fn, job_id, full_payload, queue, cmd_queue), daemon=True)
+    proc = Process(target=worker_fn, args=(job_id, full_payload, queue, cmd_queue), daemon=True)
     proc.start()
     JOB_PROCS[job_id] = proc
 
